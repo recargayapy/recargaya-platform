@@ -1,0 +1,35 @@
+name: Verificar
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm install
+
+      - name: Tipos
+        run: npm run tipos
+
+      - name: Pruebas
+        run: npm run probar
+
+      - name: Mutacion
+        run: npm run mutar
+
+      - name: Ningun secreto en el arbol
+        run: |
+          if git ls-files | grep -E '(^|/)\.dev\.vars$|\.env$'; then
+            echo "::error::hay un archivo de secretos versionado"
+            exit 1
+          fi
+          echo "sin secretos versionados"
