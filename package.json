@@ -1,0 +1,25 @@
+{
+  "name": "recargaya-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "RecargaYA Platform 2.0 sobre Cloudflare",
+  "scripts": {
+    "tipos": "tsc --noEmit",
+    "probar": "vitest run",
+    "probar:mirar": "vitest",
+    "mutar": "node herramientas/mutar.mjs",
+    "verificar": "npm run tipos && npm run probar && npm run mutar",
+    "migrar:staging": "wrangler d1 migrations apply core --env staging --remote",
+    "migrar:local": "wrangler d1 migrations apply core --local",
+    "desarrollo": "wrangler dev --env staging",
+    "desplegar:staging": "wrangler deploy --env staging",
+    "desplegar:produccion": "wrangler deploy --env produccion"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8",
+    "wrangler": "^3.101.0"
+  }
+}

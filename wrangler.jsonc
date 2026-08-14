@@ -1,0 +1,83 @@
+{
+  // RecargaYA Platform 2.0 — configuracion de Wrangler
+  //
+  // Dos entornos separados a proposito, con recursos distintos. Staging y
+  // produccion NUNCA comparten una base, un bucket ni una cola: si los
+  // comparten, una prueba en staging mueve plata de verdad.
+  //
+  // El "account_id" y los "database_id" se completan al crear los recursos.
+  // Ver docs/PRIMER-DESPLIEGUE.md.
+
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "recargaya",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": { "enabled": true },
+
+  // Sin entorno no se despliega nada. Es deliberado: obliga a elegir
+  // "--env staging" o "--env produccion" y hace imposible el despliegue
+  // accidental a produccion por olvidarse una bandera.
+  "workers_dev": false,
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "BILLETERA", "class_name": "BilleteraDO" },
+      { "name": "SECUENCIA", "class_name": "SecuenciaDO" }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["BilleteraDO", "SecuenciaDO"]
+    }
+  ],
+
+  "env": {
+    "staging": {
+      "name": "recargaya-staging",
+      "vars": {
+        "ENTORNO": "staging",
+        "ZONA_HORARIA": "America/Asuncion"
+      },
+      "d1_databases": [
+        {
+          "binding": "CORE",
+          "database_name": "core-staging",
+          "database_id": "PENDIENTE-crear-con-wrangler-d1-create",
+          "migrations_dir": "migraciones/core"
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "BILLETERA", "class_name": "BilleteraDO" },
+          { "name": "SECUENCIA", "class_name": "SecuenciaDO" }
+        ]
+      }
+    },
+
+    "produccion": {
+      "name": "recargaya-produccion",
+      "vars": {
+        "ENTORNO": "produccion",
+        "ZONA_HORARIA": "America/Asuncion"
+      },
+      "d1_databases": [
+        {
+          "binding": "CORE",
+          "database_name": "core-produccion",
+          "database_id": "PENDIENTE-crear-con-wrangler-d1-create",
+          "migrations_dir": "migraciones/core"
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "BILLETERA", "class_name": "BilleteraDO" },
+          { "name": "SECUENCIA", "class_name": "SecuenciaDO" }
+        ]
+      }
+    }
+  }
+}
