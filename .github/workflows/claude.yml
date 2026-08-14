@@ -1,4 +1,4 @@
-name: claude.yml
+name: Claude
 
 on:
   issue_comment:
