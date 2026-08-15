@@ -4,9 +4,6 @@
   // Dos entornos separados a proposito, con recursos distintos. Staging y
   // produccion NUNCA comparten una base, un bucket ni una cola: si los
   // comparten, una prueba en staging mueve plata de verdad.
-  //
-  // El "account_id" y los "database_id" se completan al crear los recursos.
-  // Ver docs/PRIMER-DESPLIEGUE.md.
 
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "recargaya",
@@ -46,7 +43,7 @@
         {
           "binding": "CORE",
           "database_name": "core-staging",
-          "database_id": "PENDIENTE-crear-con-wrangler-d1-create",
+          "database_id": "42d01b49-568a-4bea-8094-d604b62beb44",
           "migrations_dir": "migraciones/core"
         }
       ],
@@ -68,7 +65,7 @@
         {
           "binding": "CORE",
           "database_name": "core-produccion",
-          "database_id": "PENDIENTE-crear-con-wrangler-d1-create",
+          "database_id": "3fe685f2-f2e6-4ecf-b81e-1265c5d860eb",
           "migrations_dir": "migraciones/core"
         }
       ],
