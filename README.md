@@ -1,2 +1,60 @@
-# recargaya-platform
-Plataforma RecargaYA 2.0 sobre Cloudflare
+# RecargaYA Platform 2.0
+
+Plataforma paraguaya de recargas, servicios digitales y contenido de creadores,
+construida sobre Cloudflare.
+
+**Fase 0 — Fundaciones y el spike financiero.**
+
+## Qué hay acá
+
+```
+src/dinero/       guaraníes enteros, bolsas, precedencia de consumo (ley 4 y 11)
+src/billetera/    el núcleo de la billetera: asientos, idempotencia, invariantes
+src/reparto/      el spike: repartir una venta entre cuatro billeteras
+src/index.ts      el Worker y los dos Durable Objects
+migraciones/core/ el esquema de D1, versionado desde la primera tabla
+tests/            36 pruebas, incluido el arnés que inyecta caídas
+herramientas/     la mutación: rompe el código a propósito y exige que falle
+```
+
+## Correr la verificación
+
+```bash
+npm install
+npm run verificar     # tipos + pruebas + mutación
+```
+
+Los tres tienen que pasar. Es lo mismo que corre el CI.
+
+| Comando | Qué hace |
+|---|---|
+| `npm run tipos` | TypeScript estricto, sin emitir |
+| `npm run probar` | las 36 pruebas |
+| `npm run mutar` | rompe 18 invariantes y exige que alguna prueba muera |
+| `npm run desarrollo` | Wrangler local contra staging |
+
+## El spike financiero
+
+El problema que resuelve: una venta toca cuatro saldos —cliente, creador,
+vendedor y plataforma— y en Cloudflare cada billetera es un Durable Object
+distinto. **No hay transacción que los abarque.** Si el Worker muere entre el
+paso dos y el tres, el cliente ya pagó y el creador todavía no cobró.
+
+La respuesta: un Workflow con pasos idempotentes. Cada paso llama a una
+billetera con una clave que identifica **la intención**, no el momento; la
+billetera rechaza el duplicado; el Workflow reintenta **el paso que falló**, no
+el proceso entero.
+
+Las pruebas inyectan una caída en cada uno de los cuatro pasos, de dos formas
+distintas —antes de aplicar, y **después de aplicar pero antes de registrarlo**,
+que es el caso que rompe los sistemas mal diseñados— y verifican que nunca se
+paga dos veces ni se pierde un guaraní.
+
+## Primer despliegue
+
+Ver [`docs/PRIMER-DESPLIEGUE.md`](docs/PRIMER-DESPLIEGUE.md).
+
+## Cómo se trabaja acá
+
+Ver [`CLAUDE.md`](CLAUDE.md): las doce leyes, el método y las reglas del
+repositorio.

@@ -1,0 +1,331 @@
+/**
+ * El nucleo de la billetera. Puro, sin Cloudflare adentro.
+ *
+ * Esta separacion es deliberada y es lo que hace posible el spike: la logica
+ * del dinero se prueba sin desplegar nada, y el Durable Object queda como una
+ * cascara delgada que persiste. Si la logica viviera dentro del DO, cada
+ * prueba necesitaria un runtime y la mutacion seria impracticable.
+ *
+ * Ley 2: un asiento nunca se edita. Se compensa con otro asiento.
+ * Ley 3: solo la billetera escribe asientos.
+ */
+
+import { type Guaranies, guaranies, CERO } from '../dinero/monto.js'
+import { type Bolsa, type Toma, decidirConsumo, devolver, saldoRetirable } from '../dinero/bolsas.js'
+
+export interface Asiento {
+  readonly asiento_id: string
+  readonly concepto: string
+  readonly monto: Guaranies // positivo credito, negativo debito
+  readonly bolsa: Bolsa['tipo']
+  readonly clave_idem: string
+  readonly correlacion_id: string
+  readonly asentado_en: string
+}
+
+export interface Reserva {
+  readonly reserva_id: string
+  readonly tomas: readonly Toma[]
+  readonly consumido: Guaranies
+  readonly vence_en: string
+  readonly estado: 'abierta' | 'cerrada' | 'cancelada'
+}
+
+export interface EstadoBilletera {
+  readonly billetera_id: string
+  readonly bolsas: readonly Bolsa[]
+  readonly asientos: readonly Asiento[]
+  readonly reservas: ReadonlyMap<string, Reserva>
+  /** clave de idempotencia → resultado ya producido */
+  readonly aplicadas: ReadonlyMap<string, string>
+}
+
+export function billeteraVacia(billetera_id: string): EstadoBilletera {
+  return {
+    billetera_id,
+    bolsas: [],
+    asientos: [],
+    reservas: new Map(),
+    aplicadas: new Map(),
+  }
+}
+
+export interface Operacion {
+  readonly clave_idem: string
+  readonly correlacion_id: string
+  readonly momento: string
+}
+
+export interface Resultado<T> {
+  readonly estado: EstadoBilletera
+  readonly valor: T
+  /** true cuando la operacion ya se habia aplicado y se devolvio lo de antes. */
+  readonly repetida: boolean
+}
+
+/**
+ * La clave de idempotencia identifica la INTENCION, no el momento.
+ *
+ * Este es el defecto que en el sistema anterior bloqueo toda renovacion en
+ * silencio: la clave incluia algo que cambiaba entre intentos legitimos. Acá
+ * la clave la arma quien llama, y la billetera solo se acuerda de haberla
+ * visto. Es responsabilidad del llamador que dos intentos del MISMO acto
+ * compartan clave, y que dos actos distintos no la compartan.
+ */
+function yaAplicada<T>(estado: EstadoBilletera, op: Operacion): Resultado<T> | null {
+  const previo = estado.aplicadas.get(op.clave_idem)
+  if (previo === undefined) return null
+  return { estado, valor: JSON.parse(previo) as T, repetida: true }
+}
+
+function marcarAplicada<T>(estado: EstadoBilletera, op: Operacion, valor: T): ReadonlyMap<string, string> {
+  const m = new Map(estado.aplicadas)
+  m.set(op.clave_idem, JSON.stringify(valor))
+  return m
+}
+
+function asentar(
+  op: Operacion,
+  concepto: string,
+  monto: Guaranies,
+  bolsa: Bolsa['tipo'],
+  sufijo: string,
+): Asiento {
+  return {
+    asiento_id: `${op.clave_idem}:${sufijo}`,
+    concepto,
+    monto,
+    bolsa,
+    clave_idem: op.clave_idem,
+    correlacion_id: op.correlacion_id,
+    asentado_en: op.momento,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Acreditar
+// ---------------------------------------------------------------------------
+
+export function acreditar(
+  estado: EstadoBilletera,
+  op: Operacion,
+  entrada: {
+    readonly monto: Guaranies
+    readonly bolsa: Bolsa['tipo']
+    readonly concepto: string
+    readonly origen: string
+    readonly vence_en?: string | null
+    readonly restringida_a?: string | null
+  },
+): Resultado<{ saldo_retirable: Guaranies }> {
+  const previo = yaAplicada<{ saldo_retirable: Guaranies }>(estado, op)
+  if (previo !== null) return previo
+
+  if (entrada.monto <= 0) throw new Error('acreditar exige un monto positivo')
+
+  // Ley 11: el credito de promocion nace con vencimiento. Sin el, seria plata
+  // regalada eterna, y eterna se parece demasiado a retirable.
+  if (entrada.bolsa === 'credito_promocion' && (entrada.vence_en ?? null) === null) {
+    throw new Error('el credito de promocion no existe sin vencimiento')
+  }
+
+  const nueva: Bolsa = {
+    tipo: entrada.bolsa,
+    monto: entrada.monto,
+    vence_en: entrada.vence_en ?? null,
+    origen: entrada.origen,
+    restringida_a: entrada.restringida_a ?? null,
+  }
+
+  const bolsas = [...estado.bolsas, nueva]
+  const asientos = [...estado.asientos, asentar(op, entrada.concepto, entrada.monto, entrada.bolsa, 'cr')]
+  const valor = { saldo_retirable: saldoRetirable(bolsas, op.momento) }
+
+  return {
+    estado: { ...estado, bolsas, asientos, aplicadas: marcarAplicada(estado, op, valor) },
+    valor,
+    repetida: false,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Debitar
+// ---------------------------------------------------------------------------
+
+export class SaldoInsuficiente extends Error {
+  constructor(readonly faltante: Guaranies) {
+    super(`saldo insuficiente: faltan ${faltante}`)
+    this.name = 'SaldoInsuficiente'
+  }
+}
+
+/** Resta de las bolsas las tomas indicadas, dejando el resto intacto. */
+function aplicarTomas(bolsas: readonly Bolsa[], tomas: readonly Toma[]): Bolsa[] {
+  const pendiente = new Map<Bolsa, number>()
+  for (const t of tomas) pendiente.set(t.bolsa, (pendiente.get(t.bolsa) ?? 0) + t.monto)
+
+  const salida: Bolsa[] = []
+  for (const b of bolsas) {
+    const quita = pendiente.get(b) ?? 0
+    const queda = b.monto - quita
+    if (queda > 0) salida.push({ ...b, monto: guaranies(queda) })
+  }
+  return salida
+}
+
+export function debitar(
+  estado: EstadoBilletera,
+  op: Operacion,
+  entrada: {
+    readonly monto: Guaranies
+    readonly concepto: string
+    readonly proposito?: string
+    readonly omitirDisponible?: boolean
+  },
+): Resultado<{ tomas: readonly Toma[]; faltante: Guaranies }> {
+  const previo = yaAplicada<{ tomas: readonly Toma[]; faltante: Guaranies }>(estado, op)
+  if (previo !== null) return previo
+
+  if (entrada.monto <= 0) throw new Error('debitar exige un monto positivo')
+
+  const consumo = decidirConsumo(estado.bolsas, entrada.monto, op.momento, {
+    ...(entrada.omitirDisponible === undefined ? {} : { omitirDisponible: entrada.omitirDisponible }),
+    ...(entrada.proposito === undefined ? {} : { proposito: entrada.proposito }),
+  })
+
+  if (consumo.faltante > 0) throw new SaldoInsuficiente(consumo.faltante)
+
+  const bolsas = aplicarTomas(estado.bolsas, consumo.tomas)
+  const asientos = [...estado.asientos]
+  consumo.tomas.forEach((t, i) => {
+    asientos.push(asentar(op, entrada.concepto, guaranies(-t.monto), t.bolsa.tipo, `db${i}`))
+  })
+
+  const valor = { tomas: consumo.tomas, faltante: CERO }
+  return {
+    estado: { ...estado, bolsas, asientos, aplicadas: marcarAplicada(estado, op, valor) },
+    valor,
+    repetida: false,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reservar / consumir / liberar
+// ---------------------------------------------------------------------------
+
+export function reservar(
+  estado: EstadoBilletera,
+  op: Operacion,
+  entrada: { readonly reserva_id: string; readonly monto: Guaranies; readonly vence_en: string },
+): Resultado<{ reserva_id: string }> {
+  const previo = yaAplicada<{ reserva_id: string }>(estado, op)
+  if (previo !== null) return previo
+
+  const d = debitar(estado, { ...op, clave_idem: `${op.clave_idem}:reserva` }, {
+    monto: entrada.monto,
+    concepto: 'reserva_promocion',
+  })
+
+  const reservas = new Map(estado.reservas)
+  reservas.set(entrada.reserva_id, {
+    reserva_id: entrada.reserva_id,
+    tomas: d.valor.tomas,
+    consumido: CERO,
+    vence_en: entrada.vence_en,
+    estado: 'abierta',
+  })
+
+  const valor = { reserva_id: entrada.reserva_id }
+  return {
+    estado: { ...d.estado, reservas, aplicadas: marcarAplicada(d.estado, op, valor) },
+    valor,
+    repetida: false,
+  }
+}
+
+/**
+ * Cancela una reserva y devuelve el remanente A LA BOLSA DE LA QUE SALIO.
+ * Esta es la regla anticajero hecha codigo.
+ */
+export function liberarReserva(
+  estado: EstadoBilletera,
+  op: Operacion,
+  entrada: { readonly reserva_id: string },
+): Resultado<{ devuelto: Guaranies }> {
+  const previo = yaAplicada<{ devuelto: Guaranies }>(estado, op)
+  if (previo !== null) return previo
+
+  const r = estado.reservas.get(entrada.reserva_id)
+  if (r === undefined) throw new Error(`reserva desconocida: ${entrada.reserva_id}`)
+  if (r.estado !== 'abierta') {
+    const valor = { devuelto: CERO }
+    return { estado, valor, repetida: true }
+  }
+
+  const total = r.tomas.reduce((a, t) => a + t.monto, 0)
+  const remanente = guaranies(total - r.consumido)
+  const vueltas = devolver(r.tomas, remanente)
+
+  const bolsas = [...estado.bolsas, ...vueltas]
+  const asientos = [...estado.asientos]
+  vueltas.forEach((b, i) => {
+    asientos.push(asentar(op, 'promotion_refund', b.monto, b.tipo, `rf${i}`))
+  })
+
+  const reservas = new Map(estado.reservas)
+  reservas.set(r.reserva_id, { ...r, estado: 'cancelada' })
+
+  const valor = { devuelto: remanente }
+  return {
+    estado: { ...estado, bolsas, asientos, reservas, aplicadas: marcarAplicada(estado, op, valor) },
+    valor,
+    repetida: false,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Invariantes — lo que tiene que ser cierto SIEMPRE
+// ---------------------------------------------------------------------------
+
+/**
+ * Estas comprobaciones no son pruebas: son el oraculo que las pruebas usan.
+ * Se corren despues de cada paso del spike, incluida cada caida y cada
+ * reintento. Si alguna se rompe, el spike fallo aunque el resultado final
+ * "parezca" correcto.
+ */
+export function verificarInvariantes(estado: EstadoBilletera): void {
+  // 1. Ninguna bolsa en negativo. El saldo negativo es plata inventada.
+  for (const b of estado.bolsas) {
+    if (b.monto < 0) throw new Error(`bolsa en negativo: ${b.tipo} ${b.monto}`)
+  }
+
+  // 2. El ledger cuadra con las bolsas. Esta es LA comprobacion: si los
+  //    asientos y los saldos se separan, el sistema esta mintiendo.
+  const porBolsa = new Map<string, number>()
+  for (const a of estado.asientos) porBolsa.set(a.bolsa, (porBolsa.get(a.bolsa) ?? 0) + a.monto)
+
+  const enBolsas = new Map<string, number>()
+  for (const b of estado.bolsas) enBolsas.set(b.tipo, (enBolsas.get(b.tipo) ?? 0) + b.monto)
+
+  // Lo retenido en reservas abiertas salio de las bolsas pero sigue en el ledger.
+  for (const r of estado.reservas.values()) {
+    if (r.estado !== 'abierta') continue
+    for (const t of r.tomas) {
+      enBolsas.set(t.bolsa.tipo, (enBolsas.get(t.bolsa.tipo) ?? 0) + t.monto)
+    }
+  }
+
+  for (const [tipo, delLedger] of porBolsa) {
+    const enBolsa = enBolsas.get(tipo) ?? 0
+    if (delLedger !== enBolsa) {
+      throw new Error(`descuadre en ${tipo}: ledger ${delLedger} vs bolsas ${enBolsa}`)
+    }
+  }
+
+  // 3. Ningun asiento repetido. Un asiento_id duplicado es un pago doble.
+  const vistos = new Set<string>()
+  for (const a of estado.asientos) {
+    if (vistos.has(a.asiento_id)) throw new Error(`asiento duplicado: ${a.asiento_id}`)
+    vistos.add(a.asiento_id)
+  }
+}

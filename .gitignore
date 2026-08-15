@@ -1,0 +1,27 @@
+# Secretos — nunca, bajo ninguna circunstancia.
+# Esta linea existe desde el primer commit a proposito: un secreto que entra
+# al repositorio queda en la historia para siempre, y borrarlo no lo borra.
+.dev.vars
+.dev.vars.*
+*.env
+.env
+.env.*
+
+# Cloudflare
+.wrangler/
+.mf/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Construccion
+dist/
+.tsbuildinfo
+
+# Verificacion visual — el arbol de referencia se versiona, los resultados no
+capturas/resultado/
+capturas/diff/
+
+# Sistema
+.DS_Store
