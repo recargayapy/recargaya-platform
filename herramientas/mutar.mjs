@@ -25,15 +25,15 @@ import { execFileSync } from 'node:child_process'
  */
 const MUTACIONES = [
   {
-    // Nota de la primera pasada de mutacion: quitar SOLO la linea de
-    // `isInteger` sobrevivia, porque `isSafeInteger` tambien rechaza los
-    // decimales. La linea no es redundante —da un mensaje de error util— pero
-    // el invariante que hay que atacar es "no entra un decimal", y para eso
-    // hay que sacar las dos. Una mutacion que el codigo absorbe por otro lado
-    // no mide nada.
-    invariante: 'el guarani no acepta decimales',
+    // Nota de la primera pasada de mutacion: quitar SOLO esta linea sobrevivia,
+    // porque `isSafeInteger` tambien rechaza los decimales y el codigo seguia
+    // tirando `MontoInvalido` por otro camino. `toThrow(MontoInvalido)` no
+    // distinguia los dos mensajes. El arreglo no es fusionar la mutacion —eso
+    // perderia la granularidad de un invariante por linea— es que
+    // `tests/monto.test.ts` verifique el mensaje especifico de ESTA linea.
+    invariante: 'el guarani no acepta decimales (mensaje especifico)',
     archivo: 'src/dinero/monto.ts',
-    de: "  if (!Number.isInteger(valor)) throw new MontoInvalido(valor, 'el guarani no tiene decimales')\n  if (!Number.isSafeInteger(valor)) throw new MontoInvalido(valor, 'fuera del entero seguro')",
+    de: "  if (!Number.isInteger(valor)) throw new MontoInvalido(valor, 'el guarani no tiene decimales')\n",
     a: '',
   },
   {
@@ -107,6 +107,18 @@ const MUTACIONES = [
     archivo: 'src/billetera/nucleo.ts',
     de: '    if (vistos.has(a.asiento_id)) throw new Error(`asiento duplicado: ${a.asiento_id}`)',
     a: '',
+  },
+  {
+    invariante: 'reservar() registra de que bolsas salio la reserva',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    tomas: d.valor.tomas,',
+    a: '    tomas: [],',
+  },
+  {
+    invariante: 'liberarReserva() devuelve el remanente real, no cero',
+    archivo: 'src/billetera/nucleo.ts',
+    de: 'const vueltas = devolver(r.tomas, remanente)',
+    a: 'const vueltas = devolver(r.tomas, CERO)',
   },
   {
     invariante: 'sin vendedor, su peso no se descarta',

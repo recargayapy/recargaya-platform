@@ -26,6 +26,11 @@ export interface Asiento {
 export interface Reserva {
   readonly reserva_id: string
   readonly tomas: readonly Toma[]
+  /**
+   * Existe para el consumo parcial de una reserva, que todavia no esta
+   * construido: no hay ninguna funcion que lo incremente. Hasta que exista,
+   * siempre vale CERO y `liberarReserva` devuelve el total de las tomas.
+   */
   readonly consumido: Guaranies
   readonly vence_en: string
   readonly estado: 'abierta' | 'cerrada' | 'cancelada'
@@ -307,13 +312,10 @@ export function verificarInvariantes(estado: EstadoBilletera): void {
   const enBolsas = new Map<string, number>()
   for (const b of estado.bolsas) enBolsas.set(b.tipo, (enBolsas.get(b.tipo) ?? 0) + b.monto)
 
-  // Lo retenido en reservas abiertas salio de las bolsas pero sigue en el ledger.
-  for (const r of estado.reservas.values()) {
-    if (r.estado !== 'abierta') continue
-    for (const t of r.tomas) {
-      enBolsas.set(t.bolsa.tipo, (enBolsas.get(t.bolsa.tipo) ?? 0) + t.monto)
-    }
-  }
+  // `reservar()` usa el `debitar()` real: el asiento negativo y la salida de
+  // la bolsa ocurren juntos, en la misma llamada. Una reserva abierta no deja
+  // nada pendiente de reconciliar — sumar de nuevo lo retenido en `tomas`
+  // contaria esa plata dos veces y haria gritar "descuadre" a un estado sano.
 
   for (const [tipo, delLedger] of porBolsa) {
     const enBolsa = enBolsas.get(tipo) ?? 0

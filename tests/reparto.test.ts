@@ -122,7 +122,7 @@ describe('el reparto, con caida inyectada en cada paso', () => {
     expect(banco.obtener('persona-creador').bolsas.reduce((a, b) => a + b.monto, 0)).toBe(70_001)
   })
 
-  it('al reintentar, NO repite los pasos que ya habian terminado', async () => {
+  it('al reintentar tras una caida DESPUES de aplicar, NO repite los pasos que ya habian terminado', async () => {
     // La idempotencia sola hace que repetir todo sea inofensivo — por eso esta
     // prueba tuvo que escribirse aparte: la mutacion mostro que sin ella nadie
     // notaba si el Workflow reanudaba desde cero.
@@ -130,6 +130,35 @@ describe('el reparto, con caida inyectada en cada paso', () => {
     // Que sea inofensivo no lo hace gratis: repetir cuatro llamadas entre
     // Durable Objects por cada reintento es latencia y costo reales, y el dia
     // que un paso deje de ser idempotente el defecto ya estaria adentro.
+    //
+    // 'despues' es el caso peligroso: la billetera YA aplico el cambio cuando
+    // el Workflow "cae", asi que el cuarto paso SI se llama dos veces (la
+    // idempotencia absorbe la repeticion) — pero los tres primeros, que ya
+    // habian terminado, no se repiten.
+    const banco = bancoSembrado(500_000)
+
+    await correrHastaTerminar(
+      planificar(ventaDePrueba(100_001), PESOS),
+      banco,
+      { enPaso: 3, cuando: 'despues', veces: 1 },
+    )
+
+    // Cinco llamadas y no ocho: los tres primeros pasos corrieron una sola vez,
+    // y solo el cuarto —el que fallo— se llamo dos veces.
+    expect(banco.llamadas).toHaveLength(5)
+    const porClave = new Map<string, number>()
+    for (const l of banco.llamadas) porClave.set(l, (porClave.get(l) ?? 0) + 1)
+
+    expect(porClave.get('persona-comprador:debitar:RY-2026-000001:debitar_comprador')).toBe(1)
+    expect(porClave.get('persona-creador:acreditar:RY-2026-000001:acreditar_creador')).toBe(1)
+    expect(porClave.get('persona-vendedor:acreditar:RY-2026-000001:acreditar_vendedor')).toBe(1)
+    expect(porClave.get('plataforma:acreditar:RY-2026-000001:acreditar_plataforma')).toBe(2)
+  })
+
+  it('al reintentar tras una caida ANTES de aplicar, cada paso se llama exactamente una vez', async () => {
+    // Contraste con la prueba anterior: si la caida es 'antes', el paso que
+    // fallo nunca llego a llamar a la billetera, asi que el reintento lo llama
+    // por primera y unica vez. Total: cuatro llamadas, una por paso.
     const banco = bancoSembrado(500_000)
 
     await correrHastaTerminar(
@@ -138,8 +167,7 @@ describe('el reparto, con caida inyectada en cada paso', () => {
       { enPaso: 3, cuando: 'antes', veces: 1 },
     )
 
-    // Cinco llamadas y no ocho: los tres primeros pasos corrieron una sola vez,
-    // y solo el cuarto —el que fallo— se llamo dos veces.
+    expect(banco.llamadas).toHaveLength(4)
     const porClave = new Map<string, number>()
     for (const l of banco.llamadas) porClave.set(l, (porClave.get(l) ?? 0) + 1)
 

@@ -5,6 +5,13 @@ describe('el guarani es entero', () => {
   it('rechaza decimales', () => {
     expect(() => guaranies(100.5)).toThrow(MontoInvalido)
   })
+  it('rechaza un decimal puro con el mensaje especifico de "no tiene decimales"', () => {
+    // No alcanza con toThrow(MontoInvalido): isSafeInteger tambien rechaza
+    // 100.5, asi que un chequeo generico no distingue por que camino se llego
+    // al error. Este mensaje es el que prueba que la linea de isInteger sigue
+    // ahi.
+    expect(() => guaranies(100.5)).toThrow(/no tiene decimales/)
+  })
   it('rechaza NaN e infinito', () => {
     expect(() => guaranies(Number.NaN)).toThrow(MontoInvalido)
     expect(() => guaranies(Number.POSITIVE_INFINITY)).toThrow(MontoInvalido)
