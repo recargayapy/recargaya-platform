@@ -111,7 +111,7 @@ const MUTACIONES = [
   {
     invariante: 'reservar() registra de que bolsas salio la reserva',
     archivo: 'src/billetera/nucleo.ts',
-    de: '    tomas: d.valor.tomas,',
+    de: '    tomas: consumo.tomas,',
     a: '    tomas: [],',
   },
   {
@@ -119,6 +119,36 @@ const MUTACIONES = [
     archivo: 'src/billetera/nucleo.ts',
     de: 'const vueltas = devolver(r.tomas, remanente)',
     a: 'const vueltas = devolver(r.tomas, CERO)',
+  },
+  {
+    invariante: 'retenido no se consume en decidirConsumo',
+    archivo: 'src/dinero/bolsas.ts',
+    de: "const disponiblesParaConsumo = bolsas.filter((b) => b.tipo !== 'retenido')",
+    a: 'const disponiblesParaConsumo = bolsas',
+  },
+  {
+    invariante: 'reservar() mueve la plata a retenido, no la debita contra la nada',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  const bolsas = [...bolsasSinTomas, ...retenidas]',
+    a: '  const bolsas = bolsasSinTomas',
+  },
+  {
+    invariante: 'reservar() rechaza un reserva_id con reserva abierta existente',
+    archivo: 'src/billetera/nucleo.ts',
+    de: "  if (estado.reservas.get(entrada.reserva_id)?.estado === 'abierta') {\n    throw new Error(`ya existe una reserva abierta con reserva_id: ${entrada.reserva_id}`)\n  }",
+    a: '',
+  },
+  {
+    invariante: 'liberarReserva() vacia retenido de la reserva que libera',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  const bolsas = [...bolsasSinRetenido, ...vueltas]',
+    a: '  const bolsas = [...estado.bolsas, ...vueltas]',
+  },
+  {
+    invariante: 'retenido cuadra con las reservas abiertas',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    throw new Error(\n      `descuadre en retenido: bolsas ${retenidoEnBolsas} vs reservas abiertas ${retenidoEnReservas}`,\n    )',
+    a: '',
   },
   {
     invariante: 'sin vendedor, su peso no se descarta',
