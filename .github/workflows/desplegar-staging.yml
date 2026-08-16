@@ -1,0 +1,121 @@
+name: Desplegar a staging
+
+# Que hace: en cada push a `main`, corre los oraculos, aplica las migraciones
+# pendientes a la base de staging y despliega el Worker de staging.
+#
+# Por que TODO vive en un solo job encadenado, y no en un workflow que "espera"
+# a Verificar: dos workflows disparados por el mismo push corren en paralelo y
+# no se esperan entre si. Si el despliegue viviera aparte, saldria al aire
+# mientras los oraculos todavia estan corriendo, y podria publicar un commit
+# que despues falla. La unica forma de que "no se despliega si los oraculos no
+# pasan" sea un hecho y no un comentario, es que sean pasos del mismo job: si
+# `npm run verificar` falla, los pasos siguientes no corren nunca.
+#
+# Si, esto duplica el trabajo de `verificar.yml`. Es a proposito: `verificar.yml`
+# es la puerta de los pull requests, y este es el candado del despliegue. El
+# minuto de CPU repetido es mas barato que un staging desplegado desde un commit
+# roto.
+#
+# Orden de los pasos: migrar ANTES de desplegar. Codigo nuevo contra un esquema
+# viejo se rompe; esquema nuevo contra codigo viejo casi siempre aguanta, porque
+# una migracion agrega y no quita.
+#
+# Produccion NO se despliega desde aca. Ver el paso "Ningun workflow despliega
+# a produccion", que lo hace cumplir en vez de solo prometerlo.
+
+on:
+  push:
+    branches: [main]
+  # Para poder redesplegar staging a mano sin inventar un commit vacio.
+  workflow_dispatch:
+
+# Dos merges seguidos no pueden pisarse. No se cancela el que ya esta corriendo:
+# un despliegue cortado a la mitad deja la base migrada y el Worker viejo, que
+# es exactamente el estado que nadie quiere depurar. Se encolan y salen en orden.
+concurrency:
+  group: desplegar-staging
+  cancel-in-progress: false
+
+# Este workflow no escribe nada en el repositorio.
+permissions:
+  contents: read
+
+jobs:
+  desplegar:
+    name: Verificar, migrar y desplegar
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` y no `npm install`: instala exactamente lo que dice
+      # `package-lock.json` y falla si el lock y `package.json` no coinciden.
+      # Un despliegue que resuelve dependencias distintas en cada corrida no es
+      # reproducible: el commit que verificaste y el que salio al aire pueden
+      # traer codigo de terceros distinto.
+      - name: Instalar dependencias
+        run: npm ci
+
+      # El comentario de la cabecera dice que produccion no se despliega desde
+      # el CI. Este paso es lo que lo vuelve cierto tambien manana, cuando
+      # alguien edite este archivo sin leer el comentario.
+      #
+      # Los corchetes de `produc[c]ion` NO son un error de tipeo: hacen que el
+      # patron no se encuentre a si mismo en esta misma linea. Sin ellos, el
+      # guardian falla siempre. Es el mismo truco de `ps aux | grep [s]sh`.
+      # No los quites.
+      - name: Ningun workflow despliega a produccion
+        run: |
+          if grep -rnE '(desplegar:produc[c]ion|--env[= ]+produc[c]ion|recargaya-produc[c]ion)' .github/workflows/; then
+            echo "::error::un workflow despliega a produccion. Produccion va con aprobacion explicita del dueño, a mano, nunca desde el CI."
+            exit 1
+          fi
+          echo "ningun workflow toca produccion"
+
+      # tipos + pruebas + esquema + mutacion. Si esto falla, no se migra ni se
+      # despliega: los pasos de abajo no llegan a correr.
+      - name: Verificar
+        run: npm run verificar
+
+      # Idempotente por diseño: wrangler lleva la cuenta de lo aplicado en la
+      # tabla `d1_migrations`. Un push que no trae migraciones nuevas no hace
+      # nada aca.
+      - name: Aplicar migraciones a core-staging
+        run: npm run migrar:staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Desplegar el Worker de staging
+        run: npm run desplegar:staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # Un despliegue que devuelve exito no prueba que el Worker responda.
+      # Se comprueba contra /salud, que ademas devuelve el entorno: si dijera
+      # "produccion", el despliegue fue al lugar equivocado y esto lo agarra.
+      - name: Comprobar que staging quedo vivo
+        if: vars.SUBDOMINIO_WORKERS != ''
+        run: |
+          url="https://recargaya-staging.${{ vars.SUBDOMINIO_WORKERS }}.workers.dev/salud"
+          echo "GET $url"
+          cuerpo=$(curl -fsS --retry 5 --retry-delay 3 --retry-all-errors "$url")
+          echo "$cuerpo"
+          echo "$cuerpo" | grep -q '"estado":"vivo"'    || { echo "::error::/salud no dice vivo"; exit 1; }
+          echo "$cuerpo" | grep -q '"entorno":"staging"' || { echo "::error::/salud no dice staging: el despliegue fue al entorno equivocado"; exit 1; }
+          echo "staging vivo"
+
+      # Sin la variable no hay forma de saber la URL. Se avisa en vez de callarse:
+      # "desplegado" y "desplegado y comprobado" no son lo mismo, y el CI no
+      # tiene que dejar creer que hizo lo segundo cuando hizo lo primero.
+      - name: Aviso — no se comprobo la salud
+        if: vars.SUBDOMINIO_WORKERS == ''
+        run: |
+          echo "::warning::El Worker se desplego pero NO se comprobo que responda. Falta la variable SUBDOMINIO_WORKERS en Settings → Secrets and variables → Actions → pestaña Variables."

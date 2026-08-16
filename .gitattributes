@@ -1,0 +1,32 @@
+# Fin de linea: LF en todas partes, en todas las plataformas.
+#
+# El defecto que motiva esto: `herramientas/mutar.mjs` busca fragmentos de
+# codigo literales dentro de los archivos fuente. Seis de esos fragmentos
+# abarcan mas de una linea y estan escritos con \n. En Windows, `core.autocrlf`
+# deja el arbol de trabajo en CRLF, esos seis fragmentos dejan de coincidir, y
+# `npm run mutar` los reporta como "LA MUTACION NO APLICA".
+#
+# El sintoma es peor que el defecto: `npm run verificar` fallaba en Windows y
+# pasaba en el CI sobre EL MISMO COMMIT. Un oraculo cuyo veredicto depende de
+# la maquina no es un oraculo.
+#
+# La categoria no es mutar.mjs. Es que cualquier herramienta que compare texto
+# contra un archivo fuente —la de hoy y las que vengan— es sensible al fin de
+# linea. Por eso se arregla en la raiz y una sola vez: el arbol de trabajo usa
+# LF siempre, igual que el indice de git y que el CI.
+* text=auto eol=lf
+
+# Estos se ejecutan en Linux: un CRLF los rompe de verdad.
+*.sh   text eol=lf
+*.mjs  text eol=lf
+
+# Binarios: que git no les toque un byte.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.webp binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.woff binary
+*.woff2 binary
