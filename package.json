@@ -11,8 +11,8 @@
     "esquema": "node herramientas/check-esquema.mjs && node herramientas/check-esquema.pruebas.mjs",
     "mutar": "node herramientas/mutar.mjs",
     "verificar": "npm run tipos && npm run probar && npm run esquema && npm run mutar",
-    "migrar:staging": "wrangler d1 migrations apply core --env staging --remote",
-    "migrar:local": "wrangler d1 migrations apply core --local",
+    "migrar:staging": "wrangler d1 migrations apply CORE --env staging --remote",
+    "migrar:local": "wrangler d1 migrations apply CORE --env staging --local",
     "desarrollo": "wrangler dev --env staging",
     "desplegar:staging": "wrangler deploy --env staging",
     "desplegar:produccion": "wrangler deploy --env produccion"

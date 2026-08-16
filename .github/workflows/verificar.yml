@@ -24,8 +24,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
 
-      - run: npm install
+      # `npm ci` y no `npm install`, por la misma razon que en
+      # desplegar-staging.yml: si el oraculo instalara dependencias distintas a
+      # las del despliegue, verificaria un arbol que nunca sale al aire.
+      - run: npm ci
 
       # tipos + pruebas + esquema + mutacion
       - name: Verificar

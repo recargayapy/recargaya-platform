@@ -13,9 +13,14 @@
 
   "observability": { "enabled": true },
 
-  // Sin entorno no se despliega nada. Es deliberado: obliga a elegir
-  // "--env staging" o "--env produccion" y hace imposible el despliegue
-  // accidental a produccion por olvidarse una bandera.
+  // Controla UNA sola cosa: si el Worker se publica en una URL
+  // "<nombre>.<subdominio>.workers.dev". Nada mas.
+  //
+  // (El comentario que estaba aca antes decia que esto obligaba a elegir
+  // "--env" y hacia imposible el despliegue accidental a produccion. Era
+  // falso: `workers_dev` no tiene ninguna relacion con los entornos. Cada
+  // entorno declara abajo el suyo, explicitamente, porque el valor de la raiz
+  // se hereda y un valor heredado en silencio es como se cuelan las sorpresas.)
   "workers_dev": false,
 
   "durable_objects": {
@@ -35,6 +40,12 @@
   "env": {
     "staging": {
       "name": "recargaya-staging",
+
+      // Staging SI se publica en workers.dev. Lo necesita para tener una URL
+      // publica contra la cual el CI compruebe /salud despues de desplegar:
+      // un despliegue que devuelve exito no prueba que el Worker responda.
+      "workers_dev": true,
+
       "vars": {
         "ENTORNO": "staging",
         "ZONA_HORARIA": "America/Asuncion"
@@ -57,6 +68,13 @@
 
     "produccion": {
       "name": "recargaya-produccion",
+
+      // Produccion NO se publica en workers.dev. Su direccion va a ser un
+      // dominio propio, y una URL "*.workers.dev" abierta al mundo seria una
+      // segunda puerta a la misma plata, sin el dominio delante. Explicito y
+      // no heredado, para que se lea aca lo que vale aca.
+      "workers_dev": false,
+
       "vars": {
         "ENTORNO": "produccion",
         "ZONA_HORARIA": "America/Asuncion"

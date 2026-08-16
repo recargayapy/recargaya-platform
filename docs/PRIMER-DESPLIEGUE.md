@@ -4,12 +4,24 @@ Se hace **una sola vez**. Después, cada merge a `main` despliega solo a staging
 
 ## Antes de empezar
 
-Necesitás tener en tu terminal:
+Hay dos formas de autenticarse. **La primera es la recomendada**, porque no hay
+ningún secreto que copiar, pegar ni guardar en ningún lado:
+
+```bash
+npx wrangler login     # abre el navegador, autorizás, y queda guardado en disco
+```
+
+La segunda es con un token acotado, que es lo que usa el CI:
 
 ```bash
 export CLOUDFLARE_API_TOKEN="..."     # el token acotado a staging
 export CLOUDFLARE_ACCOUNT_ID="..."    # el hexadecimal de 32 caracteres
 ```
+
+> **En Windows, PowerShell.** `export` es de bash y no hace nada acá. El
+> equivalente es `$env:CLOUDFLARE_API_TOKEN = "..."`, y sólo vale para esa
+> ventana. Además `npx` a secas puede fallar por la política de ejecución:
+> usá **`npx.cmd`**.
 
 Comprobalo:
 
@@ -17,8 +29,8 @@ Comprobalo:
 npx wrangler whoami
 ```
 
-Si dice *"You are not authenticated"*, las variables no están cargadas en esa
-terminal.
+Si dice *"You are not authenticated"*, no estás logueado ni tenés las variables
+cargadas en esa terminal.
 
 ## 1 · Crear las dos bases de D1
 
@@ -63,6 +75,20 @@ curl https://recargaya-staging.TU-SUBDOMINIO.workers.dev/salud
 
 Tiene que responder `{"estado":"vivo","entorno":"staging",...}`.
 
+**Por qué staging tiene una URL `workers.dev` y producción no.** En
+`wrangler.jsonc`, el entorno `staging` declara `"workers_dev": true` y el
+entorno `produccion` declara `"workers_dev": false`. Esa opción controla una
+sola cosa: si el Worker se publica en `<nombre>.<subdominio>.workers.dev`.
+
+Staging la necesita porque sin una URL pública no hay nada contra qué hacer
+este `curl` — ni el CI podría comprobar `/salud` después de desplegar.
+Producción no la quiere: va a vivir en un dominio propio, y una `workers.dev`
+abierta al mundo sería una segunda puerta a la misma plata, sin el dominio
+delante.
+
+Fijate que la respuesta diga `"entorno":"staging"`. Si dijera `"produccion"`,
+el despliegue se fue al lugar equivocado.
+
 ## 4 · Dejar que el CI lo haga solo de acá en adelante
 
 En **GitHub → Settings → Secrets and variables → Actions**:
@@ -81,8 +107,14 @@ En **GitHub → Settings → Secrets and variables → Actions**:
 |---|---|
 | `SUBDOMINIO_WORKERS` | tu subdominio de workers.dev, sin `.workers.dev` |
 
-Desde ahí, cada merge a `main` corre los tres oráculos y despliega a staging
-solo si los tres pasan.
+Desde ahí, cada merge a `main` corre los oráculos y despliega a staging solo si
+pasan. Lo hace `.github/workflows/desplegar-staging.yml`, en un único job
+encadenado: verificar → migrar → desplegar → comprobar `/salud`. Si
+`npm run verificar` falla, los pasos siguientes no llegan a correr.
+
+Sin `SUBDOMINIO_WORKERS` el despliegue igual sale, pero el CI avisa con un
+warning que **no comprobó** que el Worker responda. Desplegado y desplegado-y-
+comprobado no son lo mismo.
 
 ## Producción
 
