@@ -109,6 +109,19 @@ describe('reservar() toma de varias bolsas con precedencia distinta', () => {
   })
 })
 
+describe('acreditar() rechaza retenido: solo se entra por reservar()', () => {
+  it('acreditar con bolsa retenido revienta declarado, no via el invariante al persistir', () => {
+    expect(() =>
+      acreditar(billeteraVacia('b1'), op('directo'), {
+        monto: guaranies(10_000),
+        bolsa: 'retenido',
+        concepto: 'intento-directo',
+        origen: 'quien-sea',
+      }),
+    ).toThrow(/retenido no se acredita directo/)
+  })
+})
+
 describe('reservar() rechaza un reserva_id con reserva abierta existente', () => {
   it('caso medido del issue: dos reservas legitimas con el mismo reserva_id no pisan la primera', () => {
     const inicial = acreditar(billeteraVacia('b1'), op('semilla'), {

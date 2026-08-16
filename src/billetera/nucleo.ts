@@ -134,6 +134,14 @@ export function acreditar(
     throw new Error('el credito de promocion no existe sin vencimiento')
   }
 
+  // A retenido solo se entra por reservar(), que mueve plata que ya paso por
+  // esta misma validacion en su bolsa de origen. Sin esta guarda, el unico
+  // freno era el invariante 4 notando el descuadre despues de persistir — una
+  // guarda reactiva, no una regla declarada como la de credito_promocion.
+  if (entrada.bolsa === 'retenido') {
+    throw new Error('retenido no se acredita directo: solo reservar() mueve plata ahi')
+  }
+
   const nueva: Bolsa = {
     tipo: entrada.bolsa,
     monto: entrada.monto,
