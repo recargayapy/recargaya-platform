@@ -1,5 +1,15 @@
 name: Verificar
 
+# Los oraculos del proyecto, corriendo solos en cada cambio.
+# Un oraculo determinista es mejor supervisor que cualquier modelo: no se
+# cansa y no opina.
+#
+# Se llama a `npm run verificar` y NO a cada oraculo por separado, a proposito:
+# asi el CI y la maquina de cualquiera corren exactamente lo mismo. Cuando se
+# agregue un oraculo nuevo, el CI lo ejecuta sin que nadie se acuerde de tocar
+# este archivo. Esa divergencia ya nos costo una entrega: check-esquema.mjs
+# existia en el repo y el CI no lo corria.
+
 on:
   push:
     branches: [main]
@@ -17,15 +27,12 @@ jobs:
 
       - run: npm install
 
-      - name: Tipos
-        run: npm run tipos
+      # tipos + pruebas + esquema + mutacion
+      - name: Verificar
+        run: npm run verificar
 
-      - name: Pruebas
-        run: npm run probar
-
-      - name: Mutacion
-        run: npm run mutar
-
+      # El secreto que nunca tiene que estar. Se busca a proposito porque
+      # esto no falla ruidosamente solo.
       - name: Ningun secreto en el arbol
         run: |
           if git ls-files | grep -E '(^|/)\.dev\.vars$|\.env$'; then
