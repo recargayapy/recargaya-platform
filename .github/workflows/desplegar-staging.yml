@@ -62,9 +62,15 @@ jobs:
       - name: Instalar dependencias
         run: npm ci
 
-      # El comentario de la cabecera dice que produccion no se despliega desde
-      # el CI. Este paso es lo que lo vuelve cierto tambien manana, cuando
-      # alguien edite este archivo sin leer el comentario.
+      # Este paso detecta un despliegue a produccion agregado a CUALQUIER
+      # workflow de .github/workflows/ y hace fallar el job. Tiene un limite:
+      # si el despliegue vive en OTRO workflow disparado por el mismo push a
+      # main, ese workflow arranca en paralelo a este (el mismo motivo que la
+      # cabecera usa para justificar el job unico, aplicado aca) y puede salir
+      # al aire antes de que este paso llegue a fallar. El guardian lo detecta
+      # y avisa en rojo; no lo impide en ese caso. Lo que si impide con
+      # certeza es el caso que va a pasar de verdad: que alguien agregue el
+      # despliegue a ESTE archivo sin leer nada de lo anterior.
       #
       # Los corchetes de `produc[c]ion` NO son un error de tipeo: hacen que el
       # patron no se encuentre a si mismo en esta misma linea. Sin ellos, el
