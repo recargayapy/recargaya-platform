@@ -70,7 +70,7 @@ CREATE TABLE ledger_copia (
   billetera_id   TEXT NOT NULL,
   concepto       TEXT NOT NULL,
   monto          INTEGER NOT NULL,          -- positivo credito, negativo debito
-  bolsa          TEXT NOT NULL CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion')),
+  bolsa          TEXT NOT NULL CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion', 'retenido')),
   clave_idem     TEXT NOT NULL,
   correlacion_id TEXT NOT NULL,
   asentado_en    TEXT NOT NULL,

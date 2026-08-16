@@ -13,7 +13,7 @@
 
 import { type Guaranies, guaranies, CERO } from './monto.js'
 
-export type TipoBolsa = 'disponible' | 'ganancia_creador' | 'credito_promocion'
+export type TipoBolsa = 'disponible' | 'ganancia_creador' | 'credito_promocion' | 'retenido'
 
 export interface Bolsa {
   readonly tipo: TipoBolsa
@@ -49,6 +49,12 @@ export interface ResultadoConsumo {
  * Dentro de un mismo tipo, primero lo que vence antes. A igual vencimiento,
  * el origen alfabetico — desempate arbitrario pero ESTABLE, que es lo que
  * hace la funcion reproducible y por lo tanto probable.
+ *
+ * `retenido` NO esta en esta lista a proposito: es plata de una reserva
+ * abierta, ya afectada a otra cosa. No se gasta — `decidirConsumo` la saca
+ * del juego antes de llegar aca. Si algun dia entra a esta lista por
+ * accidente, `rango()` la va a dejar en el ULTIMO lugar de precedencia, no
+ * fuera de circulacion, que es un defecto distinto y peor.
  */
 const PRECEDENCIA: readonly TipoBolsa[] = ['credito_promocion', 'ganancia_creador', 'disponible']
 
@@ -95,7 +101,15 @@ export function decidirConsumo(
   const tomas: Toma[] = []
   let restante: number = requerido
 
-  for (const bolsa of ordenarPorPrecedencia(bolsas)) {
+  // `retenido` es la plata de una reserva abierta: ya salio de circulacion y
+  // solo puede volver por `liberarReserva()`. Se filtra ACA, antes de ordenar,
+  // en vez de confiar en que `rango()` la mande al final de la precedencia —
+  // eso seria un accidente de implementacion, no una regla declarada. Sin
+  // este filtro, una segunda reserva podria volver a tomar plata que la
+  // primera ya tiene retenida.
+  const disponiblesParaConsumo = bolsas.filter((b) => b.tipo !== 'retenido')
+
+  for (const bolsa of ordenarPorPrecedencia(disponiblesParaConsumo)) {
     if (restante <= 0) break
     if (bolsa.monto <= 0) continue
 

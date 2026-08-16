@@ -111,7 +111,7 @@ const MUTACIONES = [
   {
     invariante: 'reservar() registra de que bolsas salio la reserva',
     archivo: 'src/billetera/nucleo.ts',
-    de: '    tomas: d.valor.tomas,',
+    de: '    tomas: consumo.tomas,',
     a: '    tomas: [],',
   },
   {
@@ -119,6 +119,36 @@ const MUTACIONES = [
     archivo: 'src/billetera/nucleo.ts',
     de: 'const vueltas = devolver(r.tomas, remanente)',
     a: 'const vueltas = devolver(r.tomas, CERO)',
+  },
+  {
+    invariante: 'retenido no se consume en decidirConsumo',
+    archivo: 'src/dinero/bolsas.ts',
+    de: "const disponiblesParaConsumo = bolsas.filter((b) => b.tipo !== 'retenido')",
+    a: 'const disponiblesParaConsumo = bolsas',
+  },
+  {
+    invariante: 'reservar() mueve la plata a retenido, no la debita contra la nada',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  const bolsas = [...bolsasSinTomas, ...retenidas]',
+    a: '  const bolsas = bolsasSinTomas',
+  },
+  {
+    invariante: 'reservar() rechaza un reserva_id con reserva abierta existente',
+    archivo: 'src/billetera/nucleo.ts',
+    de: "  if (estado.reservas.get(entrada.reserva_id)?.estado === 'abierta') {\n    throw new Error(`ya existe una reserva abierta con reserva_id: ${entrada.reserva_id}`)\n  }",
+    a: '',
+  },
+  {
+    invariante: 'liberarReserva() vacia retenido de la reserva que libera',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  const bolsas = [...bolsasSinRetenido, ...vueltas]',
+    a: '  const bolsas = [...estado.bolsas, ...vueltas]',
+  },
+  {
+    invariante: 'retenido cuadra con las reservas abiertas',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    throw new Error(\n      `descuadre en retenido: bolsas ${retenidoEnBolsas} vs reservas abiertas ${retenidoEnReservas}`,\n    )',
+    a: '',
   },
   {
     invariante: 'sin vendedor, su peso no se descarta',
@@ -137,6 +167,30 @@ const MUTACIONES = [
     archivo: 'src/reparto/reparto.ts',
     de: 'const clave = `${venta.pedido_id}:${nombre}`',
     a: 'const clave = `${venta.pedido_id}:${nombre}:${Math.random()}`',
+  },
+  {
+    // El oraculo de esta mutacion NO es vitest: vitest corre sobre
+    // TypeScript, y el CHECK vive en SQL, del otro lado de esa frontera. Es
+    // justo la frontera donde se escondio el defecto de la auditoria — el
+    // agujero que `check-esquema.mjs` existe para cerrar.
+    invariante: 'el CHECK de ledger_copia incluye retenido',
+    archivo: 'migraciones/core/0001_cimientos.sql',
+    de: "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion', 'retenido'))",
+    a: "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion'))",
+    oraculo: ['node', 'herramientas/check-esquema.mjs'],
+  },
+  {
+    invariante: 'check-esquema.mjs detecta un tipo de bolsa que le falta al CHECK',
+    archivo: 'herramientas/check-esquema.mjs',
+    de: 'return { ok: faltantes.length === 0 && sobrantes.length === 0, faltantes, sobrantes }',
+    a: 'return { ok: true, faltantes, sobrantes }',
+    oraculo: ['node', 'herramientas/check-esquema.pruebas.mjs'],
+  },
+  {
+    invariante: 'acreditar() rechaza bolsa retenido: solo reservar() entra ahi',
+    archivo: 'src/billetera/nucleo.ts',
+    de: "  if (entrada.bolsa === 'retenido') {\n    throw new Error('retenido no se acredita directo: solo reservar() mueve plata ahi')\n  }",
+    a: '',
   },
 
   // --- Mutar tambien el arnes ---------------------------------------------
@@ -174,11 +228,17 @@ for (const m of MUTACIONES) {
 
   writeFileSync(m.archivo, original.replace(m.de, m.a))
 
+  // El oraculo por defecto es vitest. Algunas mutaciones atacan un lugar que
+  // vitest no ve — el CHECK de una migracion SQL, o una herramienta de node
+  // plano — y declaran su propio oraculo en vez de fingir que vitest las
+  // cubre.
+  const [cmd, ...args] = m.oraculo ?? ['npx', 'vitest', 'run', '--silent']
+
   let murio = false
   try {
-    execFileSync('npx', ['vitest', 'run', '--silent'], { stdio: 'pipe' })
+    execFileSync(cmd, args, { stdio: 'pipe' })
   } catch {
-    murio = true // la suite fallo: la mutacion murio, que es lo que queremos
+    murio = true // el oraculo fallo: la mutacion murio, que es lo que queremos
   } finally {
     writeFileSync(m.archivo, original)
   }

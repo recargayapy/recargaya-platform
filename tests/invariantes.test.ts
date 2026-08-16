@@ -67,4 +67,20 @@ describe('el oraculo detecta lo que tiene que detectar', () => {
     }
     expect(() => verificarInvariantes(roto)).toThrow(/duplicado/)
   })
+
+  it('grita si retenido no cuadra con las reservas abiertas', () => {
+    // Plata "retenido" sin ninguna reserva abierta que la explique: exactamente
+    // la forma de una reserva huerfana. No hay asiento que la respalde, asi
+    // que el punto 2 (ledger vs bolsas) no la ve — el punto 4 es la unica
+    // comprobacion que puede notar este descuadre especifico.
+    const sano = conSaldo(100_000)
+    const roto: EstadoBilletera = {
+      ...sano,
+      bolsas: [
+        ...sano.bolsas,
+        { tipo: 'retenido', monto: guaranies(10_000), vence_en: null, origen: 'r-fantasma', restringida_a: null },
+      ],
+    }
+    expect(() => verificarInvariantes(roto)).toThrow(/descuadre en retenido/)
+  })
 })

@@ -134,6 +134,14 @@ export function acreditar(
     throw new Error('el credito de promocion no existe sin vencimiento')
   }
 
+  // A retenido solo se entra por reservar(), que mueve plata que ya paso por
+  // esta misma validacion en su bolsa de origen. Sin esta guarda, el unico
+  // freno era el invariante 4 notando el descuadre despues de persistir — una
+  // guarda reactiva, no una regla declarada como la de credito_promocion.
+  if (entrada.bolsa === 'retenido') {
+    throw new Error('retenido no se acredita directo: solo reservar() mueve plata ahi')
+  }
+
   const nueva: Bolsa = {
     tipo: entrada.bolsa,
     monto: entrada.monto,
@@ -226,15 +234,43 @@ export function reservar(
   const previo = yaAplicada<{ reserva_id: string }>(estado, op)
   if (previo !== null) return previo
 
-  const d = debitar(estado, { ...op, clave_idem: `${op.clave_idem}:reserva` }, {
-    monto: entrada.monto,
-    concepto: 'reserva_promocion',
+  // Dos reservas legitimas con el mismo reserva_id (dos claves de idempotencia
+  // distintas, no un reintento) pisarian la entrada anterior en el Map: la
+  // plata de la primera saldria de su bolsa y quedaria sin ningun rastro que
+  // la reclame. Es un error del llamador — reusar un identificador que
+  // todavia esta abierto — no un caso que reservar() deba absorber.
+  if (estado.reservas.get(entrada.reserva_id)?.estado === 'abierta') {
+    throw new Error(`ya existe una reserva abierta con reserva_id: ${entrada.reserva_id}`)
+  }
+
+  const consumo = decidirConsumo(estado.bolsas, entrada.monto, op.momento, {})
+  if (consumo.faltante > 0) throw new SaldoInsuficiente(consumo.faltante)
+
+  // La reserva mueve plata de la bolsa de origen a RETENIDO — no la debita
+  // contra la nada. Sigue viva en una bolsa, visible para `verificarInvariantes`,
+  // y la unica salida es `liberarReserva()`. Cada toma conserva su vencimiento
+  // y restriccion originales para poder devolverse tal cual (ley 11); el tipo
+  // original de cada toma queda en `reserva.tomas`, no en la bolsa retenida.
+  const bolsasSinTomas = aplicarTomas(estado.bolsas, consumo.tomas)
+  const retenidas: Bolsa[] = consumo.tomas.map((t) => ({
+    tipo: 'retenido',
+    monto: t.monto,
+    vence_en: t.bolsa.vence_en,
+    origen: entrada.reserva_id,
+    restringida_a: t.bolsa.restringida_a,
+  }))
+  const bolsas = [...bolsasSinTomas, ...retenidas]
+
+  const asientos = [...estado.asientos]
+  consumo.tomas.forEach((t, i) => {
+    asientos.push(asentar(op, 'reserva_promocion', guaranies(-t.monto), t.bolsa.tipo, `rsv${i}db`))
+    asientos.push(asentar(op, 'reserva_promocion', t.monto, 'retenido', `rsv${i}cr`))
   })
 
   const reservas = new Map(estado.reservas)
   reservas.set(entrada.reserva_id, {
     reserva_id: entrada.reserva_id,
-    tomas: d.valor.tomas,
+    tomas: consumo.tomas,
     consumido: CERO,
     vence_en: entrada.vence_en,
     estado: 'abierta',
@@ -242,7 +278,7 @@ export function reservar(
 
   const valor = { reserva_id: entrada.reserva_id }
   return {
-    estado: { ...d.estado, reservas, aplicadas: marcarAplicada(d.estado, op, valor) },
+    estado: { ...estado, bolsas, asientos, reservas, aplicadas: marcarAplicada(estado, op, valor) },
     valor,
     repetida: false,
   }
@@ -271,8 +307,19 @@ export function liberarReserva(
   const remanente = guaranies(total - r.consumido)
   const vueltas = devolver(r.tomas, remanente)
 
-  const bolsas = [...estado.bolsas, ...vueltas]
+  // Saca de RETENIDO exactamente lo que esta reserva puso ahi: `reservar()`
+  // marco cada bolsa retenida con el reserva_id en su `origen`. Como el
+  // consumo parcial no existe todavia (fuera de alcance), `remanente` es
+  // siempre el total y esto vacia el retenido de esta reserva por completo.
+  const bolsasSinRetenido = estado.bolsas.filter(
+    (b) => !(b.tipo === 'retenido' && b.origen === r.reserva_id),
+  )
+  const bolsas = [...bolsasSinRetenido, ...vueltas]
+
   const asientos = [...estado.asientos]
+  if (remanente > 0) {
+    asientos.push(asentar(op, 'promotion_refund', guaranies(-remanente), 'retenido', 'rf-ret'))
+  }
   vueltas.forEach((b, i) => {
     asientos.push(asentar(op, 'promotion_refund', b.monto, b.tipo, `rf${i}`))
   })
@@ -312,11 +359,6 @@ export function verificarInvariantes(estado: EstadoBilletera): void {
   const enBolsas = new Map<string, number>()
   for (const b of estado.bolsas) enBolsas.set(b.tipo, (enBolsas.get(b.tipo) ?? 0) + b.monto)
 
-  // `reservar()` usa el `debitar()` real: el asiento negativo y la salida de
-  // la bolsa ocurren juntos, en la misma llamada. Una reserva abierta no deja
-  // nada pendiente de reconciliar — sumar de nuevo lo retenido en `tomas`
-  // contaria esa plata dos veces y haria gritar "descuadre" a un estado sano.
-
   for (const [tipo, delLedger] of porBolsa) {
     const enBolsa = enBolsas.get(tipo) ?? 0
     if (delLedger !== enBolsa) {
@@ -329,5 +371,21 @@ export function verificarInvariantes(estado: EstadoBilletera): void {
   for (const a of estado.asientos) {
     if (vistos.has(a.asiento_id)) throw new Error(`asiento duplicado: ${a.asiento_id}`)
     vistos.add(a.asiento_id)
+  }
+
+  // 4. RETENIDO tiene que sumar exactamente lo que las reservas abiertas
+  //    dicen tener tomado. `reservar()` mueve plata a esta bolsa en vez de
+  //    debitarla contra la nada (ver bolsas.ts); si una reserva pisara a otra
+  //    en el Map, o si algo tocara `retenido` por fuera de reservar/liberar,
+  //    esta comparacion es la unica que lo nota — la del punto 2 no alcanza,
+  //    porque compara el ledger contra si mismo y los dos pueden mentir igual.
+  const retenidoEnBolsas = enBolsas.get('retenido') ?? 0
+  const retenidoEnReservas = [...estado.reservas.values()]
+    .filter((r) => r.estado === 'abierta')
+    .reduce((total, r) => total + r.tomas.reduce((s, t) => s + t.monto, 0), 0)
+  if (retenidoEnBolsas !== retenidoEnReservas) {
+    throw new Error(
+      `descuadre en retenido: bolsas ${retenidoEnBolsas} vs reservas abiertas ${retenidoEnReservas}`,
+    )
   }
 }

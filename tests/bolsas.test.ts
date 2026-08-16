@@ -77,6 +77,21 @@ describe('precedencia de consumo', () => {
     expect(r.tomas).toHaveLength(1)
     expect(r.faltante).toBe(20_000) // el resto lo cubre la tarjeta
   })
+
+  it('retenido no se consume: esa plata ya esta afectada a una reserva abierta', () => {
+    const bolsas = [
+      bolsa({ tipo: 'retenido', monto: guaranies(50_000), origen: 'r1' }),
+      bolsa({ tipo: 'disponible', monto: guaranies(10_000) }),
+    ]
+    const r = decidirConsumo(bolsas, guaranies(20_000), AHORA)
+
+    // Alcanzaria de sobra si retenido se pudiera tocar; el faltante prueba
+    // que decidirConsumo ni lo mira.
+    expect(r.tomas).toHaveLength(1)
+    expect(r.tomas[0]?.bolsa.tipo).toBe('disponible')
+    expect(r.tomas[0]?.monto).toBe(10_000)
+    expect(r.faltante).toBe(10_000)
+  })
 })
 
 describe('la regla anticajero (ley 11)', () => {

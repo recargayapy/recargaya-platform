@@ -1,20 +1,23 @@
 /**
  * reservar() / liberarReserva() — la implementacion real de la ley 11.
  *
- * Hasta esta prueba, ninguna de las dos corria bajo ningun test: la ley 11 se
- * probaba solo contra `devolver()` aislada (tests/bolsas.test.ts), nunca por
- * el camino real que pasa por el ledger y por `verificarInvariantes`.
+ * El defecto medido (issue "la plata reservada tiene que ser visible para el
+ * oraculo"): `reservar()` debitaba la plata con un `debitar()` real y la
+ * dejaba viviendo SOLO dentro del Map de reservas, sin bolsa propia. Dos
+ * llamadas legitimas con el mismo `reserva_id` (dos claves de idempotencia
+ * distintas, no un reintento) pisaban la primera entrada del Map: esa plata
+ * quedaba huerfana — salida de su bolsa, asentada en el ledger, sin nada que
+ * la reclame — y el oraculo no tenia con que notarlo, porque ledger y bolsas
+ * cuadraban igual.
  *
- * Escribir la segunda prueba de este archivo destapo un defecto real: el
- * oraculo sumaba de nuevo, en `enBolsas`, la plata retenida en una reserva
- * abierta — plata que `reservar()` ya habia descontado del ledger via un
- * `debitar()` real. El resultado era un descuadre fantasma en cualquier
- * estado sano con una reserva abierta. Se corrigio en nucleo.ts quitando esa
- * reconciliacion, que no correspondia con como reservar() esta escrito hoy.
+ * El arreglo: la reserva mueve la plata a una bolsa `retenido` de verdad
+ * (bolsas.ts), y `reservar()` rechaza de entrada un `reserva_id` que ya
+ * tenga una reserva abierta — el pisado del Map ya no puede ocurrir.
  */
 
 import { describe, it, expect } from 'vitest'
 import { guaranies } from '../src/dinero/monto.js'
+import { saldoRetirable } from '../src/dinero/bolsas.js'
 import {
   type EstadoBilletera,
   billeteraVacia,
@@ -74,6 +77,118 @@ describe('reservar() toma de varias bolsas con precedencia distinta', () => {
 
     expect(estado.reservas.get('r1')?.estado).toBe('abierta')
     expect(() => verificarInvariantes(estado)).not.toThrow()
+  })
+
+  it('la plata reservada vive en la bolsa retenido, no desaparece de las bolsas', () => {
+    const estado = conReservaAbierta()
+
+    // Nada se debita "contra la nada": lo que sale de credito_promocion y de
+    // disponible aparece, entero, como retenido.
+    const retenido = estado.bolsas.filter((b) => b.tipo === 'retenido').reduce((a, b) => a + b.monto, 0)
+    expect(retenido).toBe(50_000)
+
+    // Cada toma llega a retenido con el reserva_id como origen (paso 1 del
+    // arreglo) y con su vencimiento original intacto, para poder devolverse
+    // tal cual en liberarReserva().
+    const retenidoDelCredito = estado.bolsas.find((b) => b.tipo === 'retenido' && b.vence_en === VENCE_CREDITO)
+    expect(retenidoDelCredito?.monto).toBe(30_000)
+    expect(retenidoDelCredito?.origen).toBe('r1')
+
+    // retenido no aparece como disponible ni como credito: la bolsa de origen
+    // efectivamente perdio esa plata.
+    const disponible = estado.bolsas
+      .filter((b) => b.tipo === 'disponible')
+      .reduce((a, b) => a + b.monto, 0)
+    expect(disponible).toBe(100_000 - 20_000)
+    expect(estado.bolsas.some((b) => b.tipo === 'credito_promocion')).toBe(false)
+  })
+
+  it('retenido no cuenta para el saldo retirable', () => {
+    const estado = conReservaAbierta()
+    expect(saldoRetirable(estado.bolsas, AHORA)).toBe(100_000 - 20_000)
+  })
+})
+
+describe('acreditar() rechaza retenido: solo se entra por reservar()', () => {
+  it('acreditar con bolsa retenido revienta declarado, no via el invariante al persistir', () => {
+    expect(() =>
+      acreditar(billeteraVacia('b1'), op('directo'), {
+        monto: guaranies(10_000),
+        bolsa: 'retenido',
+        concepto: 'intento-directo',
+        origen: 'quien-sea',
+      }),
+    ).toThrow(/retenido no se acredita directo/)
+  })
+})
+
+describe('reservar() rechaza un reserva_id con reserva abierta existente', () => {
+  it('caso medido del issue: dos reservas legitimas con el mismo reserva_id no pisan la primera', () => {
+    const inicial = acreditar(billeteraVacia('b1'), op('semilla'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'seed',
+      origen: 'semilla',
+    }).estado
+
+    const conR1 = reservar(inicial, op('res-1'), {
+      reserva_id: 'R1',
+      monto: guaranies(30_000),
+      vence_en: VENCE_RESERVA,
+    }).estado
+
+    // Sin el arreglo, esta segunda llamada pisaba la entrada de R1 en el Map
+    // y los 30.000 de la primera reserva quedaban huerfanos.
+    expect(() =>
+      reservar(conR1, op('res-2'), { reserva_id: 'R1', monto: guaranies(20_000), vence_en: VENCE_RESERVA }),
+    ).toThrow(/ya existe una reserva abierta/)
+
+    // La primera reserva sigue entera: nada se perdio.
+    expect(conR1.reservas.get('R1')?.tomas.reduce((a, t) => a + t.monto, 0)).toBe(30_000)
+    const retenido = conR1.bolsas.filter((b) => b.tipo === 'retenido').reduce((a, b) => a + b.monto, 0)
+    expect(retenido).toBe(30_000)
+    expect(() => verificarInvariantes(conR1)).not.toThrow()
+
+    // liberar despues del intento fallido devuelve exactamente lo reservado,
+    // ni un guarani de mas ni de menos.
+    const { valor } = liberarReserva(conR1, op('lib-1'), { reserva_id: 'R1' })
+    expect(valor.devuelto).toBe(30_000)
+  })
+
+  it('un reintento real (misma clave de idempotencia) no choca con el rechazo', () => {
+    const inicial = acreditar(billeteraVacia('b1'), op('semilla'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'seed',
+      origen: 'semilla',
+    }).estado
+
+    const opReserva = op('res-1')
+    const primera = reservar(inicial, opReserva, { reserva_id: 'R1', monto: guaranies(30_000), vence_en: VENCE_RESERVA })
+    const segunda = reservar(primera.estado, opReserva, {
+      reserva_id: 'R1',
+      monto: guaranies(30_000),
+      vence_en: VENCE_RESERVA,
+    })
+
+    expect(segunda.repetida).toBe(true)
+    expect(segunda.valor).toEqual(primera.valor)
+  })
+
+  it('un reserva_id ya liberado se puede volver a usar', () => {
+    const inicial = acreditar(billeteraVacia('b1'), op('semilla'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'seed',
+      origen: 'semilla',
+    }).estado
+
+    const conR1 = reservar(inicial, op('res-1'), { reserva_id: 'R1', monto: guaranies(30_000), vence_en: VENCE_RESERVA }).estado
+    const liberado = liberarReserva(conR1, op('lib-1'), { reserva_id: 'R1' }).estado
+
+    expect(() =>
+      reservar(liberado, op('res-2'), { reserva_id: 'R1', monto: guaranies(10_000), vence_en: VENCE_RESERVA }),
+    ).not.toThrow()
   })
 })
 
