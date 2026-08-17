@@ -193,9 +193,61 @@ const MUTACIONES = [
     a: '',
   },
 
+  // --- El oraculo del runtime ---------------------------------------------
+  // Estas tres atacan a `check-runtime.mjs`, el oraculo que impide que las
+  // pruebas del Durable Object juzguen sobre un workerd distinto al que
+  // Cloudflare ejecuta. Un oraculo sin jueces fue el defecto n.º 1 de la Fase 0:
+  // se rompio la deteccion de descuadre y ninguna prueba se dio cuenta.
+  {
+    invariante: 'check-runtime detecta que la compatibility_date supera al workerd instalado',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: '  const ok = fechaCompatibilidad <= fechaWorkerd',
+    a: '  const ok = true',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // Sin esta guarda, `1.20260230.0` daba "2026-02-30", que JavaScript corre en
+    // silencio a 2026-03-02: el oraculo comparaba contra una fecha que nadie
+    // escribio, y no tenia forma de notarlo.
+    invariante: 'check-runtime rechaza una version que no codifica una fecha real',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: '  if (Number.isNaN(d.getTime()) || !d.toISOString().startsWith(fecha)) {',
+    a: '  if (false) {',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // Con dos fechas activas en wrangler.jsonc, elegir una es adivinar — y
+    // adivinar es lo que produce el defecto que este oraculo existe para agarrar.
+    invariante: 'check-runtime falla si wrangler.jsonc declara dos compatibility_date',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: '  if (encontradas.length > 1) {',
+    a: '  if (false) {',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+
+  // --- Las pruebas del Durable Object -------------------------------------
+  // Su oraculo NO es vitest a secas: las pruebas del runtime viven en otra
+  // configuracion porque levantan workerd, y no tiene sentido pagar ese arranque
+  // en cada una de las mutaciones de arriba. Si estas dos sobreviven, las nueve
+  // pruebas de `pruebas-runtime/` estan mirando para otro lado.
+  {
+    invariante: 'la prueba de /salud lee los vars del entorno de verdad',
+    archivo: 'src/index.ts',
+    de: '        entorno: entorno.ENTORNO,',
+    a: "        entorno: 'produccion',",
+    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+  },
+  {
+    invariante: 'una ruta desconocida da 404 y no otra cosa',
+    archivo: 'src/index.ts',
+    de: "    return new Response('no encontrado', { status: 404 })",
+    a: "    return new Response('no encontrado', { status: 500 })",
+    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+  },
+
   // --- Mutar tambien el arnes ---------------------------------------------
-  // Un arnes que no puede fallar hace que todo pase. Si estas dos sobreviven,
-  // las pruebas del spike no estan probando la caida: estan probando nada.
+  // Un arnes que no puede fallar hace que todo pase. Si estas sobreviven, las
+  // pruebas no estan probando la caida: estan probando nada.
   {
     invariante: 'el arnes inyecta la caida de verdad',
     archivo: 'tests/arnes.ts',
@@ -207,6 +259,18 @@ const MUTACIONES = [
     archivo: 'tests/arnes.ts',
     de: '    if (completados.has(paso.nombre)) continue',
     a: '',
+  },
+  {
+    // El arnes del runtime tambien se muta. `vitest.runtime.config.ts` dice que
+    // las pruebas leen el entorno `staging` del wrangler.jsonc de verdad; si eso
+    // fuera decorativo, las nueve pruebas correrian contra una configuracion
+    // inventada y nadie se enteraria. Apuntandolo a `produccion`, la prueba de
+    // /salud —que exige `entorno: 'staging'`— tiene que morir.
+    invariante: 'el arnes del runtime lee el entorno que dice leer',
+    archivo: 'vitest.runtime.config.ts',
+    de: "      wrangler: { configPath: './wrangler.jsonc', environment: 'staging' },",
+    a: "      wrangler: { configPath: './wrangler.jsonc', environment: 'produccion' },",
+    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
   },
 ]
 

@@ -69,11 +69,44 @@ se avisa antes de entregarla, no después.
 ## Antes de entregar
 
 ```bash
-npm run verificar     # tipos + pruebas + mutación
+npm run verificar
 ```
 
-Los tres tienen que pasar. El CI corre lo mismo y bloquea el pull request si
-alguno falla.
+Corre los cinco oráculos, en este orden:
+
+| | |
+|---|---|
+| `tipos` | `tsc --noEmit` |
+| `probar` | las pruebas del núcleo puro, en Node |
+| `esquema` | los tipos de TypeScript contra el SQL de las migraciones |
+| `runtime` | que el workerd instalado no sea más viejo que la `compatibility_date`, y las pruebas del Durable Object sobre workerd |
+| `mutar` | rompe el código a propósito; toda mutación tiene que morir |
+
+Los cinco tienen que pasar. El CI llama a `npm run verificar` y **no** a cada
+oráculo por separado: así el CI y la máquina de cualquiera corren exactamente lo
+mismo, y un oráculo nuevo entra sin que nadie toque el workflow.
+
+### Dos suites de pruebas, y por qué
+
+`tests/` prueba el núcleo puro en Node: milisegundos, y es lo que la mutación
+ataca decenas de veces. `pruebas-runtime/` levanta **workerd**, el motor real de
+Cloudflare, y ahí va todo lo que toca el Durable Object — su SQLite, sus
+alarmas, y el rollback de la transacción de storage que hace cumplir la ley 5.
+
+La regla que decide dónde va una prueba: **la plata no se prueba contra una
+imitación.** Si algo depende de un mecanismo de Cloudflare, va en
+`pruebas-runtime/` y corre sobre el mecanismo. Fabricar un doble de la storage
+sería un doble más permisivo que el original, y probaría el doble.
+
+```bash
+npm run probar:runtime    # sólo las del runtime, mientras se trabaja
+```
+
+**El runtime de prueba tiene que ser el del despliegue.** Si la
+`compatibility_date` de `wrangler.jsonc` es posterior a la fecha del workerd
+instalado, miniflare la baja en silencio y las pruebas juzgan sobre otro motor.
+`herramientas/check-runtime.mjs` lo mide y falla. Se arregla **subiendo
+wrangler**, nunca bajando la `compatibility_date`.
 
 ## Reglas del repositorio
 
