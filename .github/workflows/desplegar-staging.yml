@@ -84,7 +84,7 @@ jobs:
           fi
           echo "ningun workflow toca produccion"
 
-      # tipos + pruebas + esquema + mutacion. Si esto falla, no se migra ni se
+      # entorno + tipos + pruebas + esquema + runtime + mutacion. Si esto falla, no se migra ni se
       # despliega: los pasos de abajo no llegan a correr.
       - name: Verificar
         run: npm run verificar

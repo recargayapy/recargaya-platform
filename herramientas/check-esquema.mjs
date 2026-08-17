@@ -14,9 +14,18 @@
  */
 
 import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { invocadoDirecto } from './invocado-directo.mjs'
 
-const ARCHIVO_TIPOS = 'src/dinero/bolsas.ts'
-const ARCHIVO_MIGRACION = 'migraciones/core/0001_cimientos.sql'
+// La raiz sale de la ubicacion de este archivo y no del directorio desde el que
+// se lo invoca. Antes eran rutas relativas al cwd: corrido desde `herramientas/`
+// moria con un ENOENT y un stack pelado. Un oraculo cuyo veredicto depende de
+// donde estabas parado es lo mismo que el defecto n.º 6 de la Fase 0 con otro
+// disfraz. Los otros dos oraculos ya lo resolvian asi; este quedo atras.
+const RAIZ = fileURLToPath(new URL('..', import.meta.url))
+const ARCHIVO_TIPOS = join(RAIZ, 'src', 'dinero', 'bolsas.ts')
+const ARCHIVO_MIGRACION = join(RAIZ, 'migraciones', 'core', '0001_cimientos.sql')
 
 export function extraerTipoBolsa(contenido) {
   const m = contenido.match(/export type TipoBolsa = ([^\n]+)/)
@@ -61,6 +70,4 @@ function main() {
   console.log(`  check-esquema: TipoBolsa y el CHECK de ledger_copia coinciden (${tipos.join(', ')})`)
 }
 
-if (process.argv[1] !== undefined && process.argv[1].endsWith('check-esquema.mjs')) {
-  main()
-}
+if (invocadoDirecto(import.meta)) main()

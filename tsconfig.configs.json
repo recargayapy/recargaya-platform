@@ -1,0 +1,18 @@
+{
+  // Los archivos de configuracion de vitest, con los tipos de Node.
+  //
+  // Van en su propio tsconfig y no en el principal porque necesitan `node:fs` y
+  // `src/` no tiene que ver los globals de Node — corre en el Worker, y un
+  // `process.env` que compila es un `process.env` que explota en Cloudflare.
+  //
+  // Que esto exista igual es lo que importa: la primera version de
+  // `vitest.runtime.config.ts` declaraba una opcion (`singleWorker`) que el pool
+  // ya no acepta, y su schema descarta las claves desconocidas EN SILENCIO. Estaba
+  // escrita, comentada y explicada, y no hacia nada. Con el archivo bajo `tsc`,
+  // una opcion inventada no compila.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["vitest.config.ts", "vitest.runtime.config.ts"]
+}

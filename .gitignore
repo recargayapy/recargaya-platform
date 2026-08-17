@@ -25,3 +25,9 @@ capturas/diff/
 
 # Sistema
 .DS_Store
+
+# Temporal de herramientas/check-entorno.mjs — lleva el pid en el nombre para
+# que dos corridas simultaneas no se pisen. Se borra en el finally; queda aca
+# por si el proceso muere de un Ctrl-C. El patron cubre tambien el nombre sin pid
+# que usaba la version anterior.
+.check-entorno.*temporal.d.ts

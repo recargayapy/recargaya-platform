@@ -69,11 +69,107 @@ se avisa antes de entregarla, no después.
 ## Antes de entregar
 
 ```bash
-npm run verificar     # tipos + pruebas + mutación
+npm run verificar
 ```
 
-Los tres tienen que pasar. El CI corre lo mismo y bloquea el pull request si
-alguno falla.
+Corre los siete oráculos, en este orden:
+
+| | |
+|---|---|
+| `entorno` | que `worker-configuration.d.ts` sea exactamente lo que genera `wrangler.jsonc` |
+| `tipos` | `tsc --noEmit` |
+| `probar` | las pruebas del núcleo puro, en Node |
+| `esquema` | los tipos de TypeScript contra el SQL de las migraciones |
+| `portabilidad` | que ninguna herramienta lance un comando por nombre |
+| `runtime` | que la `compatibility_date` del entorno de pruebas esté escrita, y las pruebas del Durable Object sobre workerd |
+| `mutar` | rompe el código a propósito; toda mutación tiene que morir |
+
+Los siete tienen que pasar. El CI llama a `npm run verificar` y **no** a cada
+oráculo por separado: así el CI y la máquina de cualquiera corren exactamente lo
+mismo, y un oráculo nuevo entra sin que nadie toque el workflow.
+
+Cuatro de los siete existen para cubrir una **frontera** donde `tsc` no llega, y
+son la misma idea aplicada cuatro veces:
+
+| Frontera | Oráculo |
+|---|---|
+| TypeScript ↔ el SQL de las migraciones | `check-esquema.mjs` |
+| TypeScript ↔ los bindings de `wrangler.jsonc` | `check-entorno.mjs` |
+| El arnés de pruebas ↔ el runtime con el que corre | `check-runtime.mjs` |
+| Nuestras herramientas ↔ el sistema operativo | `check-portabilidad.mjs` |
+
+Cuando aparezca una frontera nueva, el patrón es ése: una herramienta de Node
+plano, con funciones puras exportadas, sus pruebas propias en
+`*.pruebas.mjs`, y su mutación en `mutar.mjs`.
+
+### Dos suites de pruebas, y por qué
+
+`tests/` prueba el núcleo puro en Node: milisegundos, y es lo que la mutación
+ataca decenas de veces. `pruebas-runtime/` levanta **workerd**, el motor real de
+Cloudflare, y ahí va todo lo que toca el Durable Object — su SQLite, sus alarmas
+y el rollback de la transacción de storage.
+
+La regla que decide dónde va una prueba: **la plata no se prueba contra una
+imitación.** Si algo depende de un mecanismo de Cloudflare, va en
+`pruebas-runtime/` y corre sobre el mecanismo. Fabricar un doble de la storage
+sería un doble más permisivo que el original, y probaría el doble.
+
+```bash
+npm run probar:runtime    # sólo las del runtime, mientras se trabaja
+```
+
+**Una prueba de `pruebas-runtime/` no vale por estar ahí.** Una auditoría midió
+que, de las que hay hoy, sólo dos están ancladas a código de `src/`; unas pocas
+más cubren una convención de este árbol, y el resto son **sondas de la
+plataforma**: verifican que Cloudflare se comporta como suponemos, no que nuestro
+código lo use. Medido: si el `BilleteraDO` escribiera el asiento y el evento del
+outbox en dos `exec` sueltos, sin transacción, todas pasarían igual — **la ley 5
+todavía no tiene oráculo.** El encabezado de `pruebas-runtime/runtime.test.ts`
+lleva el reparto exacto.
+
+De ahí la regla para las que vengan:
+
+> Si el DDL, la transacción o la alarma viven dentro de la prueba, la prueba es
+> una sonda. Para que sea un oráculo, eso tiene que vivir en `src/`, exportado, y
+> la prueba tiene que ejecutar **eso** — recién entonces hay una línea que la
+> mutación puede romper.
+
+**El aislamiento entre pruebas del runtime es una convención.** No hay reseteo de
+storage entre pruebas del mismo archivo en esta versión del pool: cada prueba usa
+un Durable Object cuyo nombre sale del **camino completo** de la prueba —
+`task.fullName`, no `task.name`, porque dos `it` con el mismo texto en dos
+`describe` distintos colisionaban. Hay dos pruebas homónimas a propósito y una
+mutación que lo rompe, para que la convención no sea sólo una promesa.
+
+**Ninguna prueba lleva una fecha absoluta cableada.** Una que decía
+`Date.parse('2026-08-17T15:00:00Z')` pasó a las 13:53 UTC y falló a las 15:11 del
+mismo día. Un instante futuro se calcula, no se escribe.
+
+**La `compatibility_date` del entorno de pruebas tiene que estar escrita.** Si
+falta, miniflare pone la fecha de **hoy del reloj del sistema** y el mismo commit
+pasa hoy y falla el miércoles. `herramientas/check-runtime.mjs` lo mide y falla.
+Un comentario no cuenta como fecha.
+
+**Con qué configuración y con qué entorno corre el arnés del runtime vive en
+`pruebas-runtime/arnes-del-runtime.json`,** y no en literales repartidos. Lo leen
+tres lados: el arnés, `check-runtime.mjs` y `check-entorno.mjs`. Un dato que tres
+archivos necesitan y cada uno escribe a mano deriva; un archivo de datos no puede.
+Antes de esto, un oráculo sacaba el nombre del entorno parseando el TypeScript del
+arnés con una expresión regular, y un glob `'src/**'` alcanzaba para romperlo.
+
+**Windows no es un detalle de despliegue: es la máquina del dueño.** Todo lo que
+esta sesión verifica corre en Linux, así que un defecto que sólo aparece en Windows
+pasa las tres vueltas de auditoría sin que nadie lo vea. Ya pasó dos veces —`npx`
+que en Windows es `npx.cmd`, y un symlink de directorio que ahí pide permisos de
+administrador—. La regla que quedó: **cualquier cosa que toque el sistema de
+archivos o lance un proceso se escribe de la forma que anda en las tres
+plataformas**, no de la que anda acá.
+
+**Ningún número va escrito en un comentario si se puede contar.** Tres vueltas de
+auditoría seguidas encontraron números viejos en la prosa — «cuatro pruebas» cuando
+eran nueve, «28 mutaciones» cuando eran 34, «15 nuevas» cuando eran 10. Los que
+manda son los que imprime `npm run verificar`; en la prosa va un puntero al lugar
+único donde el reparto está escrito.
 
 ## Reglas del repositorio
 

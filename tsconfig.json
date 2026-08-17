@@ -4,7 +4,10 @@
     "lib": ["ES2022"],
     "module": "ES2022",
     "moduleResolution": "bundler",
-    "types": ["@cloudflare/workers-types"],
+    // `cloudflare:test` no es un paquete de npm: es un modulo que existe solo
+    // adentro del runtime de prueba. Sus tipos salen de aca, y sin esta linea
+    // `import { env } from 'cloudflare:test'` no compila.
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"],
 
     "strict": true,
     "noUncheckedIndexedAccess": true,
@@ -20,5 +23,17 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  // Los archivos de configuracion NO entran aca: entran por
+  // `tsconfig.configs.json`, que les da los tipos de Node.
+  //
+  // La separacion no es burocracia. `src/` corre en el Worker y no tiene que ver
+  // los globals de Node: si `types` incluyera "node", un `process.env` o un
+  // `Buffer` en el codigo del dinero compilarian y explotarian en Cloudflare. Los
+  // configs, en cambio, corren en Node y necesitan `node:fs`.
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "pruebas-runtime/**/*.ts",
+    "worker-configuration.d.ts"
+  ]
 }

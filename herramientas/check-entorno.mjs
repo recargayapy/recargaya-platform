@@ -1,0 +1,273 @@
+#!/usr/bin/env node
+/**
+ * Oraculo: los tipos de los bindings tienen que salir de `wrangler.jsonc`, no de
+ * una copia escrita a mano.
+ *
+ * El defecto que motiva esto lo encontro una auditoria de esta misma entrega, y
+ * lo midio en las dos direcciones sobre `src/index.ts`:
+ *
+ *   · Se agrego una var a `wrangler.jsonc` y NO a `Entorno`: `tsc` limpio y todas
+ *     las pruebas verdes (entonces eran 12 las del runtime). Nada falla; el Worker
+ *     simplemente no la ve.
+ *   · Se declaro en `Entorno` un `PAGOS: DurableObjectNamespace<...>` y un
+ *     `CLAVE_BANCARIA: string` que `wrangler.jsonc` no tiene: `tsc` limpio. En
+ *     runtime valen `undefined` sin un solo ruido, y el codigo que los use
+ *     explota con `Cannot read properties of undefined`.
+ *
+ * O sea: `Entorno` era un doble de la configuracion, y nada lo comparaba contra
+ * el original. Es el mismo agujero que `check-esquema.mjs` cierra entre
+ * TypeScript y el SQL de las migraciones, en otra frontera.
+ *
+ * Como se cierra: `wrangler types` genera la interfaz DESDE la configuracion.
+ * `worker-configuration.d.ts` no se escribe a mano nunca — se regenera y se
+ * compara. Y en `pruebas-runtime/runtime.test.ts` hay una linea que le pide a
+ * TypeScript que `Entorno` sea satisfecho por el `Cloudflare.Env` generado, asi
+ * que un `Entorno` que promete de mas no compila.
+ *
+ * Por que regenerar y comparar, y no `wrangler types --check`: medido, `--check`
+ * sale 1 cuando cambio `wrangler.jsonc` (bien) pero sale 0 cuando alguien EDITA
+ * el archivo generado (mal — compara un hash de la configuracion, no el
+ * contenido). Un oraculo que no nota que le tocaron el archivo que custodia no
+ * sirve. Regenerar y comparar el contenido entero cubre los dos casos.
+ *
+ * Uso:  node herramientas/check-entorno.mjs
+ */
+
+import { readFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { invocadoDirecto } from './invocado-directo.mjs'
+import { comando } from './binarios.mjs'
+import { leerArnesDesde } from './arnes-del-runtime.mjs'
+
+const RAIZ = fileURLToPath(new URL('..', import.meta.url))
+export const GENERADO = 'worker-configuration.d.ts'
+
+
+/**
+ * Los argumentos con los que se genera. Van en una constante y no repetidos en
+ * dos lugares: si el comando de la documentacion y el del oraculo divergen, el
+ * oraculo compara contra algo que nadie genera.
+ *
+ * `--include-runtime=false` deja el archivo en menos de 1 KB en vez de 543 KB:
+ * los tipos del runtime ya los trae `@cloudflare/workers-types`, que es
+ * dependencia igual. Lo unico que hace falta generar es el `Env`.
+ */
+/**
+ * Los argumentos de generacion, para el entorno que declara el arnes.
+ *
+ * Es una funcion y no una constante porque el entorno se lee de un archivo, y
+ * leerlo en el cuerpo del modulo hacia que un archivo movido explotara con un
+ * stack de `ModuleJob.run` que se llevaba puestos tambien a `generar-tipos.mjs` y
+ * a las pruebas. Adentro de una funcion, el que decide que mensaje dar es `main()`.
+ *
+ * No dice 'staging' a mano: `check-runtime.mjs` se tomo el trabajo de no suponer
+ * el entorno, y este archivo lo suponia.
+ */
+export function argumentos(entorno) {
+  return ARGUMENTOS_BASE_1.concat([entorno], ARGUMENTOS_BASE_2)
+}
+
+// NO lleva 'wrangler' adelante: el binario lo pone `comando('wrangler', ...)` de
+// `binarios.mjs`. Lo llevaba, y los dos call sites hacian `slice(2)` para sacarlo
+// junto con el subcomando — o sea que tambien se comian `types`, y wrangler
+// respondia con su pantalla de ayuda. Un dato repetido en dos lugares con un
+// `slice` en el medio es un error esperando fecha.
+const ARGUMENTOS_BASE_1 = ['types', '--env']
+
+const ARGUMENTOS_BASE_2 = [
+  '--include-runtime=false',
+  // NO se pasa `--strict-vars=false`, y la razon es un defecto que ese flag
+  // introdujo y que encontro la tercera vuelta de auditoria: sin los literales,
+  // `wrangler types --env staging` y `--env produccion` generan el archivo BYTE A
+  // BYTE IDENTICO, porque lo unico que registra el entorno es el literal de cada
+  // var. Y la unica linea que nombra el `--env` es justo la que `compararGenerado`
+  // normaliza. O sea que el oraculo quedaba ciego al entorno: apuntar el arnes a
+  // `produccion` y no regenerar nada daba OK.
+  //
+  // Se habia puesto para que la comprobacion de tipos de `runtime.test.ts` cerrara
+  // en las dos direcciones. Eso ahora se resuelve alla, con una comprobacion sobre
+  // las CLAVES en vez de asignabilidad mutua de tipos.
+  '--path',
+]
+
+/**
+ * Compara dos textos ignorando el final de linea, para que el veredicto no
+ * cambie entre Windows y Linux. El defecto n.º 6 de la Fase 0 fue exactamente
+ * eso: el mismo commit fallaba en Windows y pasaba en el CI.
+ *
+ * Y descarta UNA linea: la que wrangler escribe con el comando que uso para
+ * generar. Esa linea embute la ruta de salida, asi que regenerar a otro nombre de
+ * archivo la cambia siempre:
+ *
+ *     // Generated by Wrangler by running `wrangler types ...`                (hash: XXXX)
+ *     // Generated by Wrangler by running `wrangler types ... .temporal.d.ts`  (hash: XXXX)
+ *
+ * (El `hash` NO depende de la ruta: es un resumen de la configuracion, y medido,
+ * sale identico en los dos lados — de ahi el mismo `XXXX` en los dos. No se
+ * transcribe el valor real a proposito: una version anterior de este comentario
+ * mostraba dos hashes distintos como evidencia de algo, y los dos estaban
+ * inventados; la version siguiente puso uno real que el commit dejo obsoleto en el
+ * mismo momento. Un hash transcrito en un comentario es basura con fecha de
+ * vencimiento.)
+ *
+ * Se reemplaza por un marcador en los dos lados —en vez de borrarla— para que los
+ * numeros de linea que reporta el error sigan siendo los del archivo de verdad.
+ * Lo que se pierde es el chequeo del `hash`, y no importa: aca se compara el
+ * contenido entero, que es estrictamente mas fuerte.
+ */
+export function compararGenerado(comprometido, regenerado) {
+  const normalizar = (s) =>
+    s
+      .replace(/\r\n/g, '\n')
+      .replace(/^\/\/ Generated by Wrangler by running .*$/m, '// (encabezado de wrangler)')
+      .trimEnd()
+  const a = normalizar(comprometido)
+  const b = normalizar(regenerado)
+  if (a === b) return { ok: true, lineaDistinta: null, esperada: null, encontrada: null }
+
+  const la = a.split('\n')
+  const lb = b.split('\n')
+  for (let i = 0; i < Math.max(la.length, lb.length); i += 1) {
+    if (la[i] !== lb[i]) {
+      return { ok: false, lineaDistinta: i + 1, esperada: lb[i] ?? '(no existe)', encontrada: la[i] ?? '(no existe)' }
+    }
+  }
+  return { ok: false, lineaDistinta: null, esperada: null, encontrada: null }
+}
+
+function main() {
+  let arnes
+  try {
+    arnes = leerArnesDesde(RAIZ)
+  } catch (e) {
+    console.error('')
+    console.error('  check-entorno: NO SE PUDO LEER LA CONFIGURACION DEL ARNES')
+    console.error('')
+    console.error(`    ${e.message}`)
+    console.error('')
+    console.error('  De ahi sale el entorno con el que se generan los tipos de los bindings.')
+    console.error('')
+    process.exit(1)
+  }
+
+  const args = argumentos(arnes.environment)
+
+  let comprometido
+  try {
+    comprometido = readFileSync(join(RAIZ, GENERADO), 'utf8')
+  } catch {
+    console.error('')
+    console.error(`  check-entorno: FALTA ${GENERADO}`)
+    console.error('')
+    console.error('  Es el archivo que le da tipos a los bindings, generado desde')
+    console.error('  wrangler.jsonc. Se regenera con:')
+    console.error('')
+    console.error('      npm run tipos:generar')
+    console.error('')
+    process.exit(1)
+  }
+
+  // El temporal va en la RAIZ DEL REPOSITORIO, no en /tmp. No es pereza: el
+  // archivo generado contiene `import("./src/index")`, una ruta relativa a su
+  // propia ubicacion. Generado en /tmp, wrangler escribe
+  // `import("../../root/recargaya-platform/src/index")` y la comparacion nunca
+  // puede coincidir.
+  //
+  // Lleva el pid en el nombre porque dos corridas simultaneas SOBRE LA MISMA COPIA
+  // DE TRABAJO —dos terminales, o un `verificar` a mano mientras corre otro— se
+  // pisaban el archivo, y una de las dos moria con un ENOENT que se leia como una
+  // falla del oraculo. Medido: fallaba en las tres rondas que se probaron.
+  //
+  // (Una version anterior de este comentario decia que el caso venia de los dos
+  // workflows del CI. Es falso: corren en runners efimeros distintos, con
+  // checkouts distintos, y no pueden pisarse un archivo.)
+  const destino = join(RAIZ, `.check-entorno.${process.pid}.temporal.d.ts`)
+
+  // El `finally` de abajo tiene que correr SIEMPRE, asi que nada de `process.exit`
+  // adentro del `try`: `process.exit()` termina el proceso de inmediato y el
+  // `finally` no corre. La version anterior salia asi en el camino de falla, con
+  // un comentario prometiendo que el temporal «se borra solo» — y cada corrida
+  // fallida lo dejaba. Se junta el veredicto y se actua despues.
+  let fallo = null
+  let cmp = null
+
+  try {
+    // Se lanza el wrangler de `node_modules` con el mismo Node que ya corre, en vez
+    // de `npx`. Ver `binarios.mjs`: `npx` en Windows es `npx.cmd`, y desde Node
+    // 20.12 un `.cmd` no se puede lanzar sin `shell: true` — y `shell: true` mete
+    // las reglas de comillas del sistema en el medio, que es justo lo que este
+    // archivo intenta que no importe.
+    const [ejecutable, ...resto] = comando('wrangler', ...args, destino)
+    const r = spawnSync(ejecutable, resto, { cwd: RAIZ, encoding: 'utf8' })
+    if (r.status !== 0) {
+      // Las ultimas tres lineas UTILES: wrangler cierra con lineas vacias y con
+      // la ruta de un archivo de log, y un `slice(-3)` pelado se comia lo unico
+      // que sirve — por ejemplo «No environment found in configuration with name
+      // "inventado". The available ... are: ["staging","produccion"]».
+      const utiles = `${r.stderr || ''}\n${r.stdout || ''}`
+        .split('\n')
+        .map((l) => l.replace(/\u001b\[[0-9;]*m/g, '').trim())
+        .filter((l) => l !== '' && !l.startsWith('🪵') && !/^[─━]+$/.test(l))
+        .slice(-3)
+      fallo = `wrangler types fallo:\n    ${utiles.join('\n    ')}`
+    } else {
+      cmp = compararGenerado(comprometido, readFileSync(destino, 'utf8'))
+    }
+  } catch (e) {
+    fallo = e.message
+  } finally {
+    rmSync(destino, { force: true })
+  }
+
+  if (fallo !== null) {
+    console.error('')
+    console.error('  check-entorno: NO SE PUDO REGENERAR LOS TIPOS')
+    console.error('')
+    console.error(`    ${fallo}`)
+    console.error('')
+    process.exit(1)
+  }
+
+  if (cmp === null) {
+    // No deberia pasar: si `spawnSync` sale distinto de 0, o tira, o el
+    // `readFileSync` del temporal falla, el `catch` de arriba setea `fallo` y ya
+    // salimos. Pero el invariante lo sostenia la lectura y no la estructura, y el
+    // dia que alguien agregue una rama que no setee ninguna de las dos, `cmp.ok`
+    // tiraba un TypeError con un stack pelado — el modo de falla que este archivo
+    // se toma el trabajo de evitar en todos los demas caminos.
+    console.error('')
+    console.error('  check-entorno: NO SE PUDO COMPARAR (no deberia pasar — reportalo)')
+    console.error('')
+    process.exit(1)
+  }
+
+  {
+    if (!cmp.ok) {
+      console.error('')
+      console.error(`  check-entorno: ${GENERADO} NO COINCIDE CON wrangler.jsonc`)
+      console.error('')
+      if (cmp.lineaDistinta !== null) {
+        console.error(`    primera diferencia, linea ${cmp.lineaDistinta}:`)
+        console.error(`      en el repositorio : ${cmp.encontrada}`)
+        console.error(`      deberia decir     : ${cmp.esperada}`)
+        console.error('')
+      }
+      console.error('  O cambio la configuracion y nadie regenero los tipos, o alguien edito')
+      console.error('  el archivo generado a mano. Las dos cosas terminan igual: el codigo')
+      console.error('  compila contra bindings que no existen, y en runtime valen undefined')
+      console.error('  sin un solo ruido.')
+      console.error('')
+      console.error('  Se arregla regenerando, nunca editando:')
+      console.error('')
+      console.error(`      npm run tipos:generar`)
+      console.error('')
+      process.exit(1)
+    }
+  }
+
+  console.log(`  check-entorno: OK — ${GENERADO} coincide con wrangler.jsonc`)
+}
+
+if (invocadoDirecto(import.meta)) main()

@@ -17,7 +17,22 @@
  */
 
 import { readFileSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
+import { ORACULO_NUCLEO, ORACULO_RUNTIME, ORACULO_TIPOS } from './binarios.mjs'
+
+/** Un oraculo de Node plano: el MISMO Node que ya corre, no el que este en el
+ *  PATH. Ver `binarios.mjs` — un comando por nombre depende del sistema. */
+const conNode = (archivo) => [process.execPath, archivo]
+
+// La raiz sale de la ubicacion de este archivo y no del cwd. Corrido desde
+// `herramientas/` moria con un ENOENT y un stack pelado. Los tres oraculos ya lo
+// resolvian asi; este quedo atras — la categoria se arreglo en tres de cuatro
+// lugares, que es la forma mas facil de creer que se arreglo.
+const RAIZ = fileURLToPath(new URL('..', import.meta.url))
+const rutaDe = (archivo) => join(RAIZ, archivo)
 
 /**
  * Cada mutacion nombra el invariante que ataca. Si alguna sobrevive, el nombre
@@ -177,14 +192,14 @@ const MUTACIONES = [
     archivo: 'migraciones/core/0001_cimientos.sql',
     de: "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion', 'retenido'))",
     a: "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion'))",
-    oraculo: ['node', 'herramientas/check-esquema.mjs'],
+    oraculo: conNode('herramientas/check-esquema.mjs'),
   },
   {
     invariante: 'check-esquema.mjs detecta un tipo de bolsa que le falta al CHECK',
     archivo: 'herramientas/check-esquema.mjs',
     de: 'return { ok: faltantes.length === 0 && sobrantes.length === 0, faltantes, sobrantes }',
     a: 'return { ok: true, faltantes, sobrantes }',
-    oraculo: ['node', 'herramientas/check-esquema.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
   },
   {
     invariante: 'acreditar() rechaza bolsa retenido: solo reservar() entra ahi',
@@ -193,9 +208,245 @@ const MUTACIONES = [
     a: '',
   },
 
+  // --- Los oraculos nuevos ------------------------------------------------
+  // Un oraculo sin jueces fue el defecto n.º 1 de la Fase 0: se rompio la
+  // deteccion de descuadre y ninguna prueba se dio cuenta. Las de este bloque
+  // atacan a los oraculos y a los modulos que comparten, y su oraculo son las
+  // pruebas propias de cada herramienta. (No lleva un numero a proposito: la
+  // version anterior decia «estas siete» cuando eran ocho.)
+  {
+    // EL caso que check-runtime existe para agarrar: sin fecha declarada,
+    // miniflare pone la del reloj del sistema. Si el oraculo inventara una, el
+    // agujero queda abierto y encima con un OK arriba.
+    invariante: 'check-runtime no inventa una fecha cuando no hay ninguna declarada',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: '  return { fecha: null, origen: null }\n}',
+    a: "  return { fecha: '2026-08-01', origen: 'inventada' }\n}",
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // La fecha de `env.<entorno>` gana sobre la de la raiz, porque es la que usa
+    // wrangler. La version anterior de esta herramienta declaraba el caso un
+    // conflicto irresoluble y fallaba.
+    invariante: 'check-runtime resuelve la fecha del entorno por sobre la de la raiz',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: "  if (typeof delEntorno === 'string') return { fecha: delEntorno, origen: `env.${entorno}` }",
+    a: '',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // Un entorno que `wrangler.jsonc` no declara resolveria contra la nada. Antes
+    // se caia a la fecha de la raiz y salia OK: un veredicto sobre un entorno
+    // inexistente, con la palabra OK arriba.
+    invariante: 'check-runtime exige que el entorno de pruebas exista en wrangler.jsonc',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: '    if (config?.env?.[entorno] === undefined) {',
+    a: '    if (false) {',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // El bloque `miniflare: {}` del pool es laxo y TypeScript no lo revisa. Un
+    // `compatibilityDate` ahi gana sobre todo lo que el oraculo resuelve, y
+    // quedaria imprimiendo OK sobre una fecha que no es la efectiva.
+    invariante: 'check-runtime prohibe que el arnes imponga la fecha por su cuenta',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: "  const m = /^[^\\n]*?\\b(compatibilityDate|compatibility_date)\\s*:/m.exec(texto)",
+    a: '  const m = null',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // El guard compartido de los tres oraculos. Con un guard por nombre de
+    // archivo, invocar un oraculo por un symlink lo neutralizaba: importaba el
+    // modulo, no verificaba nada y salia con 0.
+    invariante: 'el guard distingue invocado de importado',
+    archivo: 'herramientas/invocado-directo.mjs',
+    de: "  if (typeof meta.main === 'boolean') return meta.main",
+    a: '',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // El respaldo por comparacion de rutas, para un Node anterior a la 22.18. Las
+    // pruebas le pasan un `meta` sin `main` justamente para ejercitarlo.
+    invariante: 'el respaldo del guard compara la ruta real del modulo',
+    archivo: 'herramientas/invocado-directo.mjs',
+    de: '    return realpathSync(arrancado) === realpathSync(fileURLToPath(meta.url))',
+    a: '    return true',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // El `catch` tiene que responder `false`. Devolvia `true` —«ante la duda,
+    // corre»— y con eso importar `check-entorno.mjs` desde `generar-tipos.mjs`
+    // ejecutaba `main()` del oraculo adentro del import: cuando los tipos no
+    // coincidian, hacia `process.exit(1)` antes de generar y el generador quedaba
+    // incapaz de arreglar al oraculo.
+    invariante: 'el guard no arranca un oraculo cuando no sabe de donde viene',
+    archivo: 'herramientas/invocado-directo.mjs',
+    de: '  } catch {\n    return false\n  }',
+    a: '  } catch {\n    return true\n  }',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // El configPath del arnes tiene que ser el wrangler.jsonc del proyecto. Era el
+    // agujero grande de esta familia: apuntado a otra configuracion, los oraculos
+    // aprobaban un archivo que las pruebas no leian.
+    invariante: 'el arnes no puede leer otra configuracion que la del proyecto',
+    archivo: 'herramientas/arnes-del-runtime.mjs',
+    de: '  if (d.configPath !== CONFIG_ESPERADO) {',
+    a: '  if (false) {',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    invariante: 'el arnes declara un environment que es texto',
+    archivo: 'herramientas/arnes-del-runtime.mjs',
+    de: "  if (typeof d.environment !== 'string' || d.environment === '') {",
+    a: '  if (false) {',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // Y que `check-esquema.mjs` use el guard compartido. La primera version de
+    // este arreglo lo cambio solo en `check-runtime.mjs` y dejo este con el guard
+    // por nombre: se arreglo el caso y no la categoria, en el mismo commit que
+    // presumia de arreglar categorias.
+    invariante: 'check-esquema corre de verdad cuando se lo invoca',
+    archivo: 'herramientas/check-esquema.mjs',
+    de: 'if (invocadoDirecto(import.meta)) main()',
+    a: 'if (false) main()',
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    // Un comentario de bloque con una fecha vieja adentro no es una fecha. El
+    // extractor anterior —lineas que arrancan con `//`— la tomaba como valida.
+    invariante: 'check-runtime no toma como fecha la que vive en un comentario de bloque',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: "    if (c === '/' && d === '*') {",
+    a: '    if (false) {',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // Una barra doble adentro de una cadena no abre un comentario. Sin esta
+    // rama, una URL en la configuracion se come el resto de la linea.
+    invariante: 'check-runtime sabe cuando esta adentro de una cadena',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: "    if (c === '\"') {\n      enCadena = true",
+    a: '    if (false) {\n      enCadena = true',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // `2026-02-30` no existe y JavaScript la corre en silencio a 2026-03-02.
+    invariante: 'check-runtime rechaza una fecha que no existe',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: "  return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(fecha)",
+    a: '  return true',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    // El guard del CLI, ahora compartido. Las pruebas de punta a punta lo cubren.
+    invariante: 'check-runtime corre de verdad cuando se lo invoca',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: 'if (invocadoDirecto(import.meta)) main()',
+    a: 'if (false) main()',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    invariante: 'check-entorno detecta que los tipos generados no coinciden',
+    archivo: 'herramientas/check-entorno.mjs',
+    de: "  if (a === b) return { ok: true, lineaDistinta: null, esperada: null, encontrada: null }",
+    a: '  return { ok: true, lineaDistinta: null, esperada: null, encontrada: null }',
+    oraculo: conNode('herramientas/check-entorno.pruebas.mjs'),
+  },
+  {
+    // La normalizacion del encabezado tiene que sacar UNA linea, no todos los
+    // comentarios: si sacara cualquier `//`, una edicion a mano al final de una
+    // linea de codigo pasaria inadvertida, que es justo el caso que
+    // `wrangler types --check` no agarra y por el que existe esta herramienta.
+    invariante: 'check-entorno normaliza solo el encabezado, no todo comentario',
+    archivo: 'herramientas/check-entorno.mjs',
+    de: "      .replace(/^\\/\\/ Generated by Wrangler by running .*$/m, '// (encabezado de wrangler)')",
+    a: "      .replace(/\\/\\/.*$/gm, '// (encabezado de wrangler)')",
+    oraculo: conNode('herramientas/check-entorno.pruebas.mjs'),
+  },
+
+  // --- Las pruebas del Durable Object -------------------------------------
+  // Su oraculo NO es vitest a secas: las pruebas del runtime viven en otra
+  // configuracion porque levantan workerd, y no tiene sentido pagar ese arranque
+  // en cada una de las mutaciones de arriba.
+  //
+  // Decir lo que falta: de las catorce pruebas de `pruebas-runtime/`, solo las dos
+  // de `el Worker desplegado` estan ancladas a codigo de `src/`. El reparto exacto
+  // —y que tiene que hacer la entrega siguiente para cerrarlo— vive en el
+  // encabezado de `pruebas-runtime/runtime.test.ts`, en un solo lugar, porque este
+  // comentario ya quedo viejo dos veces.
+  {
+    invariante: 'la prueba de /salud lee los vars del entorno de verdad',
+    archivo: 'src/index.ts',
+    de: '        entorno: entorno.ENTORNO,',
+    a: "        entorno: 'produccion',",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'una ruta desconocida da 404 y no otra cosa',
+    archivo: 'src/index.ts',
+    de: "    return new Response('no encontrado', { status: 404 })",
+    a: "    return new Response('no encontrado', { status: 500 })",
+    oraculo: ORACULO_RUNTIME,
+  },
+
+  // --- La frontera con el sistema operativo --------------------------------
+  // Un comando lanzado por nombre anda en Linux, anda en el CI, y muere en la
+  // maquina del dueño: en Windows `npx` es `npx.cmd`, y desde Node 20.12 un `.cmd`
+  // no se lanza sin shell. El proyecto ya tenia anotado el cable y la entrega lo
+  // piso igual — un limite conocido sin oraculo es un limite que se vuelve a cruzar.
+  {
+    invariante: 'check-portabilidad detecta un comando lanzado por nombre',
+    archivo: 'herramientas/check-portabilidad.mjs',
+    de: "    const m = /\\b(?:spawnSync|spawn|execFileSync|execFile)\\s*\\(\\s*'([^']+)'/.exec(linea)",
+    a: '    const m = null',
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+  {
+    // Y que un comentario NO cuente. Es como una auditoria volteo la version
+    // anterior de otra regla de este proyecto: el oraculo se ponia en rojo
+    // acusando al archivo de hacer lo que el comentario decia no hacer.
+    invariante: 'un comentario no cuenta como comando lanzado',
+    archivo: 'herramientas/check-portabilidad.mjs',
+    de: "    if (/^\\s*(\\/\\/|\\*|\\/\\*)/.test(linea)) return",
+    a: '',
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+  {
+    invariante: 'binarios.mjs nota si un punto de entrada se movio de lugar',
+    archivo: 'herramientas/binarios.mjs',
+    de: '    .filter(([, ruta]) => !existe(join(raiz, ruta)))',
+    a: '    .filter(() => false)',
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+  {
+    // El enlace a `node_modules` de las pruebas de check-entorno. Un symlink de
+    // directorio necesita permiso de administrador en Windows; una junction no.
+    // Lo encontro el dueño corriendo la entrega en su maquina, con un EPERM — que
+    // es exactamente para lo que existe ese paso.
+    invariante: 'el enlace a node_modules se crea de una forma que anda en Windows',
+    archivo: 'herramientas/check-entorno.pruebas.mjs',
+    de: "    symlinkSync(join(RAIZ, 'node_modules'), join(dir, 'node_modules'), 'junction')",
+    a: "    symlinkSync(join(RAIZ, 'node_modules'), join(dir, 'node_modules'))",
+    // El oraculo es el BARRIDO, no sus pruebas: la mutacion rompe OTRO archivo, y
+    // las pruebas de `check-portabilidad` verifican la funcion sobre texto
+    // inventado — no miran el arbol. La primera version de esta mutacion las
+    // usaba y sobrevivio. Una mutacion con el oraculo equivocado no prueba nada,
+    // y el arnes lo dijo.
+    oraculo: conNode('herramientas/check-portabilidad.mjs'),
+  },
+  {
+    invariante: 'el comando siempre arranca con el Node que ya esta corriendo',
+    archivo: 'herramientas/binarios.mjs',
+    de: '  return [process.execPath, ruta, ...args]',
+    a: "  return ['node', ruta, ...args]",
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+
   // --- Mutar tambien el arnes ---------------------------------------------
-  // Un arnes que no puede fallar hace que todo pase. Si estas dos sobreviven,
-  // las pruebas del spike no estan probando la caida: estan probando nada.
+  // Un arnes que no puede fallar hace que todo pase. Si estas sobreviven, las
+  // pruebas no estan probando la caida: estan probando nada.
   {
     invariante: 'el arnes inyecta la caida de verdad',
     archivo: 'tests/arnes.ts',
@@ -208,15 +459,175 @@ const MUTACIONES = [
     de: '    if (completados.has(paso.nombre)) continue',
     a: '',
   },
+  {
+    // El arnes dice leer el entorno `staging` del wrangler.jsonc de verdad; si eso
+    // fuera decorativo, las pruebas correrian contra una configuracion inventada y
+    // nadie se enteraria. Muta el archivo de datos, que es de donde sale el
+    // nombre desde que se dejo de parsear el TypeScript del arnes.
+    invariante: 'el arnes del runtime lee el entorno que dice leer',
+    archivo: 'pruebas-runtime/arnes-del-runtime.json',
+    de: '"environment": "staging"',
+    a: '"environment": "produccion"',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El arnes tiene que poder apagarse ruidosamente. Hoy un `include` que no
+    // machea sale con 1 ("No test files found"); el dia que alguien agregue
+    // `passWithNoTests: true` para callar un ruido, esta mutacion SOBREVIVE y
+    // avisa que `verificar` esta saliendo verde con cero pruebas del runtime.
+    invariante: 'el arnes del runtime falla si no encuentra pruebas',
+    archivo: 'vitest.runtime.config.ts',
+    de: "    include: ['pruebas-runtime/**/*.test.ts'],",
+    a: "    include: ['pruebas-runtime/**/*.no-existe.ts'],",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El aislamiento entre pruebas del runtime es una convencion: cada prueba usa
+    // su propio nombre de Durable Object. Medido: en esta version del pool el
+    // storage NO se resetea entre pruebas del mismo archivo, y no hay opcion que
+    // lo haga. Una convencion sin oraculo se rompe sola.
+    invariante: 'el aislamiento entre pruebas del runtime lo da el nombre del DO',
+    archivo: 'pruebas-runtime/runtime.test.ts',
+    de: '  return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.fullName))',
+    a: "  return env.BILLETERA.get(env.BILLETERA.idFromName('una-sola'))",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Y que el nombre sea el CAMINO COMPLETO y no solo el texto del `it`.
+    // `task.name` no incluye el `describe`: dos pruebas con el mismo texto en dos
+    // grupos distintos daban el mismo Durable Object, con un comentario diciendo
+    // que no. Dos `describe` de runtime.test.ts tienen una prueba con el mismo
+    // texto para que esta mutacion tenga donde morir, y son simetricos para que no
+    // dependa de cual corre primero.
+    //
+    // Nota de la pasada de mutacion: la primera version de esta mutacion cambiaba
+    // `billetera(task.fullName)` en el sitio de LLAMADA y sobrevivia, porque
+    // `String.replace` con un texto reemplaza solo la primera aparicion y de las
+    // doce llamadas quedaban once sin mutar. (Ahora la herramienta rechaza de plano
+    // una mutacion cuyo fragmento aparece mas de una vez.) El arreglo no es escribir la mutacion con mas cuidado: es
+    // que `billetera()` reciba la prueba entera, para que la decision viva en un
+    // solo lugar. Una mutacion dificil de escribir suele estar señalando un
+    // diseño con la decision repartida.
+    invariante: 'el aislamiento usa el camino completo de la prueba, no solo su texto',
+    archivo: 'pruebas-runtime/runtime.test.ts',
+    de: 'return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.fullName))',
+    a: 'return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.name))',
+    oraculo: ORACULO_RUNTIME,
+  },
+
+  // --- La deriva de tipos entre Entorno y wrangler.jsonc -------------------
+  // Estas dos mutan `src/index.ts` y su oraculo es el compilador. Prueban las dos
+  // lineas de `pruebas-runtime/runtime.test.ts` que comparan `Entorno` contra el
+  // `Cloudflare.Env` generado. Mutar la linea de comprobacion en si no servia: la
+  // volvia una tautologia que compila, y una mutacion que no puede fallar no
+  // prueba nada. Hay que romper lo que la comprobacion custodia.
+  {
+    invariante: 'Entorno no puede prometer un binding que wrangler.jsonc no declara',
+    archivo: 'src/index.ts',
+    de: '  readonly CORE: D1Database',
+    a: '  readonly CORE: D1Database\n  readonly PASARELA_INVENTADA: string',
+    oraculo: ORACULO_TIPOS,
+  },
+  {
+    invariante: 'Entorno tampoco puede prometer de menos que wrangler.jsonc',
+    archivo: 'src/index.ts',
+    de: '  readonly SECUENCIA: DurableObjectNamespace<SecuenciaDO>\n',
+    a: '',
+    oraculo: ORACULO_TIPOS,
+  },
+  {
+    // `any` es asignable en las dos direcciones, asi que se colaba por las dos
+    // comprobaciones de arriba — y el final era el mismo que el defecto original:
+    // `env.CORE.loQueSea()` compila y explota en runtime sin un solo ruido.
+    invariante: 'ningun binding de Entorno puede declararse como any',
+    archivo: 'src/index.ts',
+    de: '  readonly CORE: D1Database\n',
+    a: '  readonly CORE: any\n',
+    oraculo: ORACULO_TIPOS,
+  },
 ]
+
+const ORACULO_POR_DEFECTO = ORACULO_NUCLEO
+
+/**
+ * El arbol tiene que estar SANO antes de empezar.
+ *
+ * `execFileSync` cuenta como "mutacion muerta" cualquier salida distinta de 0 del
+ * oraculo, sin haber comprobado nunca que el oraculo pase con el codigo intacto.
+ * Sobre un arbol ya en rojo por otra causa, las 49 se reportan muertas y el
+ * titular dice "Todas murieron. Las pruebas prueban algo." Medido: una mutacion
+ * INOCUA —agregar un comentario— se reportaba muerta.
+ *
+ * Se corre cada oraculo distinto una vez, antes de tocar nada. Cuesta unos
+ * segundos y convierte el veredicto en un veredicto.
+ */
+function comprobarLineaBase() {
+  const oraculos = new Map()
+  for (const m of MUTACIONES) {
+    const cmd = m.oraculo ?? ORACULO_POR_DEFECTO
+    oraculos.set(cmd.join(' '), cmd)
+  }
+
+  console.log(`  Linea de base — ${oraculos.size} oraculos sobre el arbol intacto\n`)
+
+  for (const [nombre, cmd] of oraculos) {
+    const [ejecutable, ...args] = cmd
+    try {
+      execFileSync(ejecutable, args, { stdio: 'pipe', cwd: RAIZ })
+      console.log(`  ✓  ${nombre}`)
+    } catch {
+      console.log(`  ✗  ${nombre}`)
+      console.log('')
+      console.log('     ESTE ORACULO YA FALLA SIN MUTACIONES.')
+      console.log('     Sobre un arbol en rojo, toda mutacion se reporta muerta y el')
+      console.log('     veredicto de abajo no vale nada. Arreglalo antes de mutar.')
+      console.log('')
+      process.exit(1)
+    }
+  }
+  console.log('')
+}
+
+/** Sello de los archivos que las mutaciones tocan, para comprobar al final que el
+ *  arbol quedo como estaba. Sin esto, "restaura en un finally" es una intencion. */
+function sellar() {
+  const h = createHash('sha256')
+  for (const archivo of [...new Set(MUTACIONES.map((m) => m.archivo))].sort()) {
+    h.update(archivo)
+    h.update(readFileSync(rutaDe(archivo)))
+  }
+  return h.digest('hex')
+}
 
 let sobrevivientes = []
 let muertas = 0
 
-console.log(`\n  Mutacion — ${MUTACIONES.length} invariantes bajo ataque\n`)
+/** El archivo mutado en este instante, para poder restaurarlo si nos matan. */
+let enVuelo = null
+
+// Un Ctrl-C dejaba el arbol con un invariante roto A PROPOSITO en el codigo del
+// dinero, porque el `finally` no corre con una señal. Y peor: el SIGINT mataba al
+// hijo, `execFileSync` tiraba, la mutacion se contaba como muerta y la corrida
+// seguia hasta imprimir "49/49 — Todas murieron". Un veredicto verde con un
+// oraculo que nunca corrio.
+for (const señal of ['SIGINT', 'SIGTERM']) {
+  process.on(señal, () => {
+    if (enVuelo !== null) {
+      writeFileSync(rutaDe(enVuelo.archivo), enVuelo.original)
+      console.log(`\n\n  ${señal} — restaurado ${enVuelo.archivo}`)
+    }
+    console.log('  INTERRUMPIDA. El veredicto no vale: no se corrieron todas.\n')
+    process.exit(130)
+  })
+}
+
+comprobarLineaBase()
+const selloInicial = sellar()
+
+console.log(`  Mutacion — ${MUTACIONES.length} invariantes bajo ataque\n`)
 
 for (const m of MUTACIONES) {
-  const original = readFileSync(m.archivo, 'utf8')
+  const original = readFileSync(rutaDe(m.archivo), 'utf8')
 
   if (!original.includes(m.de)) {
     console.log(`  ?  ${m.invariante}`)
@@ -226,21 +637,37 @@ for (const m of MUTACIONES) {
     continue
   }
 
-  writeFileSync(m.archivo, original.replace(m.de, m.a))
+  // `String.replace` con un texto reemplaza SOLO la primera aparicion. Una
+  // mutacion cuyo fragmento aparece dos veces muta a medias, y muere o sobrevive
+  // por un motivo distinto al que declara. Ya paso una vez.
+  const apariciones = original.split(m.de).length - 1
+  if (apariciones > 1) {
+    console.log(`  ?  ${m.invariante}`)
+    console.log(`     EL FRAGMENTO APARECE ${apariciones} VECES en ${m.archivo}.`)
+    console.log(`     String.replace muta solo la primera: la mutacion es ambigua.\n`)
+    sobrevivientes.push(`${m.invariante} (fragmento ambiguo)`)
+    continue
+  }
+
+  enVuelo = { archivo: m.archivo, original }
+  writeFileSync(rutaDe(m.archivo), original.replace(m.de, m.a))
 
   // El oraculo por defecto es vitest. Algunas mutaciones atacan un lugar que
   // vitest no ve — el CHECK de una migracion SQL, o una herramienta de node
   // plano — y declaran su propio oraculo en vez de fingir que vitest las
   // cubre.
-  const [cmd, ...args] = m.oraculo ?? ['npx', 'vitest', 'run', '--silent']
+  const [cmd, ...args] = m.oraculo ?? ORACULO_POR_DEFECTO
 
   let murio = false
   try {
-    execFileSync(cmd, args, { stdio: 'pipe' })
+    // `timeout` porque un oraculo del runtime que se cuelgue dejaba el arbol
+    // mutado indefinidamente, con el codigo del dinero escrito en disco.
+    execFileSync(cmd, args, { stdio: 'pipe', cwd: RAIZ, timeout: 300_000 })
   } catch {
     murio = true // el oraculo fallo: la mutacion murio, que es lo que queremos
   } finally {
-    writeFileSync(m.archivo, original)
+    writeFileSync(rutaDe(m.archivo), original)
+    enVuelo = null
   }
 
   if (murio) {
@@ -254,6 +681,17 @@ for (const m of MUTACIONES) {
 }
 
 console.log(`\n  ${muertas}/${MUTACIONES.length} mutaciones muertas`)
+
+// El arbol tiene que haber vuelto exactamente a donde estaba. "Se restaura en un
+// finally" era una intencion; esto es la comprobacion.
+const selloFinal = sellar()
+if (selloFinal !== selloInicial) {
+  console.log('')
+  console.log('  EL ARBOL NO QUEDO COMO ESTABA. Algun archivo mutado no se restauro.')
+  console.log('  Corré `git status` y `git diff` antes de seguir.')
+  console.log('')
+  process.exit(1)
+}
 
 if (sobrevivientes.length > 0) {
   console.log(`\n  ${sobrevivientes.length} sobrevivieron. Cada una es un agujero en las pruebas:\n`)
