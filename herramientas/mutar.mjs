@@ -21,7 +21,12 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
-import { ORACULO_NUCLEO, ORACULO_RUNTIME, ORACULO_TIPOS } from './binarios.mjs'
+import {
+  ORACULO_NUCLEO,
+  ORACULO_RUNTIME,
+  ORACULO_TIPOS,
+  entornoParaOraculo,
+} from './binarios.mjs'
 
 /** Un oraculo de Node plano: el MISMO Node que ya corre, no el que este en el
  *  PATH. Ver `binarios.mjs` — un comando por nombre depende del sistema. */
@@ -595,6 +600,23 @@ const MUTACIONES = [
     oraculo: ORACULO_RUNTIME,
   },
 
+  {
+    // El resumen de un job exitoso no puede parecer un desastre. Ver
+    // `entornoParaOraculo` en binarios.mjs.
+    invariante: 'las corridas de mutacion no escriben en el resumen del CI',
+    archivo: 'herramientas/binarios.mjs',
+    de: '  delete copia.GITHUB_ACTIONS',
+    a: '',
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+  {
+    invariante: 'el entorno del oraculo conserva todo lo demas',
+    archivo: 'herramientas/binarios.mjs',
+    de: '  const copia = { ...entorno }',
+    a: '  const copia = {}',
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+
   // --- Mutar tambien el arnes ---------------------------------------------
   // Un arnes que no puede fallar hace que todo pase. Si estas sobreviven, las
   // pruebas no estan probando la caida: estan probando nada.
@@ -724,7 +746,7 @@ function comprobarLineaBase() {
   for (const [nombre, cmd] of oraculos) {
     const [ejecutable, ...args] = cmd
     try {
-      execFileSync(ejecutable, args, { stdio: 'pipe', cwd: RAIZ })
+      execFileSync(ejecutable, args, { stdio: 'pipe', cwd: RAIZ, env: entornoParaOraculo(process.env) })
       console.log(`  ✓  ${nombre}`)
     } catch {
       console.log(`  ✗  ${nombre}`)
@@ -813,7 +835,12 @@ for (const m of MUTACIONES) {
   try {
     // `timeout` porque un oraculo del runtime que se cuelgue dejaba el arbol
     // mutado indefinidamente, con el codigo del dinero escrito en disco.
-    execFileSync(cmd, args, { stdio: 'pipe', cwd: RAIZ, timeout: 300_000 })
+    execFileSync(cmd, args, {
+      stdio: 'pipe',
+      cwd: RAIZ,
+      timeout: 300_000,
+      env: entornoParaOraculo(process.env),
+    })
   } catch {
     murio = true // el oraculo fallo: la mutacion murio, que es lo que queremos
   } finally {

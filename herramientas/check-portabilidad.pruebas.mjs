@@ -13,7 +13,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buscarComandosLiterales, archivosDeHerramientas } from './check-portabilidad.mjs'
-import { ENTRADAS, entradasFaltantes, comando } from './binarios.mjs'
+import { ENTRADAS, entradasFaltantes, comando, entornoParaOraculo } from './binarios.mjs'
 import { invocadoDirecto } from './invocado-directo.mjs'
 
 const RAIZ = fileURLToPath(new URL('..', import.meta.url))
@@ -152,5 +152,32 @@ assert.equal(c[1]?.endsWith(join('vitest', 'vitest.mjs')), true)
 assert.equal(c[2], 'run')
 
 assert.throws(() => comando('inventado'), /no hay entrada declarada/)
+
+// --- el entorno de los oraculos de mutacion --------------------------------
+// vitest agrega solo el reporter `github-actions` cuando ve GITHUB_ACTIONS, y
+// escribe en el resumen del job. Con una corrida por mutacion, el resumen de un
+// despliegue EXITOSO quedaba con decenas de bloques casi todos en rojo — en rojo
+// por la razon correcta (una mutacion muerta es una prueba que falla), pero
+// diciendo lo contrario de lo que paso.
+
+assert.equal(entornoParaOraculo({ GITHUB_ACTIONS: 'true', PATH: '/x' }).GITHUB_ACTIONS, undefined)
+
+// Y NO se lleva puesto el resto del entorno: sin PATH ni HOME, los oraculos no
+// arrancan.
+assert.deepEqual(entornoParaOraculo({ GITHUB_ACTIONS: 'true', PATH: '/x', HOME: '/h' }), {
+  PATH: '/x',
+  HOME: '/h',
+})
+
+// Fuera del CI no hay nada que sacar, y no se rompe.
+assert.deepEqual(entornoParaOraculo({ PATH: '/x' }), { PATH: '/x' })
+
+// No muta el objeto que recibe: `process.env` sigue como estaba para el proceso
+// que corre la mutacion.
+{
+  const original = { GITHUB_ACTIONS: 'true', PATH: '/x' }
+  entornoParaOraculo(original)
+  assert.equal(original.GITHUB_ACTIONS, 'true')
+}
 
 console.log('  check-portabilidad.pruebas: OK')
