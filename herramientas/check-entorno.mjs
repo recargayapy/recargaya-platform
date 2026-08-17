@@ -38,6 +38,7 @@ import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { invocadoDirecto } from './invocado-directo.mjs'
+import { comando } from './binarios.mjs'
 import { leerArnesDesde } from './arnes-del-runtime.mjs'
 
 const RAIZ = fileURLToPath(new URL('..', import.meta.url))
@@ -68,11 +69,12 @@ export function argumentos(entorno) {
   return ARGUMENTOS_BASE_1.concat([entorno], ARGUMENTOS_BASE_2)
 }
 
-const ARGUMENTOS_BASE_1 = [
-  'wrangler',
-  'types',
-  '--env',
-]
+// NO lleva 'wrangler' adelante: el binario lo pone `comando('wrangler', ...)` de
+// `binarios.mjs`. Lo llevaba, y los dos call sites hacian `slice(2)` para sacarlo
+// junto con el subcomando — o sea que tambien se comian `types`, y wrangler
+// respondia con su pantalla de ayuda. Un dato repetido en dos lugares con un
+// `slice` en el medio es un error esperando fecha.
+const ARGUMENTOS_BASE_1 = ['types', '--env']
 
 const ARGUMENTOS_BASE_2 = [
   '--include-runtime=false',
@@ -192,14 +194,13 @@ function main() {
   let cmp = null
 
   try {
-    // `shell` en Windows porque ahi `npx` es `npx.cmd` y sin shell da ENOENT.
-    // Este archivo normaliza los fines de linea justamente para que el veredicto
-    // no cambie entre Windows y Linux; arrancaria mal que no arranque en Windows.
-    const r = spawnSync('npx', [...args, destino], {
-      cwd: RAIZ,
-      encoding: 'utf8',
-      shell: process.platform === 'win32',
-    })
+    // Se lanza el wrangler de `node_modules` con el mismo Node que ya corre, en vez
+    // de `npx`. Ver `binarios.mjs`: `npx` en Windows es `npx.cmd`, y desde Node
+    // 20.12 un `.cmd` no se puede lanzar sin `shell: true` — y `shell: true` mete
+    // las reglas de comillas del sistema en el medio, que es justo lo que este
+    // archivo intenta que no importe.
+    const [ejecutable, ...resto] = comando('wrangler', ...args, destino)
+    const r = spawnSync(ejecutable, resto, { cwd: RAIZ, encoding: 'utf8' })
     if (r.status !== 0) {
       // Las ultimas tres lineas UTILES: wrangler cierra con lineas vacias y con
       // la ruta de un archivo de log, y un `slice(-3)` pelado se comia lo unico

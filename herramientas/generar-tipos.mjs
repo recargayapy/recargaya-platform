@@ -14,6 +14,7 @@
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { argumentos, GENERADO } from './check-entorno.mjs'
+import { comando } from './binarios.mjs'
 import { leerArnesDesde } from './arnes-del-runtime.mjs'
 
 const RAIZ = fileURLToPath(new URL('..', import.meta.url))
@@ -22,10 +23,9 @@ const RAIZ = fileURLToPath(new URL('..', import.meta.url))
 // CLI en la que ese import corria `main()` del oraculo — que, cuando los tipos no
 // coincidian, hacia `process.exit(1)` antes de generar y dejaba al generador
 // incapaz de arreglar al oraculo. Ver `invocado-directo.mjs`.
-const r = spawnSync('npx', [...argumentos(leerArnesDesde(RAIZ).environment), GENERADO], {
-  cwd: RAIZ,
-  stdio: 'inherit',
-  shell: process.platform === 'win32',
-})
+const args = argumentos(leerArnesDesde(RAIZ).environment)
+const [ejecutable, ...resto] = comando('wrangler', ...args, GENERADO)
+
+const r = spawnSync(ejecutable, resto, { cwd: RAIZ, stdio: 'inherit' })
 
 process.exit(r.status ?? 1)

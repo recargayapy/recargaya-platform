@@ -21,6 +21,11 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
+import { ORACULO_NUCLEO, ORACULO_RUNTIME, ORACULO_TIPOS } from './binarios.mjs'
+
+/** Un oraculo de Node plano: el MISMO Node que ya corre, no el que este en el
+ *  PATH. Ver `binarios.mjs` — un comando por nombre depende del sistema. */
+const conNode = (archivo) => [process.execPath, archivo]
 
 // La raiz sale de la ubicacion de este archivo y no del cwd. Corrido desde
 // `herramientas/` moria con un ENOENT y un stack pelado. Los tres oraculos ya lo
@@ -187,14 +192,14 @@ const MUTACIONES = [
     archivo: 'migraciones/core/0001_cimientos.sql',
     de: "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion', 'retenido'))",
     a: "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion'))",
-    oraculo: ['node', 'herramientas/check-esquema.mjs'],
+    oraculo: conNode('herramientas/check-esquema.mjs'),
   },
   {
     invariante: 'check-esquema.mjs detecta un tipo de bolsa que le falta al CHECK',
     archivo: 'herramientas/check-esquema.mjs',
     de: 'return { ok: faltantes.length === 0 && sobrantes.length === 0, faltantes, sobrantes }',
     a: 'return { ok: true, faltantes, sobrantes }',
-    oraculo: ['node', 'herramientas/check-esquema.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
   },
   {
     invariante: 'acreditar() rechaza bolsa retenido: solo reservar() entra ahi',
@@ -217,7 +222,7 @@ const MUTACIONES = [
     archivo: 'herramientas/check-runtime.mjs',
     de: '  return { fecha: null, origen: null }\n}',
     a: "  return { fecha: '2026-08-01', origen: 'inventada' }\n}",
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // La fecha de `env.<entorno>` gana sobre la de la raiz, porque es la que usa
@@ -227,7 +232,7 @@ const MUTACIONES = [
     archivo: 'herramientas/check-runtime.mjs',
     de: "  if (typeof delEntorno === 'string') return { fecha: delEntorno, origen: `env.${entorno}` }",
     a: '',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // Un entorno que `wrangler.jsonc` no declara resolveria contra la nada. Antes
@@ -237,7 +242,7 @@ const MUTACIONES = [
     archivo: 'herramientas/check-runtime.mjs',
     de: '    if (config?.env?.[entorno] === undefined) {',
     a: '    if (false) {',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // El bloque `miniflare: {}` del pool es laxo y TypeScript no lo revisa. Un
@@ -247,7 +252,7 @@ const MUTACIONES = [
     archivo: 'herramientas/check-runtime.mjs',
     de: "  const m = /^[^\\n]*?\\b(compatibilityDate|compatibility_date)\\s*:/m.exec(texto)",
     a: '  const m = null',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // El guard compartido de los tres oraculos. Con un guard por nombre de
@@ -257,7 +262,7 @@ const MUTACIONES = [
     archivo: 'herramientas/invocado-directo.mjs',
     de: "  if (typeof meta.main === 'boolean') return meta.main",
     a: '',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // El respaldo por comparacion de rutas, para un Node anterior a la 22.18. Las
@@ -266,7 +271,7 @@ const MUTACIONES = [
     archivo: 'herramientas/invocado-directo.mjs',
     de: '    return realpathSync(arrancado) === realpathSync(fileURLToPath(meta.url))',
     a: '    return true',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // El `catch` tiene que responder `false`. Devolvia `true` —«ante la duda,
@@ -278,7 +283,7 @@ const MUTACIONES = [
     archivo: 'herramientas/invocado-directo.mjs',
     de: '  } catch {\n    return false\n  }',
     a: '  } catch {\n    return true\n  }',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // El configPath del arnes tiene que ser el wrangler.jsonc del proyecto. Era el
@@ -288,14 +293,14 @@ const MUTACIONES = [
     archivo: 'herramientas/arnes-del-runtime.mjs',
     de: '  if (d.configPath !== CONFIG_ESPERADO) {',
     a: '  if (false) {',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     invariante: 'el arnes declara un environment que es texto',
     archivo: 'herramientas/arnes-del-runtime.mjs',
     de: "  if (typeof d.environment !== 'string' || d.environment === '') {",
     a: '  if (false) {',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // Y que `check-esquema.mjs` use el guard compartido. La primera version de
@@ -306,7 +311,7 @@ const MUTACIONES = [
     archivo: 'herramientas/check-esquema.mjs',
     de: 'if (invocadoDirecto(import.meta)) main()',
     a: 'if (false) main()',
-    oraculo: ['node', 'herramientas/check-esquema.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
   },
   {
     // Un comentario de bloque con una fecha vieja adentro no es una fecha. El
@@ -315,7 +320,7 @@ const MUTACIONES = [
     archivo: 'herramientas/check-runtime.mjs',
     de: "    if (c === '/' && d === '*') {",
     a: '    if (false) {',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // Una barra doble adentro de una cadena no abre un comentario. Sin esta
@@ -324,7 +329,7 @@ const MUTACIONES = [
     archivo: 'herramientas/check-runtime.mjs',
     de: "    if (c === '\"') {\n      enCadena = true",
     a: '    if (false) {\n      enCadena = true',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // `2026-02-30` no existe y JavaScript la corre en silencio a 2026-03-02.
@@ -332,7 +337,7 @@ const MUTACIONES = [
     archivo: 'herramientas/check-runtime.mjs',
     de: "  return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(fecha)",
     a: '  return true',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     // El guard del CLI, ahora compartido. Las pruebas de punta a punta lo cubren.
@@ -340,14 +345,14 @@ const MUTACIONES = [
     archivo: 'herramientas/check-runtime.mjs',
     de: 'if (invocadoDirecto(import.meta)) main()',
     a: 'if (false) main()',
-    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
   {
     invariante: 'check-entorno detecta que los tipos generados no coinciden',
     archivo: 'herramientas/check-entorno.mjs',
     de: "  if (a === b) return { ok: true, lineaDistinta: null, esperada: null, encontrada: null }",
     a: '  return { ok: true, lineaDistinta: null, esperada: null, encontrada: null }',
-    oraculo: ['node', 'herramientas/check-entorno.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-entorno.pruebas.mjs'),
   },
   {
     // La normalizacion del encabezado tiene que sacar UNA linea, no todos los
@@ -358,7 +363,7 @@ const MUTACIONES = [
     archivo: 'herramientas/check-entorno.mjs',
     de: "      .replace(/^\\/\\/ Generated by Wrangler by running .*$/m, '// (encabezado de wrangler)')",
     a: "      .replace(/\\/\\/.*$/gm, '// (encabezado de wrangler)')",
-    oraculo: ['node', 'herramientas/check-entorno.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-entorno.pruebas.mjs'),
   },
 
   // --- Las pruebas del Durable Object -------------------------------------
@@ -376,14 +381,51 @@ const MUTACIONES = [
     archivo: 'src/index.ts',
     de: '        entorno: entorno.ENTORNO,',
     a: "        entorno: 'produccion',",
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     invariante: 'una ruta desconocida da 404 y no otra cosa',
     archivo: 'src/index.ts',
     de: "    return new Response('no encontrado', { status: 404 })",
     a: "    return new Response('no encontrado', { status: 500 })",
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
+  },
+
+  // --- La frontera con el sistema operativo --------------------------------
+  // Un comando lanzado por nombre anda en Linux, anda en el CI, y muere en la
+  // maquina del dueño: en Windows `npx` es `npx.cmd`, y desde Node 20.12 un `.cmd`
+  // no se lanza sin shell. El proyecto ya tenia anotado el cable y la entrega lo
+  // piso igual — un limite conocido sin oraculo es un limite que se vuelve a cruzar.
+  {
+    invariante: 'check-portabilidad detecta un comando lanzado por nombre',
+    archivo: 'herramientas/check-portabilidad.mjs',
+    de: "    const m = /\\b(?:spawnSync|spawn|execFileSync|execFile)\\s*\\(\\s*'([^']+)'/.exec(linea)",
+    a: '    const m = null',
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+  {
+    // Y que un comentario NO cuente. Es como una auditoria volteo la version
+    // anterior de otra regla de este proyecto: el oraculo se ponia en rojo
+    // acusando al archivo de hacer lo que el comentario decia no hacer.
+    invariante: 'un comentario no cuenta como comando lanzado',
+    archivo: 'herramientas/check-portabilidad.mjs',
+    de: "    if (/^\\s*(\\/\\/|\\*|\\/\\*)/.test(linea)) return",
+    a: '',
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+  {
+    invariante: 'binarios.mjs nota si un punto de entrada se movio de lugar',
+    archivo: 'herramientas/binarios.mjs',
+    de: '    .filter(([, ruta]) => !existe(join(raiz, ruta)))',
+    a: '    .filter(() => false)',
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+  {
+    invariante: 'el comando siempre arranca con el Node que ya esta corriendo',
+    archivo: 'herramientas/binarios.mjs',
+    de: '  return [process.execPath, ruta, ...args]',
+    a: "  return ['node', ruta, ...args]",
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
   },
 
   // --- Mutar tambien el arnes ---------------------------------------------
@@ -410,7 +452,7 @@ const MUTACIONES = [
     archivo: 'pruebas-runtime/arnes-del-runtime.json',
     de: '"environment": "staging"',
     a: '"environment": "produccion"',
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     // El arnes tiene que poder apagarse ruidosamente. Hoy un `include` que no
@@ -421,7 +463,7 @@ const MUTACIONES = [
     archivo: 'vitest.runtime.config.ts',
     de: "    include: ['pruebas-runtime/**/*.test.ts'],",
     a: "    include: ['pruebas-runtime/**/*.no-existe.ts'],",
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     // El aislamiento entre pruebas del runtime es una convencion: cada prueba usa
@@ -432,7 +474,7 @@ const MUTACIONES = [
     archivo: 'pruebas-runtime/runtime.test.ts',
     de: '  return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.fullName))',
     a: "  return env.BILLETERA.get(env.BILLETERA.idFromName('una-sola'))",
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     // Y que el nombre sea el CAMINO COMPLETO y no solo el texto del `it`.
@@ -454,7 +496,7 @@ const MUTACIONES = [
     archivo: 'pruebas-runtime/runtime.test.ts',
     de: 'return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.fullName))',
     a: 'return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.name))',
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
 
   // --- La deriva de tipos entre Entorno y wrangler.jsonc -------------------
@@ -468,14 +510,14 @@ const MUTACIONES = [
     archivo: 'src/index.ts',
     de: '  readonly CORE: D1Database',
     a: '  readonly CORE: D1Database\n  readonly PASARELA_INVENTADA: string',
-    oraculo: ['npx', 'tsc', '--noEmit'],
+    oraculo: ORACULO_TIPOS,
   },
   {
     invariante: 'Entorno tampoco puede prometer de menos que wrangler.jsonc',
     archivo: 'src/index.ts',
     de: '  readonly SECUENCIA: DurableObjectNamespace<SecuenciaDO>\n',
     a: '',
-    oraculo: ['npx', 'tsc', '--noEmit'],
+    oraculo: ORACULO_TIPOS,
   },
   {
     // `any` es asignable en las dos direcciones, asi que se colaba por las dos
@@ -485,11 +527,11 @@ const MUTACIONES = [
     archivo: 'src/index.ts',
     de: '  readonly CORE: D1Database\n',
     a: '  readonly CORE: any\n',
-    oraculo: ['npx', 'tsc', '--noEmit'],
+    oraculo: ORACULO_TIPOS,
   },
 ]
 
-const ORACULO_POR_DEFECTO = ['npx', 'vitest', 'run', '--silent']
+const ORACULO_POR_DEFECTO = ORACULO_NUCLEO
 
 /**
  * El arbol tiene que estar SANO antes de empezar.

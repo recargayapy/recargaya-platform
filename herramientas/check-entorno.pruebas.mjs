@@ -193,6 +193,11 @@ const generado = (dir) => join(dir, 'worker-configuration.d.ts')
 // Y los argumentos de generacion llevan el entorno que se les pasa, no uno fijo.
 assert.equal(argumentos('produccion').includes('produccion'), true)
 assert.equal(argumentos('staging').includes('produccion'), false)
+// Y llevan el subcomando `types`, sin repetir el nombre del binario: eso lo pone
+// `comando()`. Repetido, los dos call sites hacian un `slice` que tambien se comia
+// el subcomando y wrangler contestaba con su ayuda.
+assert.equal(argumentos('staging')[0], 'types')
+assert.equal(argumentos('staging').includes('wrangler'), false)
 // Sin `--strict-vars=false`: sin los literales de las vars, `--env staging` y
 // `--env produccion` generan el archivo byte a byte identico y el oraculo queda
 // ciego al entorno. Lo midio la tercera vuelta de auditoria.
