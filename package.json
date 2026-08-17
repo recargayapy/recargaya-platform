@@ -6,7 +6,7 @@
   "description": "RecargaYA Platform 2.0 sobre Cloudflare",
   "scripts": {
     "tipos": "tsc --noEmit",
-    "tipos:generar": "wrangler types --env staging --include-runtime=false --path worker-configuration.d.ts",
+    "tipos:generar": "node herramientas/generar-tipos.mjs",
     "probar": "vitest run",
     "probar:mirar": "vitest",
     "probar:runtime": "vitest run --config vitest.runtime.config.ts",
@@ -20,6 +20,10 @@
     "desarrollo": "wrangler dev --env staging",
     "desplegar:staging": "wrangler deploy --env staging",
     "desplegar:produccion": "wrangler deploy --env produccion"
+  },
+  "engines": {
+    "//": "import.meta.main —el guard de los oraculos— existe desde Node 22.20. En un Node anterior vale undefined y el oraculo saldria con 0 sin verificar nada.",
+    "node": ">=22.20"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.21.3",

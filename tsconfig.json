@@ -18,6 +18,8 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
 
+    "resolveJsonModule": true,
+
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,

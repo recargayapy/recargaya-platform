@@ -195,9 +195,9 @@ const MUTACIONES = [
 
   // --- Los oraculos nuevos ------------------------------------------------
   // Un oraculo sin jueces fue el defecto n.º 1 de la Fase 0: se rompio la
-  // deteccion de descuadre y ninguna prueba se dio cuenta. Estas siete atacan a
-  // `check-runtime.mjs` y `check-entorno.mjs`, y su oraculo son las pruebas
-  // propias de cada herramienta.
+  // deteccion de descuadre y ninguna prueba se dio cuenta. Las de este bloque
+  // atacan a `check-runtime.mjs`, `check-entorno.mjs` y el guard compartido, y su
+  // oraculo son las pruebas propias de cada herramienta.
   {
     // EL caso que check-runtime existe para agarrar: sin fecha declarada,
     // miniflare pone la del reloj del sistema. Si el oraculo inventara una, el
@@ -217,6 +217,56 @@ const MUTACIONES = [
     de: "  if (typeof delEntorno === 'string') return { fecha: delEntorno, origen: `env.${entorno}` }",
     a: '',
     oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // Un entorno que `wrangler.jsonc` no declara resolveria contra la nada. Antes
+    // se caia a la fecha de la raiz y salia OK: un veredicto sobre un entorno
+    // inexistente, con la palabra OK arriba.
+    invariante: 'check-runtime exige que el entorno de pruebas exista en wrangler.jsonc',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: '    if (config?.env?.[entorno] === undefined) {',
+    a: '    if (false) {',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // El bloque `miniflare: {}` del pool es laxo y TypeScript no lo revisa. Un
+    // `compatibilityDate` ahi gana sobre todo lo que el oraculo resuelve, y
+    // quedaria imprimiendo OK sobre una fecha que no es la efectiva.
+    invariante: 'check-runtime prohibe que el arnes imponga la fecha por su cuenta',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: '  const m = /compatibilityDate|compatibility_date/.exec(texto)',
+    a: '  const m = null',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // El guard compartido de los tres oraculos. Con un guard por nombre de
+    // archivo, invocar un oraculo por un symlink lo neutralizaba: importaba el
+    // modulo, no verificaba nada y salia con 0.
+    invariante: 'el guard distingue invocado de importado',
+    archivo: 'herramientas/invocado-directo.mjs',
+    de: '    return realpathSync(arrancado) === realpathSync(fileURLToPath(urlDelModulo))',
+    a: '    return false',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // El mismo guard, del otro lado: si diera verdadero siempre, importar el
+    // modulo correria `main()` y las pruebas dejarian de ser el unico que habla.
+    invariante: 'el guard no se cree invocado cuando lo importan',
+    archivo: 'herramientas/invocado-directo.mjs',
+    de: '  if (arrancado === undefined) return false',
+    a: '  if (arrancado === undefined) return true\n  return true',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // Y que `check-esquema.mjs` use el guard compartido. La primera version de
+    // este arreglo lo cambio solo en `check-runtime.mjs` y dejo este con el guard
+    // por nombre: se arreglo el caso y no la categoria, en el mismo commit que
+    // presumia de arreglar categorias.
+    invariante: 'check-esquema corre de verdad cuando se lo invoca',
+    archivo: 'herramientas/check-esquema.mjs',
+    de: 'if (invocadoDirecto(import.meta.url)) main()',
+    a: 'if (false) main()',
+    oraculo: ['node', 'herramientas/check-esquema.pruebas.mjs'],
   },
   {
     // Un comentario de bloque con una fecha vieja adentro no es una fecha. El
@@ -245,12 +295,10 @@ const MUTACIONES = [
     oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
   },
   {
-    // El guard del CLI. Con el anterior —por nombre de archivo— invocarlo por un
-    // symlink importaba el modulo, no verificaba nada y salia con 0: el peor
-    // final posible para un oraculo. Las pruebas de punta a punta lo cubren.
+    // El guard del CLI, ahora compartido. Las pruebas de punta a punta lo cubren.
     invariante: 'check-runtime corre de verdad cuando se lo invoca',
     archivo: 'herramientas/check-runtime.mjs',
-    de: 'if (import.meta.main) main()',
+    de: 'if (invocadoDirecto(import.meta.url)) main()',
     a: 'if (false) main()',
     oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
   },
@@ -315,13 +363,14 @@ const MUTACIONES = [
     a: '',
   },
   {
-    // `vitest.runtime.config.ts` dice que las pruebas leen el entorno `staging`
-    // del wrangler.jsonc de verdad; si eso fuera decorativo, las doce pruebas
-    // correrian contra una configuracion inventada y nadie se enteraria.
+    // El arnes dice leer el entorno `staging` del wrangler.jsonc de verdad; si eso
+    // fuera decorativo, las pruebas correrian contra una configuracion inventada y
+    // nadie se enteraria. Muta el archivo de datos, que es de donde sale el
+    // nombre desde que se dejo de parsear el TypeScript del arnes.
     invariante: 'el arnes del runtime lee el entorno que dice leer',
-    archivo: 'vitest.runtime.config.ts',
-    de: "      wrangler: { configPath: './wrangler.jsonc', environment: 'staging' },",
-    a: "      wrangler: { configPath: './wrangler.jsonc', environment: 'produccion' },",
+    archivo: 'pruebas-runtime/entorno-de-pruebas.json',
+    de: '"environment": "staging"',
+    a: '"environment": "produccion"',
     oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
   },
   {
@@ -342,9 +391,50 @@ const MUTACIONES = [
     // lo haga. Una convencion sin oraculo se rompe sola.
     invariante: 'el aislamiento entre pruebas del runtime lo da el nombre del DO',
     archivo: 'pruebas-runtime/runtime.test.ts',
-    de: '  return env.BILLETERA.get(env.BILLETERA.idFromName(nombreDeLaPrueba))',
+    de: '  return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.fullName))',
     a: "  return env.BILLETERA.get(env.BILLETERA.idFromName('una-sola'))",
     oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+  },
+  {
+    // Y que el nombre sea el CAMINO COMPLETO y no solo el texto del `it`.
+    // `task.name` no incluye el `describe`: dos pruebas con el mismo texto en dos
+    // grupos distintos daban el mismo Durable Object, con un comentario diciendo
+    // que no. Los dos ultimos `describe` de runtime.test.ts existen para que esta
+    // mutacion tenga donde morir.
+    //
+    // Nota de la pasada de mutacion: la primera version de esta mutacion cambiaba
+    // `billetera(task.fullName)` en el sitio de LLAMADA y sobrevivia, porque
+    // `String.replace` con un texto reemplaza solo la primera aparicion y quedaban
+    // trece sin mutar. El arreglo no es escribir la mutacion con mas cuidado: es
+    // que `billetera()` reciba la prueba entera, para que la decision viva en un
+    // solo lugar. Una mutacion dificil de escribir suele estar señalando un
+    // diseño con la decision repartida.
+    invariante: 'el aislamiento usa el camino completo de la prueba, no solo su texto',
+    archivo: 'pruebas-runtime/runtime.test.ts',
+    de: 'return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.fullName))',
+    a: 'return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.name))',
+    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+  },
+
+  // --- La deriva de tipos entre Entorno y wrangler.jsonc -------------------
+  // Estas dos mutan `src/index.ts` y su oraculo es el compilador. Prueban las dos
+  // lineas de `pruebas-runtime/runtime.test.ts` que comparan `Entorno` contra el
+  // `Cloudflare.Env` generado. Mutar la linea de comprobacion en si no servia: la
+  // volvia una tautologia que compila, y una mutacion que no puede fallar no
+  // prueba nada. Hay que romper lo que la comprobacion custodia.
+  {
+    invariante: 'Entorno no puede prometer un binding que wrangler.jsonc no declara',
+    archivo: 'src/index.ts',
+    de: '  readonly CORE: D1Database',
+    a: '  readonly CORE: D1Database\n  readonly PASARELA_INVENTADA: string',
+    oraculo: ['npx', 'tsc', '--noEmit'],
+  },
+  {
+    invariante: 'Entorno tampoco puede prometer de menos que wrangler.jsonc',
+    archivo: 'src/index.ts',
+    de: '  readonly SECUENCIA: DurableObjectNamespace<SecuenciaDO>\n',
+    a: '',
+    oraculo: ['npx', 'tsc', '--noEmit'],
   },
 ]
 

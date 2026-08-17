@@ -21,20 +21,25 @@ import { fileURLToPath } from 'node:url'
 import {
   normalizarJsonc,
   leerConfig,
-  extraerEntornoDelArnes,
+  entornoDePruebas,
+  buscarFechaImpuestaPorElArnes,
   fechaEfectiva,
   esFechaReal,
 } from './check-runtime.mjs'
+import { invocadoDirecto } from './invocado-directo.mjs'
 
 const RAIZ = fileURLToPath(new URL('..', import.meta.url))
 
-// --- importar este modulo NO tiene que correr el oraculo -------------------
-// Con el guard anterior (`argv[1].endsWith('check-runtime.mjs')`) esto ya era
-// cierto, pero por casualidad: el nombre de ESTE archivo no termina asi. Ahora
-// el guard es `import.meta.main` y la propiedad se afirma en vez de suponerse.
-// Si `main()` corriera al importar, el `console.log` de mas abajo no seria la
-// primera salida del proceso.
-assert.equal(import.meta.main, true, 'este archivo se corre directo, no importado')
+// --- el guard del CLI ------------------------------------------------------
+// Este archivo se corre directo, y el modulo que importa NO. Si el guard diera
+// verdadero al importar, `main()` correria aca y el `console.log` del final no
+// seria la ultima palabra del proceso.
+assert.equal(invocadoDirecto(import.meta.url), true, 'este archivo se corre directo')
+assert.equal(
+  invocadoDirecto(new URL('check-runtime.mjs', import.meta.url).href),
+  false,
+  'el modulo importado no se cree invocado',
+)
 
 // --- normalizarJsonc -------------------------------------------------------
 
@@ -94,25 +99,38 @@ assert.equal(configReal.name, 'recargaya')
 assert.equal(configReal.env.staging.name, 'recargaya-staging')
 assert.equal(configReal.env.produccion.workers_dev, false)
 
-// --- extraerEntornoDelArnes ------------------------------------------------
+// --- entornoDePruebas ------------------------------------------------------
+// Es un JSON, asi que no hay parser propio que probar. Lo que se prueba es que el
+// archivo REAL diga lo que el resto de la entrega supone, y que una forma
+// invalida falle en vez de resolver a `undefined`.
 
-const arnesReal = readFileSync(`${RAIZ}vitest.runtime.config.ts`, 'utf8')
-assert.equal(extraerEntornoDelArnes(arnesReal), 'staging')
-
-assert.equal(extraerEntornoDelArnes("wrangler: { environment: 'produccion' }"), 'produccion')
-assert.equal(extraerEntornoDelArnes('wrangler: { environment: "staging" }'), 'staging')
-
-// Un entorno nombrado en un comentario no cuenta.
 assert.equal(
-  extraerEntornoDelArnes("// antes: environment: 'produccion'\nwrangler: { environment: 'staging' }"),
+  entornoDePruebas(readFileSync(`${RAIZ}pruebas-runtime/entorno-de-pruebas.json`, 'utf8')),
   'staging',
 )
 
-assert.throws(() => extraerEntornoDelArnes('sin nada'), /no declara con que/)
-assert.throws(
-  () => extraerEntornoDelArnes("environment: 'staging'\nenvironment: 'produccion'"),
-  /declara 2 entornos/,
+assert.equal(entornoDePruebas('{ "environment": "produccion" }'), 'produccion')
+assert.throws(() => entornoDePruebas('{}'), /no declara un `environment`/)
+assert.throws(() => entornoDePruebas('{ "environment": "" }'), /no declara un `environment`/)
+assert.throws(() => entornoDePruebas('{ "environment": 3 }'), /no declara un `environment`/)
+
+// --- buscarFechaImpuestaPorElArnes ----------------------------------------
+// El bloque `miniflare: {}` del pool es un objeto laxo: TypeScript no revisa lo
+// que va adentro, y un `compatibilityDate` ahi gana sobre todo lo que este
+// oraculo resuelve. No se resuelve: se prohibe.
+
+const arnesReal = readFileSync(`${RAIZ}vitest.runtime.config.ts`, 'utf8')
+assert.equal(buscarFechaImpuestaPorElArnes(arnesReal), null)
+
+assert.equal(
+  buscarFechaImpuestaPorElArnes("miniflare: { compatibilityDate: '2023-01-01' }"),
+  'compatibilityDate',
 )
+assert.equal(
+  buscarFechaImpuestaPorElArnes('miniflare: { compatibility_date: "2023-01-01" }'),
+  'compatibility_date',
+)
+assert.equal(buscarFechaImpuestaPorElArnes('nada de eso aca'), null)
 
 // --- fechaEfectiva ---------------------------------------------------------
 
@@ -184,7 +202,7 @@ assert.equal(esFechaReal(20260801), false)
 // esto, el oraculo podia estar roto con sus propias pruebas en verde — que es
 // exactamente lo que encontro la auditoria.
 
-const { mkdtempSync, writeFileSync, cpSync, rmSync } = await import('node:fs')
+const { mkdtempSync, mkdirSync, writeFileSync, cpSync, rmSync } = await import('node:fs')
 const { tmpdir } = await import('node:os')
 const { join } = await import('node:path')
 const { spawnSync } = await import('node:child_process')
@@ -193,14 +211,14 @@ const { spawnSync } = await import('node:child_process')
  *  salida y la salida junta, para poder afirmar sobre el mensaje y no solo sobre
  *  el numero: un oraculo que falla con el mensaje equivocado manda a arreglar
  *  otra cosa. */
-function correrOraculoCon({ wrangler, arnes }) {
+function correrOraculoCon({ wrangler, entorno = '{ "environment": "staging" }', arnes = ARNES_OK }) {
   const dir = mkdtempSync(join(tmpdir(), 'check-runtime-'))
   try {
-    cpSync(`${RAIZ}herramientas/check-runtime.mjs`, join(dir, 'herramientas', 'check-runtime.mjs'), {
-      recursive: true,
-    })
+    cpSync(`${RAIZ}herramientas`, join(dir, 'herramientas'), { recursive: true })
     writeFileSync(join(dir, 'wrangler.jsonc'), wrangler)
     writeFileSync(join(dir, 'vitest.runtime.config.ts'), arnes)
+    mkdirSync(join(dir, 'pruebas-runtime'), { recursive: true })
+    writeFileSync(join(dir, 'pruebas-runtime', 'entorno-de-pruebas.json'), entorno)
 
     // Se lo invoca desde OTRO directorio a proposito: el oraculo tiene que
     // resolver la raiz desde su propia ubicacion y no desde el cwd.
@@ -214,11 +232,14 @@ function correrOraculoCon({ wrangler, arnes }) {
   }
 }
 
-const ARNES_OK = "cloudflareTest({ wrangler: { configPath: './wrangler.jsonc', environment: 'staging' } })"
+const ARNES_OK =
+  "cloudflareTest({ wrangler: { configPath: './wrangler.jsonc', environment: entornoDePruebas.environment } })"
+
+const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": { "name": "x" } } }'
 
 // Camino sano.
 {
-  const r = correrOraculoCon({ wrangler: '{ "compatibility_date": "2026-08-01" }', arnes: ARNES_OK })
+  const r = correrOraculoCon({ wrangler: CON_STAGING })
   assert.equal(r.codigo, 0, `esperaba 0 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /OK/)
   assert.match(r.salida, /staging/)
@@ -227,7 +248,7 @@ const ARNES_OK = "cloudflareTest({ wrangler: { configPath: './wrangler.jsonc', e
 
 // Sin fecha en ningun lado: el caso del reloj del sistema.
 {
-  const r = correrOraculoCon({ wrangler: '{ "name": "x" }', arnes: ARNES_OK })
+  const r = correrOraculoCon({ wrangler: '{ "name": "x", "env": { "staging": {} } }' })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /NO HAY compatibility_date/)
 }
@@ -236,8 +257,8 @@ const ARNES_OK = "cloudflareTest({ wrangler: { configPath: './wrangler.jsonc', e
 // viejo la tomaba como valida y decia OK.
 {
   const r = correrOraculoCon({
-    wrangler: '{\n  /* antes: "compatibility_date": "2026-08-01" */\n  "name": "x"\n}',
-    arnes: ARNES_OK,
+    wrangler:
+      '{\n  /* antes: "compatibility_date": "2026-08-01" */\n  "name": "x",\n  "env": { "staging": {} }\n}',
   })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /NO HAY compatibility_date/)
@@ -247,7 +268,6 @@ const ARNES_OK = "cloudflareTest({ wrangler: { configPath: './wrangler.jsonc', e
 {
   const r = correrOraculoCon({
     wrangler: '{ "env": { "staging": { "compatibility_date": "2026-08-10" } } }',
-    arnes: ARNES_OK,
   })
   assert.equal(r.codigo, 0, `esperaba 0 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /2026-08-10/)
@@ -256,38 +276,48 @@ const ARNES_OK = "cloudflareTest({ wrangler: { configPath: './wrangler.jsonc', e
 
 // Fecha que no existe.
 {
-  const r = correrOraculoCon({ wrangler: '{ "compatibility_date": "2026-02-30" }', arnes: ARNES_OK })
+  const r = correrOraculoCon({
+    wrangler: '{ "compatibility_date": "2026-02-30", "env": { "staging": {} } }',
+  })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /NO ES UNA FECHA REAL/)
 }
 
-// El arnes no dice con que entorno corre: no se puede resolver nada.
+// El archivo de datos no dice con que entorno corre.
 {
-  const r = correrOraculoCon({
-    wrangler: '{ "compatibility_date": "2026-08-01" }',
-    arnes: 'cloudflareTest({})',
-  })
+  const r = correrOraculoCon({ wrangler: CON_STAGING, entorno: '{}' })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /NO SE PUDO DETERMINAR/)
 }
 
+// El arnes impone la fecha por su cuenta: la efectiva deja de ser la aprobada.
+{
+  const r = correrOraculoCon({
+    wrangler: CON_STAGING,
+    arnes: `${ARNES_OK}\ncloudflareTest({ miniflare: { compatibilityDate: '2023-01-01' } })`,
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /fija la fecha por su cuenta/)
+}
+
 // wrangler.jsonc ilegible: falla con el mensaje del oraculo, no con un stack.
 {
-  const r = correrOraculoCon({ wrangler: '{ "compatibility_date": }', arnes: ARNES_OK })
+  const r = correrOraculoCon({ wrangler: '{ "compatibility_date": }' })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /NO SE PUDO DETERMINAR/)
   assert.doesNotMatch(r.salida, /at main \(/)
 }
 
-// El arnes apunta a un entorno que la configuracion no declara: se cae a la
-// fecha de la raiz, que es lo que hace wrangler, y eso esta bien.
+// El arnes apunta a un entorno que la configuracion no declara. Antes esto daba
+// OK resolviendo contra la fecha de la raiz: un veredicto sobre un entorno que no
+// existe, con la palabra OK arriba. Ahora falla.
 {
   const r = correrOraculoCon({
     wrangler: '{ "compatibility_date": "2026-08-01", "env": { "staging": {} } }',
-    arnes: "cloudflareTest({ wrangler: { environment: 'inventado' } })",
+    entorno: '{ "environment": "inventado" }',
   })
-  assert.equal(r.codigo, 0, `esperaba 0 y salio ${r.codigo}: ${r.salida}`)
-  assert.match(r.salida, /inventado/)
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /no declara el entorno "inventado"/)
 }
 
 console.log('  check-runtime.pruebas: OK')

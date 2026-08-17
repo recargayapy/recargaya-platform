@@ -4,7 +4,7 @@
  * Van aparte de `vitest.config.ts` a proposito. Las pruebas de `tests/` son del
  * nucleo puro: corren en Node, en milisegundos, y son las que la mutacion ataca
  * decenas de veces. Las de `pruebas-runtime/` levantan workerd. Mezclarlas haria
- * que cada mutacion pague el arranque del runtime, y la mutacion ya se corre 41
+ * que cada mutacion pague el arranque del runtime, y la mutacion ya se corre 49
  * veces y va a crecer.
  *
  * Lo que esta separacion NO significa: que las pruebas del runtime sean
@@ -18,6 +18,7 @@
  */
 import { defineConfig } from 'vitest/config'
 import { cloudflareTest } from '@cloudflare/vitest-pool-workers'
+import entornoDePruebas from './pruebas-runtime/entorno-de-pruebas.json'
 
 export default defineConfig({
   plugins: [
@@ -25,10 +26,13 @@ export default defineConfig({
       // Se lee el wrangler.jsonc de verdad, con el entorno de staging. Un
       // binding inventado aca probaria una configuracion que no existe.
       //
-      // `check-runtime.mjs` lee el nombre del entorno DE ESTA LINEA para
-      // resolver la fecha de compatibilidad efectiva. Si cambia, el oraculo lo
-      // sigue solo.
-      wrangler: { configPath: './wrangler.jsonc', environment: 'staging' },
+      // El nombre del entorno sale de `pruebas-runtime/entorno-de-pruebas.json`,
+      // que tambien lee `check-runtime.mjs` para resolver la fecha de
+      // compatibilidad efectiva. Es un archivo de datos y no un literal aca
+      // porque asi los dos lados no pueden divergir: la version anterior lo
+      // sacaba de ESTE archivo con una expresion regular sobre el TypeScript, y
+      // una auditoria la rompio con un glob y con `test.environment`.
+      wrangler: { configPath: './wrangler.jsonc', environment: entornoDePruebas.environment },
 
       // Explicito, aunque el default hoy sea inerte. Con `remoteBindings` en
       // `true` —que es el default— un binding marcado `"remote": true`, o

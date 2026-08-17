@@ -10,18 +10,23 @@
  *
  * QUE PRUEBAN Y QUE NO — leer esto antes de confiar en el numero de abajo.
  *
- * De las doce pruebas de este archivo, DOS estan ancladas a codigo de `src/`
- * (las dos de `/salud`) y tienen mutacion que las mata. Las otras diez son
- * SONDAS DE LA PLATAFORMA: crean sus propias tablas y le hablan a la API de
- * Cloudflare. Verifican que los mecanismos se comportan como la entrega
- * siguiente va a suponer, y no pueden verificar que nuestro codigo los use,
- * porque todavia no hay codigo nuestro que los use.
+ * De las catorce pruebas de este archivo:
+ *
+ *   · DOS estan ancladas a codigo de `src/` — las de `el Worker desplegado` — y
+ *     hay una mutacion de `src/index.ts` que mata a cada una.
+ *   · CUATRO —las de aislamiento y las dos homonimas— las cubre una mutacion del
+ *     propio arnes: prueban una convencion de este archivo, no una linea de
+ *     produccion, pero la convencion tiene oraculo.
+ *   · Las OCHO restantes son SONDAS DE LA PLATAFORMA: crean sus propias tablas y
+ *     le hablan a la API de Cloudflare. Verifican que los mecanismos se comportan
+ *     como la entrega siguiente va a suponer, y no pueden verificar que nuestro
+ *     codigo los use, porque todavia no hay codigo nuestro que los use.
  *
  * Lo dice una auditoria de esta entrega, y queda escrito para que nadie lea
- * "41/41 mutaciones muertas" como si las doce estuvieran cubiertas:
+ * "49/49 mutaciones muertas" como si las catorce estuvieran cubiertas:
  *
  *   Si `BilleteraDO` escribiera el asiento y el evento del outbox en dos `exec`
- *   sueltos, sin transaccion, las doce pruebas de este archivo pasarian igual.
+ *   sueltos, sin transaccion, las catorce pruebas de este archivo pasarian igual.
  *   La ley 5 NO tiene oraculo todavia.
  *
  * Lo que la entrega siguiente tiene que hacer para cerrarlo, y no es opcional:
@@ -40,8 +45,8 @@ import type { Entorno } from '../src/index.js'
 
 /**
  * El `env` de las pruebas se tipa con `Cloudflare.Env`, que lo GENERA wrangler
- * desde `wrangler.jsonc` (`worker-configuration.d.ts`, 921 bytes, regenerado y
- * comparado por `check-entorno.mjs` en cada `npm run verificar`).
+ * desde `wrangler.jsonc` (`worker-configuration.d.ts`, regenerado y comparado por
+ * `check-entorno.mjs` en cada `npm run verificar`).
  *
  * La primera version de este archivo escribia `interface Env extends Entorno` y
  * el comentario decia que eso evitaba "un doble de la configuracion". Era falso,
@@ -57,25 +62,69 @@ const _entornoNoPrometeDeMas: Entorno = {} as Cloudflare.Env
 void _entornoNoPrometeDeMas
 
 /**
- * Una billetera por prueba, con el nombre DERIVADO del nombre de la prueba.
+ * Y la direccion contraria, que la segunda vuelta de auditoria encontro abierta:
+ * la primera version tenia SOLO la linea de arriba, y el encabezado de
+ * `check-entorno.mjs` enumeraba las dos direcciones como el defecto a cerrar.
+ * Medido entonces: se agrego una var a `wrangler.jsonc`, se regeneraron los
+ * tipos, y `Entorno` siguio sin ella con `tsc` en verde.
  *
- * No es cosmetica. Medido por la auditoria: en esta version del pool no hay
- * `isolatedStorage` y el storage NO se resetea entre pruebas del mismo archivo —
- * dos `it` con el mismo nombre de DO comparten tablas y filas. Hoy eso se nota
- * porque las pruebas hacen `CREATE TABLE` y la segunda choca; en cuanto el
- * esquema lo cree el constructor del DO, ese aviso desaparece y una prueba de
- * saldo pasaria por plata que dejo otra.
- *
- * Con el nombre derivado, dos pruebas no pueden pisarse por descuido. Y hay una
- * mutacion que lo rompe a proposito, para que la convencion no sea una promesa.
+ * Con esta linea la asignabilidad es mutua, y eso cierra cuatro huecos de una
+ * vez: un binding que falta en `Entorno`, uno vuelto opcional, uno ensanchado a
+ * `unknown`, y uno con el tipo cambiado.
  */
-function billetera(nombreDeLaPrueba: string) {
-  return env.BILLETERA.get(env.BILLETERA.idFromName(nombreDeLaPrueba))
+const _entornoNoPrometeDeMenos: Cloudflare.Env = {} as Entorno
+void _entornoNoPrometeDeMenos
+
+/**
+ * Una billetera por prueba, con el nombre derivado de `task.fullName`.
+ *
+ * No es cosmetica. Medido: en esta version del pool no hay `isolatedStorage` y el
+ * storage NO se resetea entre pruebas del mismo archivo — dos `it` que compartan
+ * nombre de Durable Object comparten tablas y filas. Hoy eso se nota porque las
+ * pruebas hacen `CREATE TABLE` y la segunda choca; en cuanto el esquema lo cree
+ * el constructor del DO, ese aviso desaparece y una prueba de saldo pasaria por
+ * plata que dejo otra.
+ *
+ * Va `task.fullName` y NO `task.name`, y esto es un arreglo de la segunda vuelta
+ * de auditoria: `task.name` es solo el texto del `it`, sin el `describe`. Dos
+ * pruebas con el mismo texto en dos `describe` distintos daban el MISMO id de
+ * Durable Object — el aislamiento no aislaba, con un comentario aca diciendo que
+ * si. `task.fullName` incluye el camino completo.
+ *
+ * El ultimo `describe` de este archivo tiene dos pruebas con texto identico a
+ * proposito: son el oraculo de esto, y la mutacion que vuelve a `task.name` las
+ * mata.
+ */
+function billetera(prueba: { readonly name: string; readonly fullName: string }) {
+  // Recibe la prueba entera y no un texto ya elegido, a proposito: asi hay UN
+  // solo lugar donde se decide que campo usar, y por lo tanto un solo lugar que
+  // la mutacion tiene que romper. Con el nombre resuelto en cada llamada, la
+  // mutacion cambiaba una sola de las catorce y sobrevivia.
+  return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.fullName))
+}
+
+/**
+ * Un instante futuro para programar una alarma.
+ *
+ * Esto NO puede ser una fecha absoluta cableada, y la leccion salio caro: la
+ * version anterior usaba `Date.parse('2026-08-17T15:00:00Z')`. Paso a las 13:53
+ * UTC del 17 de agosto y fallo a las 15:11 UTC del mismo dia, porque a partir de
+ * las 15:00 esa fecha quedo en el PASADO y workerd normaliza una alarma vencida
+ * al instante actual. El mismo commit, la misma maquina, dos veredictos segun la
+ * hora — el defecto n.º 6 de la Fase 0 adentro de la entrega que existe para
+ * cazarlo.
+ *
+ * Treinta minutos es el plazo real del plan maestro para una reserva sin
+ * confirmar. Lo que se afirma es la igualdad contra el valor que se programo, asi
+ * que la prueba sigue siendo exacta sin depender del calendario.
+ */
+function dentroDeMediaHora(): number {
+  return Date.now() + 30 * 60 * 1000
 }
 
 describe('el SQLite del Durable Object', () => {
   it('existe y guarda lo que se le escribe', async ({ task }) => {
-    const filas = await runInDurableObject(billetera(task.name), (_do, ctx) => {
+    const filas = await runInDurableObject(billetera(task), (_do, ctx) => {
       ctx.storage.sql.exec('CREATE TABLE t (clave TEXT PRIMARY KEY, monto INTEGER NOT NULL) STRICT')
       ctx.storage.sql.exec("INSERT INTO t (clave, monto) VALUES ('a', 100000)")
       return [...ctx.storage.sql.exec<{ clave: string; monto: number }>('SELECT clave, monto FROM t')]
@@ -94,7 +143,7 @@ describe('el SQLite del Durable Object', () => {
     // sobre "hubo error": la version anterior usaba `expect(error).not.toBeNull()`
     // y la auditoria la hizo pasar con un INSERT a una columna inexistente, o
     // sea afirmando "algo tiro error" en vez de "STRICT manda".
-    const r = await runInDurableObject(billetera(task.name), (_do, ctx) => {
+    const r = await runInDurableObject(billetera(task), (_do, ctx) => {
       ctx.storage.sql.exec('CREATE TABLE m (monto INTEGER NOT NULL) STRICT')
 
       let error: string | null = null
@@ -123,7 +172,7 @@ describe('el SQLite del Durable Object', () => {
     // `check-esquema.mjs` existe para que TypeScript y ese CHECK no se
     // desincronicen. La entrega siguiente pone el MISMO CHECK adentro del DO,
     // que es donde nace el asiento. Esta sonda confirma que ahi tambien manda.
-    const r = await runInDurableObject(billetera(task.name), (_do, ctx) => {
+    const r = await runInDurableObject(billetera(task), (_do, ctx) => {
       ctx.storage.sql.exec(
         "CREATE TABLE b (tipo TEXT NOT NULL CHECK (tipo IN ('disponible', 'retenido'))) STRICT",
       )
@@ -154,7 +203,7 @@ describe('la transaccion de storage', () => {
     // misma transaccion. Esta sonda mide que el mecanismo cumple: una caida en
     // el medio no deja ni uno de los dos. Lo que NO mide —y esta escrito arriba—
     // es que nuestro codigo lo use.
-    const quedaron = await runInDurableObject(billetera(task.name), async (_do, ctx) => {
+    const quedaron = await runInDurableObject(billetera(task), async (_do, ctx) => {
       ctx.storage.sql.exec('CREATE TABLE asientos (id TEXT PRIMARY KEY) STRICT')
       ctx.storage.sql.exec('CREATE TABLE outbox (id TEXT PRIMARY KEY) STRICT')
 
@@ -181,7 +230,7 @@ describe('la transaccion de storage', () => {
     // El par de la sonda de arriba. Una prueba de rollback sola pasaria igual si
     // la transaccion nunca escribiera nada: hay que verificar tambien que el
     // camino sano SI persiste, o no se distingue "deshizo" de "no hizo".
-    const quedaron = await runInDurableObject(billetera(task.name), async (_do, ctx) => {
+    const quedaron = await runInDurableObject(billetera(task), async (_do, ctx) => {
       ctx.storage.sql.exec('CREATE TABLE asientos (id TEXT PRIMARY KEY) STRICT')
       ctx.storage.sql.exec('CREATE TABLE outbox (id TEXT PRIMARY KEY) STRICT')
 
@@ -209,7 +258,7 @@ describe('la transaccion de storage', () => {
     // elige por otro motivo (la sincrona no puede envolver un `await`, y eso es
     // una VENTAJA: impide que una transaccion abarque I/O externo y quede abierta
     // con el input gate cerrado), no porque el arnes le haya cerrado la puerta.
-    const quedaron = await runInDurableObject(billetera(task.name), (_do, ctx) => {
+    const quedaron = await runInDurableObject(billetera(task), (_do, ctx) => {
       ctx.storage.sql.exec('CREATE TABLE asientos (id TEXT PRIMARY KEY) STRICT')
 
       try {
@@ -232,9 +281,9 @@ describe('la alarma del Durable Object', () => {
   it('se programa, se lee y se puede cancelar', async ({ task }) => {
     // El plan maestro dice que una reserva sin confirmar vence sola, por la
     // alarma del propio DO, sin cron ni barrido. Esto es el mecanismo.
-    const vencimiento = Date.parse('2026-08-17T15:00:00Z')
+    const vencimiento = dentroDeMediaHora()
 
-    await runInDurableObject(billetera(task.name), async (_do, ctx) => {
+    await runInDurableObject(billetera(task), async (_do, ctx) => {
       expect(await ctx.storage.getAlarm()).toBeNull()
 
       await ctx.storage.setAlarm(vencimiento)
@@ -263,13 +312,13 @@ describe('la alarma del Durable Object', () => {
     // son dos cosas distintas, y este helper solo sabe de la primera. Confundir
     // las dos habria hecho pasar una prueba de vencimiento de reservas con el
     // metodo desconectado.
-    const oreja = billetera(task.name)
+    const oreja = billetera(task)
 
     // Sin alarma programada: no hay nada que disparar.
     expect(await runDurableObjectAlarm(oreja)).toBe(false)
 
     await runInDurableObject(oreja, async (_do, ctx) => {
-      await ctx.storage.setAlarm(Date.parse('2026-08-17T15:00:00Z'))
+      await ctx.storage.setAlarm(dentroDeMediaHora())
     })
 
     // Con alarma programada: la dispara, y devuelve que la disparo.
@@ -286,13 +335,13 @@ describe('la alarma del Durable Object', () => {
 })
 
 describe('el aislamiento entre pruebas', () => {
-  // Estas dos existen porque la auditoria midio que el storage NO se resetea
-  // entre pruebas del mismo archivo, y que en esta version del pool no hay
-  // ninguna opcion que lo haga. El aislamiento es una convencion —el nombre del
-  // DO— y una convencion sin oraculo se rompe sola. Estas dos son el oraculo.
+  // Estas existen porque el storage NO se resetea entre pruebas del mismo
+  // archivo, y en esta version del pool no hay ninguna opcion que lo haga. El
+  // aislamiento es una convencion —el nombre del Durable Object— y una
+  // convencion sin oraculo se rompe sola. Estas son el oraculo.
 
   it('el estado sobrevive dentro de una misma prueba', async ({ task }) => {
-    const oreja = billetera(task.name)
+    const oreja = billetera(task)
 
     await runInDurableObject(oreja, (_do, ctx) => {
       ctx.storage.sql.exec('CREATE TABLE marca (n INTEGER NOT NULL) STRICT')
@@ -310,11 +359,36 @@ describe('el aislamiento entre pruebas', () => {
 
   it('y NO se filtra a otra prueba, porque el nombre lo separa', async ({ task }) => {
     // Si el nombre no separara, la tabla `marca` de la prueba de arriba estaria
-    // visible aca y esto fallaria. Esta es la prueba que la mutacion del
-    // aislamiento mata.
-    const tablas = await runInDurableObject(billetera(task.name), (_do, ctx) => [
+    // visible aca y esto fallaria.
+    const tablas = await runInDurableObject(billetera(task), (_do, ctx) => [
       ...ctx.storage.sql.exec<{ n: number }>(
         "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'marca'",
+      ),
+    ])
+
+    expect(tablas).toEqual([{ n: 0 }])
+  })
+})
+
+// Estos dos `describe` tienen una prueba con EL MISMO TEXTO a proposito. Son el
+// oraculo de que el aislamiento use el camino completo y no solo el texto del
+// `it`: con `task.name` los dos daban el mismo id de Durable Object y la segunda
+// veia la tabla de la primera. La mutacion `task.fullName` -> `task.name` muere
+// aca, y sin este par no moriria en ningun lado.
+describe('dos pruebas con el mismo texto · grupo A', () => {
+  it('no comparten Durable Object', async ({ task }) => {
+    await runInDurableObject(billetera(task), (_do, ctx) => {
+      ctx.storage.sql.exec('CREATE TABLE homonima (n INTEGER NOT NULL) STRICT')
+      ctx.storage.sql.exec('INSERT INTO homonima (n) VALUES (1)')
+    })
+  })
+})
+
+describe('dos pruebas con el mismo texto · grupo B', () => {
+  it('no comparten Durable Object', async ({ task }) => {
+    const tablas = await runInDurableObject(billetera(task), (_do, ctx) => [
+      ...ctx.storage.sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'homonima'",
       ),
     ])
 

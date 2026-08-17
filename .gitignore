@@ -26,6 +26,7 @@ capturas/diff/
 # Sistema
 .DS_Store
 
-# Temporal de herramientas/check-entorno.mjs. Se borra solo; queda acá por si
-# el proceso muere en el medio.
-.check-entorno.temporal.d.ts
+# Temporal de herramientas/check-entorno.mjs — lleva el pid en el nombre para
+# que dos corridas simultaneas no se pisen. Se borra en el finally; queda aca
+# por si el proceso muere de un Ctrl-C.
+.check-entorno.*.temporal.d.ts

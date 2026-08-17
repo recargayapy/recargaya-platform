@@ -3,50 +3,54 @@
  * Oraculo: la fecha de compatibilidad con la que corren las pruebas del Durable
  * Object tiene que estar ESCRITA, no adivinada por el reloj de la maquina.
  *
- * Este archivo nacio afirmando otra cosa. Decia que miniflare, ante una
- * `compatibility_date` que el workerd instalado no soporta, "baja la fecha en
- * silencio y sigue". Eso es cierto de la version vieja de miniflare — es el
- * aviso que aparecio cuando se evaluo quedarse en vitest 2 — y es FALSO del
- * stack instalado: miniflare 5 tira `ERR_FUTURE_COMPATIBILITY_DATE` y workerd
- * tira "the newest date supported by this server binary is ...". Los dos fallan
- * a los gritos, con el numero exacto. Ese agujero no existe, y el oraculo que
- * lo cuidaba tampoco tiene sentido.
+ * El agujero, medido en `node_modules/miniflare/dist/src/index.js` (linea 38872):
  *
- * Tambien comparaba la fecha pedida contra la version del paquete `workerd`,
- * suponiendo que la fecha del paquete era el techo de compatibilidad soportado.
- * Medido contra el binario: `workerd 1.20260811.1` soporta hasta **2026-08-18**,
- * siete dias mas que su propia fecha de build, porque registra banderas con
- * fecha de activacion futura. Esa comparacion era una hipotesis comoda, y su
- * error caia del lado que rompe el CI: cualquier fecha del 12 al 18 de agosto
- * daba rojo sobre una corrida perfectamente fiel, y no habia wrangler mas nuevo
- * que lo arreglara.
- *
- * Lo que SI falla en silencio, y es la razon por la que este archivo se queda:
- *
- *     node_modules/miniflare/dist/src/index.js
- *     compatibility_date: config.compatibility_date ?? getTodaysCompatDate()
+ *     compatibility_date: config3.compatibility_date ?? getTodaysCompatDate(),
  *
  * Si la configuracion no declara una fecha para el entorno con el que corren las
- * pruebas, miniflare pone **la fecha de hoy del sistema**. Nadie avisa. El mismo
- * commit pasa hoy y falla el miercoles, o pasa en el CI y falla en la maquina
- * del dueño. Es el defecto n.º 6 de la Fase 0 tal cual — un veredicto que
- * depende de la maquina y no del codigo — y es facil de producir sin querer:
- * alcanza con dejar la fecha comentada mientras se prueba algo.
+ * pruebas, miniflare pone **la fecha de hoy del reloj del sistema**. Nadie avisa.
+ * El mismo commit pasa hoy y falla el miercoles, o pasa en el CI y falla en la
+ * maquina del dueño. Es la misma categoria que el defecto n.º 6 de la Fase 0 —un
+ * veredicto que depende de la maquina y no del codigo, aunque ahi el mecanismo
+ * eran los fines de linea— y es facil de producir sin querer: alcanza con dejar
+ * la fecha comentada un rato mientras se prueba algo.
  *
- * Asi que el oraculo hace tres cosas, y ninguna mas:
+ * Lo que este archivo NO hace, y por que:
  *
- *   1. Lee de `vitest.runtime.config.ts` con QUE entorno corren las pruebas, en
- *      vez de suponer "staging". Si el arnes y el oraculo miran entornos
- *      distintos, el oraculo no mide lo que corre.
- *   2. Resuelve la fecha efectiva de ese entorno como la resuelve wrangler:
+ * No compara la fecha pedida contra la version del paquete `workerd`. Lo hizo, y
+ * estaba mal de dos formas. Primero, suponia que la fecha del paquete era el
+ * techo de compatibilidad soportado: sondeado contra el binario, `1.20260811.1`
+ * soporta hasta 2026-08-18, siete dias mas que su propia fecha de build, porque
+ * registra banderas con fecha de activacion futura. Y segundo, no hacia falta:
+ * una fecha que el motor no soporta ya falla a los gritos, y esta medido en los
+ * dos caminos —`workerd` dice «the newest date supported by this server binary
+ * is ...» con el numero exacto, y miniflare rechaza aparte toda fecha posterior a
+ * la de hoy con `ERR_FUTURE_COMPATIBILITY_DATE`, sin decir cual si soporta.
+ *
+ * (El aviso que motivo esa comparacion —«Falling back to ...», miniflare bajando
+ * la fecha en silencio— es real, pero del stack VIEJO: aparecio al evaluar
+ * quedarse en vitest 2. Con el instalado no existe.)
+ *
+ * Asi que el oraculo hace cuatro cosas, y ninguna mas:
+ *
+ *   1. Lee de `pruebas-runtime/entorno-de-pruebas.json` con QUE entorno corren
+ *      las pruebas — el mismo archivo que lee el arnes. Si el arnes y el oraculo
+ *      miraran entornos distintos, el oraculo no mediria lo que corre.
+ *   2. Exige que ese entorno exista en `wrangler.jsonc`. Un entorno que la
+ *      configuracion no declara resolveria contra la nada.
+ *   3. Resuelve la fecha efectiva como la resuelve wrangler:
  *      `env.<entorno>.compatibility_date` gana sobre la de la raiz.
- *   3. Falla si no hay ninguna. Un comentario de bloque no cuenta como fecha.
+ *   4. Falla si no hay ninguna, y falla si el arnes la sobreescribe por su cuenta
+ *      con un `compatibilityDate` de miniflare — porque ahi la fecha efectiva ya
+ *      no es la que este oraculo acaba de aprobar.
  *
  * Uso:  node herramientas/check-runtime.mjs
  */
 
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
+import { invocadoDirecto } from './invocado-directo.mjs'
 
 /** La raiz del repositorio, derivada de la ubicacion de este archivo y no del
  *  directorio desde el que se lo invoca: un oraculo cuyo veredicto depende de
@@ -135,28 +139,43 @@ export function leerConfig(texto) {
 }
 
 /**
- * Con que entorno corren las pruebas del runtime, segun el propio arnes.
+ * Con que entorno corren las pruebas del runtime.
  *
- * Se lee de `vitest.runtime.config.ts` en vez de escribir 'staging' aca. Si
- * alguien apunta el arnes a otro entorno, el oraculo lo sigue — y si el arnes no
- * declara ninguno, esto falla, porque un entorno implicito significa que la
- * fecha efectiva sale de la raiz y nadie lo escribio.
+ * Sale de un archivo de datos que tambien lee `vitest.runtime.config.ts`. La
+ * version anterior lo sacaba del TypeScript del arnes con una expresion regular,
+ * y la segunda vuelta de auditoria la rompio de dos formas medidas: un glob como
+ * `'src/**'` dentro de comillas simples abria un comentario de bloque que se
+ * comia el resto del archivo, y `test.environment` —que es una opcion propia de
+ * vitest, con los valores `node` o `jsdom`— contaba como segunda coincidencia. En
+ * el peor caso el oraculo imprimia OK sobre un entorno llamado "node".
+ *
+ * Un archivo de datos hace que los dos lados no puedan divergir, que era todo el
+ * objetivo. Parsear TypeScript con texto nunca lo era.
  */
-export function extraerEntornoDelArnes(texto) {
-  const limpio = normalizarJsonc(texto)
-  const encontrados = [...limpio.matchAll(/environment\s*:\s*'([^']+)'|environment\s*:\s*"([^"]+)"/g)].map(
-    (m) => m[1] ?? m[2],
-  )
+export function entornoDePruebas(textoJson) {
+  const d = JSON.parse(textoJson)
+  if (typeof d.environment !== 'string' || d.environment === '') {
+    throw new Error('entorno-de-pruebas.json no declara un `environment` que sea texto')
+  }
+  return d.environment
+}
 
-  if (encontrados.length === 0) {
-    throw new Error('vitest.runtime.config.ts no declara con que `environment` corren las pruebas')
-  }
-  if (encontrados.length > 1) {
-    throw new Error(
-      `vitest.runtime.config.ts declara ${encontrados.length} entornos y no se sabe cual corre: ${encontrados.join(', ')}`,
-    )
-  }
-  return encontrados[0]
+/**
+ * El arnes no puede sobreescribir la fecha por su cuenta.
+ *
+ * El pool acepta un bloque `miniflare: { ... }` que pasa opciones crudas, y ese
+ * bloque esta declarado como objeto laxo: TypeScript no revisa lo que va adentro.
+ * Un `compatibilityDate` ahi gana sobre todo lo que resuelve este oraculo, y
+ * quedaria imprimiendo OK sobre una fecha que no es la efectiva. Medido: con
+ * `miniflare: { compatibilityDate: '2023-01-01' }` el oraculo decia OK y las
+ * pruebas corrian con 2023.
+ *
+ * No se intenta resolverlo: se prohibe. Detectar y fallar, que es lo que se puede
+ * hacer bien sin parsear TypeScript.
+ */
+export function buscarFechaImpuestaPorElArnes(texto) {
+  const m = /compatibilityDate|compatibility_date/.exec(texto)
+  return m === null ? null : m[0]
 }
 
 /**
@@ -188,16 +207,30 @@ export function esFechaReal(fecha) {
 
 function main() {
   let entorno
+  let config
   let resuelta
 
   try {
-    entorno = extraerEntornoDelArnes(
-      readFileSync(new URL('vitest.runtime.config.ts', `file://${RAIZ}`), 'utf8'),
+    const arnes = readFileSync(join(RAIZ, 'vitest.runtime.config.ts'), 'utf8')
+    const impuesta = buscarFechaImpuestaPorElArnes(arnes)
+    if (impuesta !== null) {
+      throw new Error(
+        `vitest.runtime.config.ts fija la fecha por su cuenta ("${impuesta}"): la efectiva dejaria de ser la de wrangler.jsonc`,
+      )
+    }
+
+    entorno = entornoDePruebas(
+      readFileSync(join(RAIZ, 'pruebas-runtime', 'entorno-de-pruebas.json'), 'utf8'),
     )
-    const config = leerConfig(readFileSync(new URL('wrangler.jsonc', `file://${RAIZ}`), 'utf8'))
+    config = leerConfig(readFileSync(join(RAIZ, 'wrangler.jsonc'), 'utf8'))
+
+    if (config?.env?.[entorno] === undefined) {
+      throw new Error(`wrangler.jsonc no declara el entorno "${entorno}" que el arnes dice usar`)
+    }
+
     resuelta = fechaEfectiva(config, entorno)
   } catch (e) {
-    // El mismo formato que el camino de falla de abajo. Un oraculo que se cae
+    // El mismo formato que los caminos de falla de abajo. Un oraculo que se cae
     // con un stack de Node le hace perder media hora al que lo lee con el CI en
     // rojo, y este archivo es el que mas se va a leer en ese estado.
     console.error('')
@@ -205,8 +238,8 @@ function main() {
     console.error('')
     console.error(`    ${e.message}`)
     console.error('')
-    console.error('  Sin esa fecha, miniflare usa la de HOY del reloj del sistema y las')
-    console.error('  pruebas del Durable Object pasan a depender del dia en que se corren.')
+    console.error('  Sin una fecha escrita, miniflare usa la de HOY del reloj del sistema y')
+    console.error('  las pruebas del Durable Object pasan a depender del dia en que corren.')
     console.error('')
     process.exit(1)
   }
@@ -216,18 +249,16 @@ function main() {
     console.error('  check-runtime: NO HAY compatibility_date PARA EL ENTORNO DE PRUEBAS')
     console.error('')
     console.error(`    el arnes corre con el entorno    : ${entorno}`)
-    console.error('    fecha en env.' + entorno + '            : no hay')
+    console.error(`    fecha en env.${entorno}            : no hay`)
     console.error('    fecha en la raiz                 : no hay')
     console.error('')
     console.error('  miniflare NO falla por esto. Pone la fecha de hoy del sistema:')
     console.error('')
-    console.error('      compatibility_date: config.compatibility_date ?? getTodaysCompatDate()')
+    console.error('      compatibility_date: config3.compatibility_date ?? getTodaysCompatDate(),')
     console.error('')
-    console.error('  Eso hace que el mismo commit pase hoy y falle el miercoles, y que el CI')
-    console.error("")
-    console.error('  y la maquina del dueño no den el mismo veredicto. Es el defecto n.º 6 de')
-    console.error('  la Fase 0: un oraculo cuyo resultado depende de la maquina no es un')
-    console.error('  oraculo.')
+    console.error('  Eso hace que el mismo commit pase hoy y falle el miercoles, y que el CI y')
+    console.error('  la maquina del dueño no den el mismo veredicto: un oraculo cuyo resultado')
+    console.error('  depende de la maquina no es un oraculo.')
     console.error('')
     console.error('  Un comentario NO cuenta como fecha: si la dejaste comentada mientras')
     console.error('  probabas algo, esto es exactamente lo que tenia que pasar.')
@@ -252,7 +283,7 @@ function main() {
   )
 }
 
-// `import.meta.main` y no `argv[1].endsWith(...)`: con el nombre, invocarlo por
-// un symlink o una copia con otro nombre importaba el modulo, no verificaba nada
-// y salia con 0 — el peor final posible para un oraculo.
-if (import.meta.main) main()
+// El guard vive en `invocado-directo.mjs`, compartido por los tres oraculos: la
+// primera version de este arreglo lo cambio solo aca y dejo `check-esquema.mjs`
+// con el guard por nombre. Se arregla la categoria, no el caso.
+if (invocadoDirecto(import.meta.url)) main()

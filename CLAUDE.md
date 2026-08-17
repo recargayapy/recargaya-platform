@@ -117,12 +117,13 @@ npm run probar:runtime    # sólo las del runtime, mientras se trabaja
 ```
 
 **Una prueba de `pruebas-runtime/` no vale por estar ahí.** Una auditoría midió
-que, de las doce que hay hoy, sólo dos están ancladas a código de `src/` y tienen
-mutación que las mate; las otras diez son **sondas de la plataforma**: verifican
-que Cloudflare se comporta como suponemos, no que nuestro código lo use. Medido:
-si el `BilleteraDO` escribiera el asiento y el evento del outbox en dos `exec`
-sueltos, sin transacción, las doce pasarían igual — **la ley 5 todavía no tiene
-oráculo.**
+que, de las que hay hoy, sólo dos están ancladas a código de `src/`; unas pocas
+más cubren una convención de este árbol, y el resto son **sondas de la
+plataforma**: verifican que Cloudflare se comporta como suponemos, no que nuestro
+código lo use. Medido: si el `BilleteraDO` escribiera el asiento y el evento del
+outbox en dos `exec` sueltos, sin transacción, todas pasarían igual — **la ley 5
+todavía no tiene oráculo.** El encabezado de `pruebas-runtime/runtime.test.ts`
+lleva el reparto exacto.
 
 De ahí la regla para las que vengan:
 
@@ -131,12 +132,16 @@ De ahí la regla para las que vengan:
 > la prueba tiene que ejecutar **eso** — recién entonces hay una línea que la
 > mutación puede romper.
 
-El encabezado de `pruebas-runtime/runtime.test.ts` lleva la lista de lo que falta.
-
 **El aislamiento entre pruebas del runtime es una convención.** No hay reseteo de
 storage entre pruebas del mismo archivo en esta versión del pool: cada prueba usa
-un Durable Object con el nombre derivado del nombre de la prueba, y hay una
-mutación que lo rompe para que la convención no sea sólo una promesa.
+un Durable Object cuyo nombre sale del **camino completo** de la prueba —
+`task.fullName`, no `task.name`, porque dos `it` con el mismo texto en dos
+`describe` distintos colisionaban. Hay dos pruebas homónimas a propósito y una
+mutación que lo rompe, para que la convención no sea sólo una promesa.
+
+**Ninguna prueba lleva una fecha absoluta cableada.** Una que decía
+`Date.parse('2026-08-17T15:00:00Z')` pasó a las 13:53 UTC y falló a las 15:11 del
+mismo día. Un instante futuro se calcula, no se escribe.
 
 **La `compatibility_date` del entorno de pruebas tiene que estar escrita.** Si
 falta, miniflare pone la fecha de **hoy del reloj del sistema** y el mismo commit
