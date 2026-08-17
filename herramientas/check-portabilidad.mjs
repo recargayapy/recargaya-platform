@@ -15,10 +15,20 @@
  * siguen este mismo patron: una herramienta de Node plano, con funciones puras
  * exportadas, sus pruebas propias, y su mutacion.
  *
- * QUE EXIGE, exactamente: que el primer argumento de `spawnSync`/`execFileSync` sea
- * `process.execPath` (el mismo Node que ya corre) o algo que salga de
- * `binarios.mjs`. Un nombre de comando pelado —`'npx'`, `'npm'`, `'node'`,
- * `'wrangler'`— depende del PATH y de la extension que use cada sistema.
+ * QUE EXIGE, exactamente, dos cosas:
+ *
+ *   · Que el primer argumento de `spawnSync`/`execFileSync` sea `process.execPath`
+ *     (el mismo Node que ya corre) o algo que salga de `binarios.mjs`. Un nombre de
+ *     comando pelado —`'npx'`, `'npm'`, `'node'`, `'wrangler'`— depende del PATH y
+ *     de la extension que use cada sistema.
+ *   · Que todo `symlinkSync` lleve `'junction'`. Un symlink de directorio necesita
+ *     permiso de administrador en Windows y devuelve EPERM sin el; una junction
+ *     hace lo mismo sin pedir nada, y en Linux el argumento se ignora.
+ *
+ * La segunda se agrego DESPUES de la primera, y por el mismo motivo: la version
+ * original de este oraculo miraba como se lanzan procesos y no como se crean
+ * enlaces. Cubria una parte de la frontera y no la otra — y el defecto que quedaba
+ * estaba en el archivo de al lado.
  *
  * QUE NO REVISA, y se dice: los scripts de `package.json`. Ahi `npm` pone
  * `node_modules/.bin` en el PATH y crea los `.cmd` de Windows, asi que
@@ -55,8 +65,32 @@ export function buscarComandosLiterales(texto) {
     // version anterior de otra regla de este mismo proyecto.
     if (/^\s*(\/\/|\*|\/\*)/.test(linea)) return
 
+    // Y los campos `de:` / `a:` de `mutar.mjs` son CODIGO COMO DATO: una mutacion
+    // existe para escribir la forma rota y comprobar que algo se da cuenta. Sin
+    // esta linea, agregar la mutacion que cuida esta misma regla ponia el oraculo
+    // en rojo.
+    //
+    // Es la unica excepcion, y es angosta a proposito: dos nombres de campo, con
+    // su prueba. No es «los archivos de prueba no se revisan» —eso si se pudre—,
+    // es «un fragmento declarado como dato de mutacion no es una llamada».
+    if (/^\s*(de|a):\s/.test(linea)) return
+
     const m = /\b(?:spawnSync|spawn|execFileSync|execFile)\s*\(\s*'([^']+)'/.exec(linea)
     if (m !== null) hallazgos.push({ linea: i + 1, comando: m[1] })
+
+    // Y los enlaces de directorio. Un `symlinkSync` sin el tercer argumento crea
+    // un symlink, y en Windows eso necesita permiso de administrador o el Modo de
+    // desarrollador: el sistema devuelve EPERM. Una junction hace lo mismo sin
+    // pedir nada, y en Linux el argumento se ignora.
+    //
+    // Esta rama se agrego despues del `npx`, y por el mismo motivo: la primera
+    // version de este oraculo miraba como se LANZAN procesos y no como se CREAN
+    // enlaces. Cubria una parte de la frontera y no la otra, y el defecto que
+    // quedaba estaba en el archivo de al lado.
+    const e = /\bsymlinkSync\s*\(/.exec(linea)
+    if (e !== null && !/'junction'/.test(linea)) {
+      hallazgos.push({ linea: i + 1, comando: 'symlinkSync sin junction' })
+    }
   })
 
   return hallazgos

@@ -421,6 +421,22 @@ const MUTACIONES = [
     oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
   },
   {
+    // El enlace a `node_modules` de las pruebas de check-entorno. Un symlink de
+    // directorio necesita permiso de administrador en Windows; una junction no.
+    // Lo encontro el dueño corriendo la entrega en su maquina, con un EPERM — que
+    // es exactamente para lo que existe ese paso.
+    invariante: 'el enlace a node_modules se crea de una forma que anda en Windows',
+    archivo: 'herramientas/check-entorno.pruebas.mjs',
+    de: "    symlinkSync(join(RAIZ, 'node_modules'), join(dir, 'node_modules'), 'junction')",
+    a: "    symlinkSync(join(RAIZ, 'node_modules'), join(dir, 'node_modules'))",
+    // El oraculo es el BARRIDO, no sus pruebas: la mutacion rompe OTRO archivo, y
+    // las pruebas de `check-portabilidad` verifican la funcion sobre texto
+    // inventado — no miran el arbol. La primera version de esta mutacion las
+    // usaba y sobrevivio. Una mutacion con el oraculo equivocado no prueba nada,
+    // y el arnes lo dijo.
+    oraculo: conNode('herramientas/check-portabilidad.mjs'),
+  },
+  {
     invariante: 'el comando siempre arranca con el Node que ya esta corriendo',
     archivo: 'herramientas/binarios.mjs',
     de: '  return [process.execPath, ruta, ...args]',

@@ -72,7 +72,7 @@ se avisa antes de entregarla, no después.
 npm run verificar
 ```
 
-Corre los seis oráculos, en este orden:
+Corre los siete oráculos, en este orden:
 
 | | |
 |---|---|
@@ -80,21 +80,23 @@ Corre los seis oráculos, en este orden:
 | `tipos` | `tsc --noEmit` |
 | `probar` | las pruebas del núcleo puro, en Node |
 | `esquema` | los tipos de TypeScript contra el SQL de las migraciones |
+| `portabilidad` | que ninguna herramienta lance un comando por nombre |
 | `runtime` | que la `compatibility_date` del entorno de pruebas esté escrita, y las pruebas del Durable Object sobre workerd |
 | `mutar` | rompe el código a propósito; toda mutación tiene que morir |
 
-Los seis tienen que pasar. El CI llama a `npm run verificar` y **no** a cada
+Los siete tienen que pasar. El CI llama a `npm run verificar` y **no** a cada
 oráculo por separado: así el CI y la máquina de cualquiera corren exactamente lo
 mismo, y un oráculo nuevo entra sin que nadie toque el workflow.
 
-Tres de los seis existen para cubrir una **frontera** donde `tsc` no llega, y son
-la misma idea aplicada tres veces:
+Cuatro de los siete existen para cubrir una **frontera** donde `tsc` no llega, y
+son la misma idea aplicada cuatro veces:
 
 | Frontera | Oráculo |
 |---|---|
 | TypeScript ↔ el SQL de las migraciones | `check-esquema.mjs` |
 | TypeScript ↔ los bindings de `wrangler.jsonc` | `check-entorno.mjs` |
 | El arnés de pruebas ↔ el runtime con el que corre | `check-runtime.mjs` |
+| Nuestras herramientas ↔ el sistema operativo | `check-portabilidad.mjs` |
 
 Cuando aparezca una frontera nueva, el patrón es ése: una herramienta de Node
 plano, con funciones puras exportadas, sus pruebas propias en
@@ -154,6 +156,14 @@ tres lados: el arnés, `check-runtime.mjs` y `check-entorno.mjs`. Un dato que tr
 archivos necesitan y cada uno escribe a mano deriva; un archivo de datos no puede.
 Antes de esto, un oráculo sacaba el nombre del entorno parseando el TypeScript del
 arnés con una expresión regular, y un glob `'src/**'` alcanzaba para romperlo.
+
+**Windows no es un detalle de despliegue: es la máquina del dueño.** Todo lo que
+esta sesión verifica corre en Linux, así que un defecto que sólo aparece en Windows
+pasa las tres vueltas de auditoría sin que nadie lo vea. Ya pasó dos veces —`npx`
+que en Windows es `npx.cmd`, y un symlink de directorio que ahí pide permisos de
+administrador—. La regla que quedó: **cualquier cosa que toque el sistema de
+archivos o lance un proceso se escribe de la forma que anda en las tres
+plataformas**, no de la que anda acá.
 
 **Ningún número va escrito en un comentario si se puede contar.** Tres vueltas de
 auditoría seguidas encontraron números viejos en la prosa — «cuatro pruebas» cuando

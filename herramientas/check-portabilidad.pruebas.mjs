@@ -74,6 +74,32 @@ assert.deepEqual(buscarComandosLiterales(`// antes decia ${ejemplo('spawnSync', 
 assert.deepEqual(buscarComandosLiterales(` * usaba ${ejemplo('execFileSync', 'npx')}`), [])
 assert.deepEqual(buscarComandosLiterales(`  /* ${ejemplo('spawnSync', 'npm')} */`), [])
 
+// --- los enlaces de directorio --------------------------------------------
+// La segunda mitad de la frontera. `symlinkSync` sin `'junction'` anda en Linux y
+// devuelve EPERM en Windows sin permiso de administrador.
+
+// Se arma en dos pedazos por lo mismo que `ejemplo`: escrito entero, este archivo
+// se acusaria a si mismo.
+const enlace = (extra) => `symlink${'Sync'}(origen, destino${extra})`
+
+assert.deepEqual(buscarComandosLiterales(enlace('')), [
+  { linea: 1, comando: 'symlinkSync sin junction' },
+])
+assert.deepEqual(buscarComandosLiterales(enlace(", 'junction'")), [])
+
+// Un comentario que la menciona tampoco cuenta.
+assert.deepEqual(buscarComandosLiterales(`// antes: ${enlace('')}`), [])
+
+// Los campos `de:` y `a:` de mutar.mjs llevan codigo como dato: una mutacion existe
+// justamente para escribir la forma rota. Es la unica excepcion, y es angosta.
+assert.deepEqual(buscarComandosLiterales(`    a: "${ejemplo('spawnSync', 'npx')}",`), [])
+assert.deepEqual(buscarComandosLiterales(`    de: "${enlace('')}",`), [])
+
+// Pero sigue siendo angosta: `de` o `a` como parte de otra cosa NO cuentan.
+assert.deepEqual(buscarComandosLiterales(`  const de = ${ejemplo('spawnSync', 'npx')}`), [
+  { linea: 1, comando: 'npx' },
+])
+
 // --- el arbol de verdad ----------------------------------------------------
 // Las de arriba prueban la funcion sobre texto inventado. Esta prueba que sirve
 // para lo que tiene que mirar: si `archivosDeHerramientas` devolviera una lista

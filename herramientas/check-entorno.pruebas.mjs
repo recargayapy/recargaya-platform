@@ -93,7 +93,25 @@ function correrOraculoSobreCopia(perturbar) {
       cpSync(join(RAIZ, x), join(dir, x), { recursive: true })
     }
     cpSync(join(RAIZ, 'worker-configuration.d.ts'), join(dir, 'worker-configuration.d.ts'))
-    symlinkSync(join(RAIZ, 'node_modules'), join(dir, 'node_modules'))
+
+    // 'junction' y no un symlink comun, y esto lo encontro el dueño corriendo la
+    // entrega en su Windows — que es exactamente para lo que existe ese paso:
+    //
+    //   Error: EPERM: operation not permitted, symlink
+    //   'C:\Users\...\node_modules' -> 'C:\Users\...\Temp\check-entorno-XXXX\node_modules'
+    //
+    // En Linux cualquier usuario crea un symlink de directorio. En Windows hace
+    // falta permiso de administrador o el Modo de desarrollador activado, y sin
+    // eso el sistema devuelve EPERM. Una junction es el equivalente de Windows y
+    // NO pide permisos; en Linux el tercer argumento se ignora, asi que la misma
+    // linea sirve en las tres plataformas — que es la regla de `binarios.mjs`
+    // aplicada al sistema de archivos.
+    //
+    // Lo incomodo: la entrega que agrega `check-portabilidad` para cerrar «un
+    // defecto que solo aparecia en Windows» dejaba otro, en el propio oraculo que
+    // tocaba. `check-portabilidad` mira como se lanzan procesos, no como se crean
+    // enlaces: cubria una parte de la frontera y no la otra.
+    symlinkSync(join(RAIZ, 'node_modules'), join(dir, 'node_modules'), 'junction')
 
     perturbar(dir)
 
@@ -110,6 +128,11 @@ function correrOraculoSobreCopia(perturbar) {
       temporales: readdirSync(dir).filter((f) => f.startsWith('.check-entorno.')),
     }
   } finally {
+    // El enlace se desarma ANTES de borrar la carpeta. `rmSync` recursivo trata
+    // un enlace como enlace y no lo sigue —esta medido— pero el costo de que
+    // alguna vez no fuera asi es borrar el `node_modules` de verdad, 300 MB y una
+    // reinstalacion. Dos lineas de mas contra un riesgo asi es un buen negocio.
+    rmSync(join(dir, 'node_modules'), { force: true })
     rmSync(dir, { recursive: true, force: true })
   }
 }
