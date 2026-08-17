@@ -31,7 +31,8 @@ jobs:
       # las del despliegue, verificaria un arbol que nunca sale al aire.
       - run: npm ci
 
-      # tipos + pruebas + esquema + mutacion
+      # entorno + tipos + pruebas + esquema + runtime + mutacion. `runtime` levanta
+      # workerd de verdad para las pruebas del Durable Object.
       - name: Verificar
         run: npm run verificar
 

@@ -193,43 +193,97 @@ const MUTACIONES = [
     a: '',
   },
 
-  // --- El oraculo del runtime ---------------------------------------------
-  // Estas tres atacan a `check-runtime.mjs`, el oraculo que impide que las
-  // pruebas del Durable Object juzguen sobre un workerd distinto al que
-  // Cloudflare ejecuta. Un oraculo sin jueces fue el defecto n.º 1 de la Fase 0:
-  // se rompio la deteccion de descuadre y ninguna prueba se dio cuenta.
+  // --- Los oraculos nuevos ------------------------------------------------
+  // Un oraculo sin jueces fue el defecto n.º 1 de la Fase 0: se rompio la
+  // deteccion de descuadre y ninguna prueba se dio cuenta. Estas siete atacan a
+  // `check-runtime.mjs` y `check-entorno.mjs`, y su oraculo son las pruebas
+  // propias de cada herramienta.
   {
-    invariante: 'check-runtime detecta que la compatibility_date supera al workerd instalado',
+    // EL caso que check-runtime existe para agarrar: sin fecha declarada,
+    // miniflare pone la del reloj del sistema. Si el oraculo inventara una, el
+    // agujero queda abierto y encima con un OK arriba.
+    invariante: 'check-runtime no inventa una fecha cuando no hay ninguna declarada',
     archivo: 'herramientas/check-runtime.mjs',
-    de: '  const ok = fechaCompatibilidad <= fechaWorkerd',
-    a: '  const ok = true',
+    de: '  return { fecha: null, origen: null }\n}',
+    a: "  return { fecha: '2026-08-01', origen: 'inventada' }\n}",
     oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
   },
   {
-    // Sin esta guarda, `1.20260230.0` daba "2026-02-30", que JavaScript corre en
-    // silencio a 2026-03-02: el oraculo comparaba contra una fecha que nadie
-    // escribio, y no tenia forma de notarlo.
-    invariante: 'check-runtime rechaza una version que no codifica una fecha real',
+    // La fecha de `env.<entorno>` gana sobre la de la raiz, porque es la que usa
+    // wrangler. La version anterior de esta herramienta declaraba el caso un
+    // conflicto irresoluble y fallaba.
+    invariante: 'check-runtime resuelve la fecha del entorno por sobre la de la raiz',
     archivo: 'herramientas/check-runtime.mjs',
-    de: '  if (Number.isNaN(d.getTime()) || !d.toISOString().startsWith(fecha)) {',
-    a: '  if (false) {',
+    de: "  if (typeof delEntorno === 'string') return { fecha: delEntorno, origen: `env.${entorno}` }",
+    a: '',
     oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
   },
   {
-    // Con dos fechas activas en wrangler.jsonc, elegir una es adivinar — y
-    // adivinar es lo que produce el defecto que este oraculo existe para agarrar.
-    invariante: 'check-runtime falla si wrangler.jsonc declara dos compatibility_date',
+    // Un comentario de bloque con una fecha vieja adentro no es una fecha. El
+    // extractor anterior —lineas que arrancan con `//`— la tomaba como valida.
+    invariante: 'check-runtime no toma como fecha la que vive en un comentario de bloque',
     archivo: 'herramientas/check-runtime.mjs',
-    de: '  if (encontradas.length > 1) {',
-    a: '  if (false) {',
+    de: "    if (c === '/' && d === '*') {",
+    a: '    if (false) {',
     oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // Una barra doble adentro de una cadena no abre un comentario. Sin esta
+    // rama, una URL en la configuracion se come el resto de la linea.
+    invariante: 'check-runtime sabe cuando esta adentro de una cadena',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: "    if (c === '\"') {\n      enCadena = true",
+    a: '    if (false) {\n      enCadena = true',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // `2026-02-30` no existe y JavaScript la corre en silencio a 2026-03-02.
+    invariante: 'check-runtime rechaza una fecha que no existe',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: "  return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(fecha)",
+    a: '  return true',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // El guard del CLI. Con el anterior —por nombre de archivo— invocarlo por un
+    // symlink importaba el modulo, no verificaba nada y salia con 0: el peor
+    // final posible para un oraculo. Las pruebas de punta a punta lo cubren.
+    invariante: 'check-runtime corre de verdad cuando se lo invoca',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: 'if (import.meta.main) main()',
+    a: 'if (false) main()',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    invariante: 'check-entorno detecta que los tipos generados no coinciden',
+    archivo: 'herramientas/check-entorno.mjs',
+    de: "  if (a === b) return { ok: true, lineaDistinta: null, esperada: null, encontrada: null }",
+    a: '  return { ok: true, lineaDistinta: null, esperada: null, encontrada: null }',
+    oraculo: ['node', 'herramientas/check-entorno.pruebas.mjs'],
+  },
+  {
+    // La normalizacion del encabezado tiene que sacar UNA linea, no todos los
+    // comentarios: si sacara cualquier `//`, una edicion a mano al final de una
+    // linea de codigo pasaria inadvertida, que es justo el caso que
+    // `wrangler types --check` no agarra y por el que existe esta herramienta.
+    invariante: 'check-entorno normaliza solo el encabezado, no todo comentario',
+    archivo: 'herramientas/check-entorno.mjs',
+    de: "      .replace(/^\\/\\/ Generated by Wrangler by running .*$/m, '// (encabezado de wrangler)')",
+    a: "      .replace(/\\/\\/.*$/gm, '// (encabezado de wrangler)')",
+    oraculo: ['node', 'herramientas/check-entorno.pruebas.mjs'],
   },
 
   // --- Las pruebas del Durable Object -------------------------------------
   // Su oraculo NO es vitest a secas: las pruebas del runtime viven en otra
   // configuracion porque levantan workerd, y no tiene sentido pagar ese arranque
-  // en cada una de las mutaciones de arriba. Si estas dos sobreviven, las nueve
-  // pruebas de `pruebas-runtime/` estan mirando para otro lado.
+  // en cada una de las mutaciones de arriba.
+  //
+  // Decir lo que falta: de las doce pruebas de `pruebas-runtime/`, solo las dos
+  // de `/salud` estan ancladas a codigo de `src/`. Las otras diez son sondas de
+  // la plataforma y no hay linea de produccion que romper para matarlas. Esta
+  // lista NO prueba que esas diez sirvan; el encabezado de
+  // `pruebas-runtime/runtime.test.ts` dice que tiene que hacer la entrega
+  // siguiente para cerrarlo.
   {
     invariante: 'la prueba de /salud lee los vars del entorno de verdad',
     archivo: 'src/index.ts',
@@ -261,15 +315,35 @@ const MUTACIONES = [
     a: '',
   },
   {
-    // El arnes del runtime tambien se muta. `vitest.runtime.config.ts` dice que
-    // las pruebas leen el entorno `staging` del wrangler.jsonc de verdad; si eso
-    // fuera decorativo, las nueve pruebas correrian contra una configuracion
-    // inventada y nadie se enteraria. Apuntandolo a `produccion`, la prueba de
-    // /salud —que exige `entorno: 'staging'`— tiene que morir.
+    // `vitest.runtime.config.ts` dice que las pruebas leen el entorno `staging`
+    // del wrangler.jsonc de verdad; si eso fuera decorativo, las doce pruebas
+    // correrian contra una configuracion inventada y nadie se enteraria.
     invariante: 'el arnes del runtime lee el entorno que dice leer',
     archivo: 'vitest.runtime.config.ts',
     de: "      wrangler: { configPath: './wrangler.jsonc', environment: 'staging' },",
     a: "      wrangler: { configPath: './wrangler.jsonc', environment: 'produccion' },",
+    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+  },
+  {
+    // El arnes tiene que poder apagarse ruidosamente. Hoy un `include` que no
+    // machea sale con 1 ("No test files found"); el dia que alguien agregue
+    // `passWithNoTests: true` para callar un ruido, esta mutacion SOBREVIVE y
+    // avisa que `verificar` esta saliendo verde con cero pruebas del runtime.
+    invariante: 'el arnes del runtime falla si no encuentra pruebas',
+    archivo: 'vitest.runtime.config.ts',
+    de: "    include: ['pruebas-runtime/**/*.test.ts'],",
+    a: "    include: ['pruebas-runtime/**/*.no-existe.ts'],",
+    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+  },
+  {
+    // El aislamiento entre pruebas del runtime es una convencion: cada prueba usa
+    // su propio nombre de Durable Object. Medido: en esta version del pool el
+    // storage NO se resetea entre pruebas del mismo archivo, y no hay opcion que
+    // lo haga. Una convencion sin oraculo se rompe sola.
+    invariante: 'el aislamiento entre pruebas del runtime lo da el nombre del DO',
+    archivo: 'pruebas-runtime/runtime.test.ts',
+    de: '  return env.BILLETERA.get(env.BILLETERA.idFromName(nombreDeLaPrueba))',
+    a: "  return env.BILLETERA.get(env.BILLETERA.idFromName('una-sola'))",
     oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
   },
 ]

@@ -23,5 +23,16 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "pruebas-runtime/**/*.ts"]
+  // Los archivos de configuracion tambien entran. La primera version de
+  // vitest.runtime.config.ts declaraba una opcion que el pool ya no acepta, y el
+  // schema descarta las claves desconocidas en silencio: estaba escrita,
+  // comentada, y no hacia nada. Con los configs adentro, tsc lo agarra.
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "pruebas-runtime/**/*.ts",
+    "vitest.config.ts",
+    "vitest.runtime.config.ts",
+    "worker-configuration.d.ts"
+  ]
 }
