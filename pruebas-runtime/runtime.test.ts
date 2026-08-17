@@ -10,13 +10,13 @@
  *
  * QUE PRUEBAN Y QUE NO — leer esto antes de confiar en el numero de abajo.
  *
- * De las diecinueve pruebas de este archivo:
+ * De las veintiseis pruebas de este archivo:
  *
- *   · DOCE estan ancladas a codigo de `src/` y tienen una mutacion que las mata:
- *     las siete del esquema (ejecutan la cadena que exporta
+ *   · DIECINUEVE estan ancladas a codigo de `src/` y tienen una mutacion que las
+ *     mata: las siete del esquema (ejecutan la cadena que exporta
  *     `src/billetera/esquema.ts`, no una tabla de juguete), las tres de la
- *     transaccion (llaman a `enUnaTransaccion` de `src/billetera/transaccion.ts`),
- *     y las dos de `el Worker desplegado`.
+ *     transaccion, las siete del `BilleteraDO` por su metodo publico, y las dos de
+ *     `el Worker desplegado`.
  *   · CUATRO —las dos de aislamiento y las dos homonimas— prueban una convencion
  *     de este archivo y no una linea de produccion. Tres de las cuatro mueren por
  *     su propia asercion con una mutacion del arnes; la cuarta (`el estado
@@ -24,10 +24,11 @@
  *   · Las TRES restantes son SONDAS DE LA PLATAFORMA: las dos de la alarma y la de
  *     `transactionSync`. Verifican que Cloudflare se comporta como suponemos, y no
  *     pueden verificar que nuestro codigo lo use, porque todavia no hay codigo
- *     nuestro que use la alarma. Eso lo cierra el vencimiento de reservas.
+ *     nuestro que use la alarma. Eso lo cierra el vencimiento de reservas, que es
+ *     lo que sigue.
  *
- * LA LEY 5 YA TIENE ORACULO, y hasta esta entrega no lo tenia. La version anterior
- * de este encabezado decia, medido por una auditoria:
+ * LA LEY 5 YA TIENE ORACULO CONTRA EL METODO PUBLICO. La version anterior de este
+ * encabezado decia, medido por una auditoria:
  *
  *   «Si `BilleteraDO` escribiera el asiento y el evento del outbox en dos `exec`
  *   sueltos, sin transaccion, las catorce pruebas de este archivo pasarian igual.»
@@ -37,17 +38,23 @@
  * `src/`, y la mutacion «el asiento y el evento del outbox van en la MISMA
  * transaccion» le saca la transaccion al helper y muere.
  *
- * Lo que TODAVIA falta para cerrar la ley 5 de punta a punta, y no es opcional:
- * una prueba que llame al METODO PUBLICO del `BilleteraDO` con una caida inyectada
- * entre la escritura del asiento y la del outbox — el patron que ya existe en
- * `tests/arnes.ts`. Hoy se comprueba que el helper deshace; falta comprobar que el
- * metodo del DO pasa por el helper. Eso llega cuando el DO se reescriba sobre este
- * esquema, que es el resto de esta misma entrega.
+ * Eso ya no es cierto: `si falla EN EL MEDIO de escribir, no queda nada a medias`
+ * llama a `acreditar()` del DO con una colision de PRIMARY KEY sembrada, o sea con
+ * la caida ocurriendo DESPUES de que las bolsas y los totales se reescribieron. Sin
+ * la transaccion, la plata de la carga anterior queda borrada. La mutacion que le
+ * saca `enUnaTransaccion` al metodo publico muere ahi.
+ *
+ * Como se llego a esa prueba vale la pena contarlo: la primera version usaba un
+ * debito sin saldo, y la mutacion SOBREVIVIO — el nucleo se queja antes de escribir
+ * una sola fila, asi que probaba «no se escribe si no se empieza», que no es lo
+ * mismo que «no queda nada a medias». Lo dijo el arnes de mutacion, no una
+ * auditoria.
  */
 import { env, SELF, runInDurableObject, runDurableObjectAlarm } from 'cloudflare:test'
 import { describe, it, expect } from 'vitest'
 import type { Entorno } from '../src/index.js'
 import { ESQUEMA } from '../src/billetera/esquema.js'
+import { guaranies } from '../src/dinero/monto.js'
 import { enUnaTransaccion } from '../src/billetera/transaccion.js'
 
 /**
@@ -445,19 +452,23 @@ describe('la transaccion de storage', () => {
     // elige por otro motivo (la sincrona no puede envolver un `await`, y eso es
     // una VENTAJA: impide que una transaccion abarque I/O externo y quede abierta
     // con el input gate cerrado), no porque el arnes le haya cerrado la puerta.
+    // Usa una tabla propia con nombre propio: desde que el constructor del DO
+    // crea el esquema real, una sonda que invente una tabla `asientos` choca con
+    // la de verdad. Es una buena señal — significa que el esquema ya esta ahi
+    // antes de que nadie lo pida.
     const quedaron = await runInDurableObject(billetera(task), (_do, ctx) => {
-      ctx.storage.sql.exec('CREATE TABLE asientos (id TEXT PRIMARY KEY) STRICT')
+      ctx.storage.sql.exec('CREATE TABLE sonda_sync (id TEXT PRIMARY KEY) STRICT')
 
       try {
         ctx.storage.transactionSync(() => {
-          ctx.storage.sql.exec("INSERT INTO asientos (id) VALUES ('a1')")
+          ctx.storage.sql.exec("INSERT INTO sonda_sync (id) VALUES ('a1')")
           throw new Error('caida inyectada')
         })
       } catch {
         /* a proposito */
       }
 
-      return [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM asientos')]
+      return [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM sonda_sync')]
     })
 
     expect(quedaron).toEqual([{ n: 0 }])
@@ -600,6 +611,246 @@ describe('dos pruebas con el mismo texto · grupo A', () => {
 
 describe('dos pruebas con el mismo texto · grupo B', () => {
   it('no comparten Durable Object', comprobarQueNadieEscribioAca('B'))
+})
+
+describe('el BilleteraDO, por su metodo publico', () => {
+  // Estas son las que cierran la ley 5 de punta a punta. Las del esquema y las de
+  // la transaccion prueban las piezas; estas prueban que el metodo que mueve la
+  // plata las USA. Sin ellas, el DO podia escribir el asiento y el evento en dos
+  // `exec` sueltos y todo lo demas seguia en verde.
+
+  const op = (clave: string) => ({
+    clave_idem: clave,
+    correlacion_id: 'c1',
+    momento: '2026-08-17T12:00:00Z',
+  })
+
+  it('acreditar deja el asiento, la bolsa y el evento del outbox', async ({ task }) => {
+    const oreja = billetera(task)
+
+    const r = await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+
+    expect(r.repetida).toBe(false)
+    expect(r.valor.saldo_retirable).toBe(100_000)
+
+    const quedo = await runInDurableObject(oreja, (_do, ctx) => ({
+      bolsas: [...ctx.storage.sql.exec<{ n: number; total: number }>(
+        'SELECT COUNT(*) AS n, COALESCE(SUM(monto), 0) AS total FROM bolsas',
+      )],
+      asientos: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM asientos')],
+      outbox: [...ctx.storage.sql.exec<{ n: number; tipo: string }>(
+        'SELECT COUNT(*) AS n, MIN(tipo) AS tipo FROM outbox',
+      )],
+      totales: [...ctx.storage.sql.exec<{ bolsa: string; total: number }>(
+        'SELECT bolsa, total FROM totales_ledger',
+      )],
+    }))
+
+    expect(quedo.bolsas).toEqual([{ n: 1, total: 100_000 }])
+    expect(quedo.asientos).toEqual([{ n: 1 }])
+    // Ley 5: el evento esta, y llego junto con el asiento.
+    expect(quedo.outbox).toEqual([{ n: 1, tipo: 'billetera.acreditada' }])
+    expect(quedo.totales).toEqual([{ bolsa: 'disponible', total: 100_000 }])
+  })
+
+  it('la misma clave de idempotencia no paga dos veces', async ({ task }) => {
+    const oreja = billetera(task)
+    const entrada = {
+      monto: guaranies(100_000),
+      bolsa: 'disponible' as const,
+      concepto: 'carga',
+      origen: 'dpago',
+    }
+
+    const primera = await oreja.acreditar(op('k1'), entrada)
+    const segunda = await oreja.acreditar(op('k1'), entrada)
+
+    expect(primera.repetida).toBe(false)
+    expect(segunda.repetida).toBe(true)
+    // Y devuelve lo MISMO que la primera vez, no un valor nuevo.
+    expect(segunda.valor).toEqual(primera.valor)
+
+    const quedo = await runInDurableObject(oreja, (_do, ctx) => ({
+      asientos: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM asientos')],
+      outbox: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM outbox')],
+      total: [...ctx.storage.sql.exec<{ t: number }>('SELECT COALESCE(SUM(monto), 0) AS t FROM bolsas')],
+    }))
+
+    // Un asiento, un evento, una vez la plata. Un segundo evento seria un
+    // consumidor cobrando dos veces (ley 6: por eso ademas es idempotente).
+    expect(quedo.asientos).toEqual([{ n: 1 }])
+    expect(quedo.outbox).toEqual([{ n: 1 }])
+    expect(quedo.total).toEqual([{ t: 100_000 }])
+  })
+
+  it('una operacion que falla no deja NADA: ni asiento, ni evento, ni saldo', async ({ task }) => {
+    // ESTA es la prueba de la ley 5 contra el metodo publico. No hace falta
+    // inyectar una caida sintetica: un debito sin saldo tira desde adentro de la
+    // transaccion, que es exactamente la forma que tomaria una caida real entre
+    // la escritura del asiento y la del evento.
+    //
+    // Si `aplicar()` escribiera fuera de la transaccion, acá quedarian filas.
+    const oreja = billetera(task)
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(50_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+
+    const antes = await runInDurableObject(oreja, (_do, ctx) => ({
+      asientos: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM asientos')][0]?.n,
+      outbox: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM outbox')][0]?.n,
+    }))
+
+    // Se atrapa con try/catch y no con `.rejects`. Medido: con `.rejects`, el
+    // stub del Durable Object dejaba una promesa rechazada sin manejar, vitest la
+    // reportaba como «Unhandled Rejection» y salia con codigo 1 — con las 24
+    // pruebas en verde arriba. Un veredicto verde que no lo era.
+    let error: unknown = null
+    try {
+      await oreja.debitar(op('k2'), { monto: guaranies(999_999), concepto: 'compra' })
+    } catch (e) {
+      error = e
+    }
+    expect(String(error)).toMatch(/saldo insuficiente/)
+
+    const despues = await runInDurableObject(oreja, (_do, ctx) => ({
+      asientos: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM asientos')][0]?.n,
+      outbox: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM outbox')][0]?.n,
+      total: [...ctx.storage.sql.exec<{ t: number }>('SELECT COALESCE(SUM(monto), 0) AS t FROM bolsas')][0]?.t,
+      aplicadas: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM aplicadas')][0]?.n,
+    }))
+
+    expect(despues.asientos).toBe(antes.asientos)
+    expect(despues.outbox).toBe(antes.outbox)
+    expect(despues.total).toBe(50_000)
+    // Y la clave de idempotencia del intento fallido NO quedo marcada: si
+    // quedara, el reintento legitimo devolveria "ya aplicada" sin haber aplicado
+    // nada. Es la forma mas silenciosa de perder un pago.
+    expect(despues.aplicadas).toBe(1)
+  })
+
+  it('si falla EN EL MEDIO de escribir, no queda nada a medias', async ({ task }) => {
+    // La prueba de arriba no alcanzaba, y lo dijo el arnes de mutacion: sacarle la
+    // transaccion a `aplicar()` la dejaba pasar igual. El motivo es que un debito
+    // sin saldo tira ANTES de escribir una sola fila — el nucleo se queja y no se
+    // llega a `guardarDelta`. O sea que probaba «no se escribe si no se empieza»,
+    // que no es lo mismo que «no queda nada a medias».
+    //
+    // Acá la caida ocurre DESPUES de que empezo a escribir: se siembra un asiento
+    // con el id que la operacion va a producir, asi que el INSERT de los asientos
+    // viola la PRIMARY KEY — y para ese momento las bolsas y los totales YA se
+    // reescribieron. Es la forma exacta que tomaria una caida real en el medio.
+    const oreja = billetera(task)
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(50_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+
+    await runInDurableObject(oreja, (_do, ctx) => {
+      ctx.storage.sql.exec(
+        `INSERT INTO asientos (asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en)
+         VALUES ('k9:cr', 'sembrado', 1, 'disponible', 'otra', 'c0', '2026-08-17T00:00:00Z')`,
+      )
+    })
+
+    let error: unknown = null
+    try {
+      await oreja.acreditar(op('k9'), {
+        monto: guaranies(70_000),
+        bolsa: 'disponible',
+        concepto: 'carga',
+        origen: 'dpago',
+      })
+    } catch (e) {
+      error = e
+    }
+    expect(error).not.toBeNull()
+
+    const quedo = await runInDurableObject(oreja, (_do, ctx) => ({
+      total: [...ctx.storage.sql.exec<{ t: number }>(
+        'SELECT COALESCE(SUM(monto), 0) AS t FROM bolsas',
+      )][0]?.t,
+      outbox: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM outbox')][0]?.n,
+      totales: [...ctx.storage.sql.exec<{ t: number }>(
+        "SELECT total AS t FROM totales_ledger WHERE bolsa = 'disponible'",
+      )][0]?.t,
+    }))
+
+    // Las bolsas y los totales volvieron a donde estaban. Sin la transaccion, el
+    // `DELETE FROM bolsas` y los INSERT ya habrian quedado firmes y acá veriamos
+    // 70.000 en vez de 50.000: la plata de la carga anterior, borrada.
+    expect(quedo.total).toBe(50_000)
+    expect(quedo.totales).toBe(50_000)
+    expect(quedo.outbox).toBe(1)
+  })
+
+  it('la reconciliacion nota si el acumulado se corrompe por su cuenta', async ({ task }) => {
+    // `verificarInvariantes` compara las bolsas contra `totales_ledger`, que es un
+    // cache. Si ese cache se corrompiera solo, la comparacion no lo veria: los dos
+    // lados mentirian igual. Esto es lo unico que puede notarlo, y por eso tiene
+    // que poder decir que NO.
+    const oreja = billetera(task)
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+
+    expect(await oreja.reconciliar()).toEqual({ ok: true, diferencias: [] })
+
+    await runInDurableObject(oreja, (_do, ctx) => {
+      ctx.storage.sql.exec("UPDATE totales_ledger SET total = 999 WHERE bolsa = 'disponible'")
+    })
+
+    const r = await oreja.reconciliar()
+    expect(r.ok).toBe(false)
+    expect(r.diferencias.join(' ')).toMatch(/disponible.*100000.*999/)
+  })
+
+  it('el debito consume, asienta y avisa, y el ledger sigue cuadrando', async ({ task }) => {
+    const oreja = billetera(task)
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    await oreja.debitar(op('k2'), { monto: guaranies(30_000), concepto: 'compra' })
+
+    const saldo = await oreja.saldo()
+    expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(70_000)
+    expect(saldo.asientos).toBe(2)
+
+    // La reconciliacion exhaustiva: la suma de los asientos de verdad contra el
+    // acumulado que `verificarInvariantes` usa en el camino caliente.
+    expect(await oreja.reconciliar()).toEqual({ ok: true, diferencias: [] })
+  })
+
+  it('el estado sobrevive: la billetera no es una variable en memoria', async ({ task }) => {
+    const oreja = billetera(task)
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+
+    // Se pide el objeto DE NUEVO por su nombre. Si el estado viviera en una
+    // propiedad de la clase y no en el SQLite, esto daria cero.
+    const otraVez = env.BILLETERA.get(env.BILLETERA.idFromName(task.fullName))
+    const saldo = await otraVez.saldo()
+    expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(100_000)
+  })
 })
 
 describe('el Worker desplegado', () => {

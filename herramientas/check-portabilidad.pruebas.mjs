@@ -100,6 +100,24 @@ assert.deepEqual(buscarComandosLiterales(`  const de = ${ejemplo('spawnSync', 'n
   { linea: 1, comando: 'npx' },
 ])
 
+// --- los oraculos declarados como arreglo ---------------------------------
+// No son una llamada, pero terminan en un `execFileSync` igual.
+
+// En pedazos, por lo mismo que los otros dos: escrito entero, este archivo se
+// acusaria a si mismo.
+const oraculo = (cmd) => `    ${'oraculo'}: ['${cmd}', 'algo'],`
+
+assert.deepEqual(buscarComandosLiterales(oraculo('npx')), [
+  { linea: 1, comando: "oraculo: 'npx'" },
+])
+assert.deepEqual(buscarComandosLiterales(oraculo('node')), [
+  { linea: 1, comando: "oraculo: 'node'" },
+])
+
+// La forma correcta: una constante de `binarios.mjs`, o el helper.
+assert.deepEqual(buscarComandosLiterales('    oraculo: ORACULO_RUNTIME,'), [])
+assert.deepEqual(buscarComandosLiterales("    oraculo: conNode('herramientas/x.pruebas.mjs'),"), [])
+
 // --- el arbol de verdad ----------------------------------------------------
 // Las de arriba prueban la funcion sobre texto inventado. Esta prueba que sirve
 // para lo que tiene que mirar: si `archivosDeHerramientas` devolviera una lista

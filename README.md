@@ -35,8 +35,8 @@ que nadie toque el workflow.
 | `npm run tipos` | TypeScript estricto, sin emitir |
 | `npm run probar` | las 50 pruebas del núcleo puro, en Node |
 | `npm run esquema` | los tipos de TypeScript contra el SQL de las migraciones |
-| `npm run runtime` | que la fecha de compatibilidad esté escrita, y 19 pruebas sobre workerd |
-| `npm run mutar` | rompe 63 invariantes a propósito y exige que todos mueran |
+| `npm run runtime` | que la fecha de compatibilidad esté escrita, y 26 pruebas sobre workerd |
+| `npm run mutar` | rompe 75 invariantes a propósito y exige que todos mueran |
 | `npm run desarrollo` | Wrangler local contra staging |
 
 Los números de esta tabla envejecen. Los que manda son los que imprime

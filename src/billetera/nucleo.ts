@@ -36,10 +36,47 @@ export interface Reserva {
   readonly estado: 'abierta' | 'cerrada' | 'cancelada'
 }
 
+/**
+ * Un evento del outbox (ley 5). Se escribe en la MISMA transaccion que el cambio.
+ *
+ * Ley 9: nada de datos personales acá adentro. Identificadores y montos, que es
+ * lo que un consumidor necesita para reaccionar; quien quiera el nombre de la
+ * persona lo pide donde vive.
+ */
+export interface Evento {
+  readonly tipo: string
+  /** JSON. */
+  readonly cuerpo: string
+  readonly correlacion_id: string
+  readonly creado_en: string
+}
+
+/**
+ * El estado de la billetera, ANGOSTO a proposito.
+ *
+ * Antes tenia `asientos: readonly Asiento[]` — el historial entero, en memoria,
+ * en cada operacion. Eso obligaba a que el Durable Object cargara todos los
+ * asientos para acreditar un guarani, y a reescribirlos todos para guardarlo.
+ * Medido sobre la version anterior: 244 bytes por asiento contra un tope de
+ * 128 KiB por valor, o sea una billetera inescribible a los ~534 movimientos.
+ *
+ * En su lugar va `totales`: el acumulado del ledger por tipo de bolsa. Es lo
+ * unico que el invariante 2 necesita —«el ledger cuadra con las bolsas»— y se
+ * mantiene en O(1). Los asientos ya no vuelven: salen del resultado como DELTA y
+ * el que persiste los agrega.
+ *
+ * Que se pierde con esto, dicho sin vueltas: la comprobacion «ningun asiento_id
+ * repetido» ya no puede mirar la historia, porque la historia no esta acá. La
+ * hace cumplir la PRIMARY KEY de la tabla `asientos`, que es mas fuerte que un
+ * `Set` en memoria — no depende de que alguien se acuerde de llamarla. Lo que
+ * queda acá es la comprobacion sobre el delta, que agarra el caso de una
+ * operacion que se duplica a si misma.
+ */
 export interface EstadoBilletera {
   readonly billetera_id: string
   readonly bolsas: readonly Bolsa[]
-  readonly asientos: readonly Asiento[]
+  /** tipo de bolsa → acumulado de todos los asientos de ese tipo */
+  readonly totales: ReadonlyMap<Bolsa['tipo'], number>
   readonly reservas: ReadonlyMap<string, Reserva>
   /** clave de idempotencia → resultado ya producido */
   readonly aplicadas: ReadonlyMap<string, string>
@@ -49,10 +86,20 @@ export function billeteraVacia(billetera_id: string): EstadoBilletera {
   return {
     billetera_id,
     bolsas: [],
-    asientos: [],
+    totales: new Map(),
     reservas: new Map(),
     aplicadas: new Map(),
   }
+}
+
+/** Suma los asientos nuevos al acumulado por tipo de bolsa. */
+function acumular(
+  totales: ReadonlyMap<Bolsa['tipo'], number>,
+  asientos: readonly Asiento[],
+): ReadonlyMap<Bolsa['tipo'], number> {
+  const m = new Map(totales)
+  for (const a of asientos) m.set(a.bolsa, (m.get(a.bolsa) ?? 0) + a.monto)
+  return m
 }
 
 export interface Operacion {
@@ -63,6 +110,16 @@ export interface Operacion {
 
 export interface Resultado<T> {
   readonly estado: EstadoBilletera
+  /**
+   * Los asientos que ESTA operacion produce. No el historial: el delta.
+   *
+   * Quien persiste los inserta en la misma transaccion que las bolsas y los
+   * eventos. Cuando `repetida` es true va vacio, porque una operacion repetida
+   * no vuelve a asentar nada — ese es todo el punto de la idempotencia.
+   */
+  readonly asientos: readonly Asiento[]
+  /** Los eventos del outbox de esta operacion. Ley 5: van en la misma transaccion. */
+  readonly eventos: readonly Evento[]
   readonly valor: T
   /** true cuando la operacion ya se habia aplicado y se devolvio lo de antes. */
   readonly repetida: boolean
@@ -80,13 +137,23 @@ export interface Resultado<T> {
 function yaAplicada<T>(estado: EstadoBilletera, op: Operacion): Resultado<T> | null {
   const previo = estado.aplicadas.get(op.clave_idem)
   if (previo === undefined) return null
-  return { estado, valor: JSON.parse(previo) as T, repetida: true }
+  return { estado, asientos: [], eventos: [], valor: JSON.parse(previo) as T, repetida: true }
 }
 
 function marcarAplicada<T>(estado: EstadoBilletera, op: Operacion, valor: T): ReadonlyMap<string, string> {
   const m = new Map(estado.aplicadas)
   m.set(op.clave_idem, JSON.stringify(valor))
   return m
+}
+
+/** Arma el evento del outbox de una operacion. Ley 9: sin datos personales. */
+function evento(op: Operacion, tipo: string, cuerpo: Record<string, unknown>): Evento {
+  return {
+    tipo,
+    cuerpo: JSON.stringify(cuerpo),
+    correlacion_id: op.correlacion_id,
+    creado_en: op.momento,
+  }
 }
 
 function asentar(
@@ -151,11 +218,26 @@ export function acreditar(
   }
 
   const bolsas = [...estado.bolsas, nueva]
-  const asientos = [...estado.asientos, asentar(op, entrada.concepto, entrada.monto, entrada.bolsa, 'cr')]
+  const asientos = [asentar(op, entrada.concepto, entrada.monto, entrada.bolsa, 'cr')]
   const valor = { saldo_retirable: saldoRetirable(bolsas, op.momento) }
 
   return {
-    estado: { ...estado, bolsas, asientos, aplicadas: marcarAplicada(estado, op, valor) },
+    estado: {
+      ...estado,
+      bolsas,
+      totales: acumular(estado.totales, asientos),
+      aplicadas: marcarAplicada(estado, op, valor),
+    },
+    asientos,
+    eventos: [
+      evento(op, 'billetera.acreditada', {
+        billetera_id: estado.billetera_id,
+        monto: entrada.monto,
+        bolsa: entrada.bolsa,
+        concepto: entrada.concepto,
+        clave_idem: op.clave_idem,
+      }),
+    ],
     valor,
     repetida: false,
   }
@@ -209,14 +291,28 @@ export function debitar(
   if (consumo.faltante > 0) throw new SaldoInsuficiente(consumo.faltante)
 
   const bolsas = aplicarTomas(estado.bolsas, consumo.tomas)
-  const asientos = [...estado.asientos]
+  const asientos: Asiento[] = []
   consumo.tomas.forEach((t, i) => {
     asientos.push(asentar(op, entrada.concepto, guaranies(-t.monto), t.bolsa.tipo, `db${i}`))
   })
 
   const valor = { tomas: consumo.tomas, faltante: CERO }
   return {
-    estado: { ...estado, bolsas, asientos, aplicadas: marcarAplicada(estado, op, valor) },
+    estado: {
+      ...estado,
+      bolsas,
+      totales: acumular(estado.totales, asientos),
+      aplicadas: marcarAplicada(estado, op, valor),
+    },
+    asientos,
+    eventos: [
+      evento(op, 'billetera.debitada', {
+        billetera_id: estado.billetera_id,
+        monto: entrada.monto,
+        concepto: entrada.concepto,
+        clave_idem: op.clave_idem,
+      }),
+    ],
     valor,
     repetida: false,
   }
@@ -261,7 +357,7 @@ export function reservar(
   }))
   const bolsas = [...bolsasSinTomas, ...retenidas]
 
-  const asientos = [...estado.asientos]
+  const asientos: Asiento[] = []
   consumo.tomas.forEach((t, i) => {
     asientos.push(asentar(op, 'reserva_promocion', guaranies(-t.monto), t.bolsa.tipo, `rsv${i}db`))
     asientos.push(asentar(op, 'reserva_promocion', t.monto, 'retenido', `rsv${i}cr`))
@@ -278,7 +374,23 @@ export function reservar(
 
   const valor = { reserva_id: entrada.reserva_id }
   return {
-    estado: { ...estado, bolsas, asientos, reservas, aplicadas: marcarAplicada(estado, op, valor) },
+    estado: {
+      ...estado,
+      bolsas,
+      totales: acumular(estado.totales, asientos),
+      reservas,
+      aplicadas: marcarAplicada(estado, op, valor),
+    },
+    asientos,
+    eventos: [
+      evento(op, 'billetera.reservada', {
+        billetera_id: estado.billetera_id,
+        reserva_id: entrada.reserva_id,
+        monto: entrada.monto,
+        vence_en: entrada.vence_en,
+        clave_idem: op.clave_idem,
+      }),
+    ],
     valor,
     repetida: false,
   }
@@ -300,7 +412,7 @@ export function liberarReserva(
   if (r === undefined) throw new Error(`reserva desconocida: ${entrada.reserva_id}`)
   if (r.estado !== 'abierta') {
     const valor = { devuelto: CERO }
-    return { estado, valor, repetida: true }
+    return { estado, asientos: [], eventos: [], valor, repetida: true }
   }
 
   const total = r.tomas.reduce((a, t) => a + t.monto, 0)
@@ -316,7 +428,7 @@ export function liberarReserva(
   )
   const bolsas = [...bolsasSinRetenido, ...vueltas]
 
-  const asientos = [...estado.asientos]
+  const asientos: Asiento[] = []
   if (remanente > 0) {
     asientos.push(asentar(op, 'promotion_refund', guaranies(-remanente), 'retenido', 'rf-ret'))
   }
@@ -329,7 +441,22 @@ export function liberarReserva(
 
   const valor = { devuelto: remanente }
   return {
-    estado: { ...estado, bolsas, asientos, reservas, aplicadas: marcarAplicada(estado, op, valor) },
+    estado: {
+      ...estado,
+      bolsas,
+      totales: acumular(estado.totales, asientos),
+      reservas,
+      aplicadas: marcarAplicada(estado, op, valor),
+    },
+    asientos,
+    eventos: [
+      evento(op, 'billetera.reserva_liberada', {
+        billetera_id: estado.billetera_id,
+        reserva_id: r.reserva_id,
+        devuelto: remanente,
+        clave_idem: op.clave_idem,
+      }),
+    ],
     valor,
     repetida: false,
   }
@@ -353,8 +480,18 @@ export function verificarInvariantes(estado: EstadoBilletera): void {
 
   // 2. El ledger cuadra con las bolsas. Esta es LA comprobacion: si los
   //    asientos y los saldos se separan, el sistema esta mintiendo.
-  const porBolsa = new Map<string, number>()
-  for (const a of estado.asientos) porBolsa.set(a.bolsa, (porBolsa.get(a.bolsa) ?? 0) + a.monto)
+  //
+  //    Compara contra `totales`, el acumulado que cada operacion actualiza a
+  //    partir de los asientos que produce. Antes sumaba el historial entero en
+  //    memoria; el resultado es el mismo y el costo pasa de O(n) a O(1).
+  //
+  //    Lo que esto SI agarra: una operacion que escribe bolsas sin los asientos
+  //    que le corresponden, o al reves — que es la forma que toma un pago doble
+  //    mal absorbido. Lo que NO agarra: que `totales` se corrompa por su cuenta,
+  //    porque ahi el acumulado y las bolsas podrian mentir igual. Para eso esta
+  //    la reconciliacion contra la suma exhaustiva de la tabla `asientos`, que
+  //    corre fuera del camino caliente.
+  const porBolsa = estado.totales
 
   const enBolsas = new Map<string, number>()
   for (const b of estado.bolsas) enBolsas.set(b.tipo, (enBolsas.get(b.tipo) ?? 0) + b.monto)
@@ -366,14 +503,7 @@ export function verificarInvariantes(estado: EstadoBilletera): void {
     }
   }
 
-  // 3. Ningun asiento repetido. Un asiento_id duplicado es un pago doble.
-  const vistos = new Set<string>()
-  for (const a of estado.asientos) {
-    if (vistos.has(a.asiento_id)) throw new Error(`asiento duplicado: ${a.asiento_id}`)
-    vistos.add(a.asiento_id)
-  }
-
-  // 4. RETENIDO tiene que sumar exactamente lo que las reservas abiertas
+  // 3. RETENIDO tiene que sumar exactamente lo que las reservas abiertas
   //    dicen tener tomado. `reservar()` mueve plata a esta bolsa en vez de
   //    debitarla contra la nada (ver bolsas.ts); si una reserva pisara a otra
   //    en el Map, o si algo tocara `retenido` por fuera de reservar/liberar,
@@ -387,5 +517,29 @@ export function verificarInvariantes(estado: EstadoBilletera): void {
     throw new Error(
       `descuadre en retenido: bolsas ${retenidoEnBolsas} vs reservas abiertas ${retenidoEnReservas}`,
     )
+  }
+}
+
+/**
+ * Ningun asiento_id repetido DENTRO de una operacion.
+ *
+ * Antes esta comprobacion recorria el historial completo, y dejo de poder
+ * hacerlo cuando el estado se angosto: los asientos ya no vuelven, salen como
+ * delta. No se perdio la garantia, cambio de lugar y se hizo mas fuerte:
+ *
+ *   · Entre operaciones, la PRIMARY KEY de la tabla `asientos` lo hace
+ *     imposible. Una restriccion de la base no depende de que alguien se
+ *     acuerde de llamar a una funcion.
+ *   · Adentro de una operacion, esta funcion. Es el caso que la base tambien
+ *     agarraria, pero acá falla ANTES de escribir y con un mensaje que dice cual
+ *     es el asiento repetido, en vez de un error de restriccion.
+ *
+ * Un asiento_id duplicado es un pago doble: por eso vale tenerlo dos veces.
+ */
+export function verificarDelta(asientos: readonly Asiento[]): void {
+  const vistos = new Set<string>()
+  for (const a of asientos) {
+    if (vistos.has(a.asiento_id)) throw new Error(`asiento duplicado: ${a.asiento_id}`)
+    vistos.add(a.asiento_id)
   }
 }

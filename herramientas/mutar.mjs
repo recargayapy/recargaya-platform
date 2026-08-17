@@ -118,7 +118,11 @@ const MUTACIONES = [
     a: '',
   },
   {
-    invariante: 'ningun asiento se duplica',
+    // La comprobacion se mudo de `verificarInvariantes` a `verificarDelta` cuando
+    // el estado se angosto: los asientos ya no vuelven del nucleo, salen como
+    // delta. Entre operaciones lo hace cumplir la PRIMARY KEY de la tabla, que
+    // tiene su propia prueba en el runtime.
+    invariante: 'ningun asiento se duplica dentro de una operacion',
     archivo: 'src/billetera/nucleo.ts',
     de: '    if (vistos.has(a.asiento_id)) throw new Error(`asiento duplicado: ${a.asiento_id}`)',
     a: '',
@@ -454,14 +458,14 @@ const MUTACIONES = [
     archivo: 'src/billetera/esquema.ts',
     de: '    restringida_a TEXT\n  ) STRICT`,',
     a: '    restringida_a TEXT\n  )`,',
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     invariante: 'el esquema del DO restringe los tipos de bolsa',
     archivo: 'src/billetera/esquema.ts',
     de: "const CHECK_TIPO_BOLSA = `IN ('${TIPOS_DE_BOLSA.join(\"', '\")}')`",
     a: "const CHECK_TIPO_BOLSA = `IN ('${TIPOS_DE_BOLSA.join(\"', '\")}', 'inventada')`",
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     // Una bolsa en cero no es una bolsa: es una fila que ensucia la precedencia.
@@ -469,7 +473,7 @@ const MUTACIONES = [
     archivo: 'src/billetera/esquema.ts',
     de: '    monto         INTEGER NOT NULL CHECK (monto > 0),\n    vence_en      TEXT,\n    origen        TEXT NOT NULL,\n    restringida_a TEXT\n  ) STRICT`,',
     a: '    monto         INTEGER NOT NULL,\n    vence_en      TEXT,\n    origen        TEXT NOT NULL,\n    restringida_a TEXT\n  ) STRICT`,',
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     // Ley 2, hecha cumplir y no prometida.
@@ -477,14 +481,14 @@ const MUTACIONES = [
     archivo: 'src/billetera/esquema.ts',
     de: "     SELECT RAISE(ABORT, 'un asiento no se edita: se compensa con otro asiento');",
     a: '     SELECT 1;',
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     invariante: 'un asiento no se puede borrar',
     archivo: 'src/billetera/esquema.ts',
     de: "     SELECT RAISE(ABORT, 'un asiento no se borra: se compensa con otro asiento');",
     a: '     SELECT 1;',
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     // LA COTA que el plan maestro pedia y que no existia en ningun lado:
@@ -493,7 +497,7 @@ const MUTACIONES = [
     archivo: 'src/billetera/esquema.ts',
     de: '   WHEN NEW.consumido > (SELECT COALESCE(SUM(monto), 0) FROM tomas WHERE reserva_id = NEW.reserva_id)',
     a: '   WHEN 0',
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     // LA LEY 5. Hasta esta entrega no tenia oraculo: si el DO escribia el asiento y
@@ -503,28 +507,92 @@ const MUTACIONES = [
     archivo: 'src/billetera/transaccion.ts',
     de: '  return ctx.storage.transactionSync(cambios)',
     a: '  return cambios()',
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     invariante: 'la transaccion devuelve lo que se calculo adentro',
     archivo: 'src/billetera/transaccion.ts',
     de: 'export function enUnaTransaccion<T>(ctx: ConTransaccion, cambios: () => T): T {\n  return ctx.storage.transactionSync(cambios)',
     a: 'export function enUnaTransaccion<T>(ctx: ConTransaccion, cambios: () => T): T {\n  ctx.storage.transactionSync(cambios)\n  return undefined as T',
-    oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
+    oraculo: ORACULO_RUNTIME,
   },
   {
     invariante: 'check-esquema compara tambien el esquema del Durable Object',
     archivo: 'herramientas/check-esquema.mjs',
     de: '  const contraDO = compararEsquemas(tipos, delDO)\n  if (!contraDO.ok) {',
     a: '  const contraDO = compararEsquemas(tipos, delDO)\n  if (false) {',
-    oraculo: ['node', 'herramientas/check-esquema.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
   },
   {
     invariante: 'check-esquema nota el orden distinto entre TypeScript y el DO',
     archivo: 'herramientas/check-esquema.mjs',
     de: "  return { ok: tipos.join('|') === delDO.join('|'), tipos, delDO }",
     a: '  return { ok: true, tipos, delDO }',
-    oraculo: ['node', 'herramientas/check-esquema.pruebas.mjs'],
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+
+  // --- El Durable Object sobre SQL ----------------------------------------
+  // Estas atacan la cascara: la traduccion a tablas y el camino que recorre toda
+  // operacion de plata. Su oraculo son las pruebas del runtime, que llaman al
+  // METODO PUBLICO del DO — no a las piezas por separado.
+  {
+    // LA LEY 5, contra el metodo publico. Sin la transaccion, un debito que falla
+    // deja el asiento escrito y el evento no, o al reves.
+    invariante: 'el metodo publico del DO escribe todo en UNA transaccion',
+    archivo: 'src/index.ts',
+    de: '    return enUnaTransaccion(this.ctx, () => {',
+    a: '    return ((f) => f())(() => {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'el evento del outbox se escribe con el asiento',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '  for (const e of eventos) {',
+    a: '  for (const e of []) {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Sin marcar la clave, la idempotencia no existe: el reintento vuelve a pagar.
+    invariante: 'la clave de idempotencia queda marcada al aplicar',
+    archivo: 'src/billetera/repositorio.ts',
+    de: "  sql.exec(\n    'INSERT INTO aplicadas (clave_idem, valor, aplicada_en) VALUES (?, ?, ?)',",
+    a: "  if (false) sql.exec(\n    'INSERT INTO aplicadas (clave_idem, valor, aplicada_en) VALUES (?, ?, ?)',",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El acumulado que `verificarInvariantes` compara contra las bolsas. Si no se
+    // persiste, la billetera se descuadra en la operacion siguiente.
+    invariante: 'los totales del ledger se persisten con el asiento',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '  for (const [bolsa, total] of estado.totales) {',
+    a: '  for (const [bolsa, total] of []) {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El estado tiene que salir del SQLite, no de una propiedad de la clase.
+    invariante: 'el estado se carga de la base en cada operacion',
+    archivo: 'src/billetera/repositorio.ts',
+    de: "      'SELECT tipo, monto, vence_en, origen, restringida_a FROM bolsas ORDER BY id',",
+    a: "      'SELECT tipo, monto, vence_en, origen, restringida_a FROM bolsas WHERE 0 ORDER BY id',",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El esquema se crea antes de atender nada. Sin esto, la primera operacion
+    // corre contra tablas que no existen.
+    invariante: 'el DO crea su esquema antes de atender',
+    archivo: 'src/index.ts',
+    de: '      for (const sentencia of ESQUEMA) ctx.storage.sql.exec(sentencia)',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // La reconciliacion exhaustiva es lo unico que puede notar que el acumulado
+    // se corrompio por su cuenta. Si siempre dijera que si, no serviria de nada.
+    invariante: 'la reconciliacion compara de verdad',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '    if (a !== b) diferencias.push(`${bolsa}: asientos ${a} vs totales_ledger ${b}`)',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
   },
 
   // --- Mutar tambien el arnes ---------------------------------------------

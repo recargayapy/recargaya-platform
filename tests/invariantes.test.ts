@@ -17,6 +17,7 @@ import {
   billeteraVacia,
   acreditar,
   verificarInvariantes,
+  verificarDelta,
 } from '../src/billetera/nucleo.js'
 
 const OP = { clave_idem: 'k1', correlacion_id: 'c1', momento: '2026-08-14T12:00:00Z' }
@@ -55,17 +56,42 @@ describe('el oraculo detecta lo que tiene que detectar', () => {
     expect(() => verificarInvariantes(roto)).toThrow(/descuadre/)
   })
 
-  it('grita si un asiento aparece dos veces', () => {
-    const sano = conSaldo(100_000)
-    const roto: EstadoBilletera = {
-      ...sano,
-      // El asiento duplicado tambien duplica el monto del ledger, asi que
-      // compensamos la bolsa para que el UNICO defecto sea la duplicacion.
-      // Sin esto, la prueba pasaria por el descuadre y no probaria lo suyo.
-      asientos: [...sano.asientos, ...sano.asientos],
-      bolsas: [{ ...sano.bolsas[0]!, monto: guaranies(200_000) }],
+  it('grita si un asiento aparece dos veces en la misma operacion', () => {
+    // Esta comprobacion se mudo de `verificarInvariantes` a `verificarDelta`
+    // cuando el estado se angosto: los asientos ya no vuelven del nucleo, salen
+    // como delta. No se perdio nada — entre operaciones lo hace cumplir la
+    // PRIMARY KEY de la tabla `asientos`, que es mas fuerte que un Set en
+    // memoria porque no depende de que alguien llame a una funcion.
+    const asiento = {
+      asiento_id: 'k1:cr',
+      concepto: 'seed',
+      monto: guaranies(100_000),
+      bolsa: 'disponible' as const,
+      clave_idem: 'k1',
+      correlacion_id: 'c1',
+      asentado_en: OP.momento,
     }
-    expect(() => verificarInvariantes(roto)).toThrow(/duplicado/)
+    expect(() => verificarDelta([asiento, asiento])).toThrow(/duplicado/)
+    expect(() => verificarDelta([asiento])).not.toThrow()
+  })
+
+  it('el nucleo solo mira la clave de idempotencia de SU operacion', () => {
+    // El repositorio carga `aplicadas` con UNA sola clave: la de la operacion.
+    // Eso es correcto porque el nucleo nunca mira otra — y esto es el oraculo de
+    // esa afirmacion, no un comentario que la promete. Con una clave señuelo
+    // adentro, el resultado tiene que ser identico.
+    const conSenuelo: EstadoBilletera = {
+      ...billeteraVacia('b1'),
+      aplicadas: new Map([['otra-clave-cualquiera', '{"saldo_retirable":999}']]),
+    }
+    const r = acreditar(conSenuelo, OP, {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'seed',
+      origen: 'semilla',
+    })
+    expect(r.repetida).toBe(false)
+    expect(r.valor.saldo_retirable).toBe(100_000)
   })
 
   it('grita si retenido no cuadra con las reservas abiertas', () => {
