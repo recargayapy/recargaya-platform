@@ -10,22 +10,21 @@
  *
  * QUE PRUEBAN Y QUE NO — leer esto antes de confiar en el numero de abajo.
  *
- * De las veintiseis pruebas de este archivo:
+ * De las treinta y cinco pruebas de este archivo:
  *
- *   · DIECINUEVE estan ancladas a codigo de `src/` y tienen una mutacion que las
+ *   · VEINTIOCHO estan ancladas a codigo de `src/` y tienen una mutacion que las
  *     mata: las siete del esquema (ejecutan la cadena que exporta
  *     `src/billetera/esquema.ts`, no una tabla de juguete), las tres de la
- *     transaccion, las siete del `BilleteraDO` por su metodo publico, y las dos de
- *     `el Worker desplegado`.
+ *     transaccion, las siete del `BilleteraDO` por su metodo publico, las nueve de
+ *     las reservas y la alarma, y las dos de `el Worker desplegado`.
  *   · CUATRO —las dos de aislamiento y las dos homonimas— prueban una convencion
  *     de este archivo y no una linea de produccion. Tres de las cuatro mueren por
  *     su propia asercion con una mutacion del arnes; la cuarta (`el estado
  *     sobrevive dentro de una misma prueba`) es el estado que las otras necesitan.
  *   · Las TRES restantes son SONDAS DE LA PLATAFORMA: las dos de la alarma y la de
- *     `transactionSync`. Verifican que Cloudflare se comporta como suponemos, y no
- *     pueden verificar que nuestro codigo lo use, porque todavia no hay codigo
- *     nuestro que use la alarma. Eso lo cierra el vencimiento de reservas, que es
- *     lo que sigue.
+ *     `transactionSync`. Verifican que Cloudflare se comporta como suponemos. Las
+ *     de la alarma quedan como sondas incluso ahora que el vencimiento de reservas
+ *     existe: miden que `setAlarm`/`getAlarm` hacen lo suyo, no nuestro codigo.
  *
  * LA LEY 5 YA TIENE ORACULO CONTRA EL METODO PUBLICO. La version anterior de este
  * encabezado decia, medido por una auditoria:
@@ -850,6 +849,260 @@ describe('el BilleteraDO, por su metodo publico', () => {
     const otraVez = env.BILLETERA.get(env.BILLETERA.idFromName(task.fullName))
     const saldo = await otraVez.saldo()
     expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(100_000)
+  })
+})
+
+describe('las reservas, por el metodo publico del DO', () => {
+  const op = (clave: string) => ({
+    clave_idem: clave,
+    correlacion_id: 'c1',
+    momento: '2026-08-17T12:00:00Z',
+  })
+
+  /** Una billetera con credito de promocion y disponible, para que la precedencia
+   *  tenga algo que decidir. */
+  async function conSaldo(oreja: ReturnType<typeof billetera>) {
+    await oreja.acreditar(op('c1'), {
+      monto: guaranies(30_000),
+      bolsa: 'credito_promocion',
+      concepto: 'premio',
+      origen: 'campania',
+      vence_en: '2026-12-31T00:00:00Z',
+    })
+    await oreja.acreditar(op('c2'), {
+      monto: guaranies(70_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+  }
+
+  const enElFuturo = () => new Date(Date.now() + 30 * 60 * 1000).toISOString()
+
+  it('reservar mueve la plata a retenido, no la debita contra la nada', async ({ task }) => {
+    const oreja = billetera(task)
+    await conSaldo(oreja)
+
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: enElFuturo(),
+    })
+
+    const saldo = await oreja.saldo()
+    // El total no cambia: la plata sigue adentro de la billetera, en otra bolsa.
+    expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(100_000)
+    expect(saldo.bolsas.filter((b) => b.tipo === 'retenido').reduce((a, b) => a + b.monto, 0)).toBe(
+      50_000,
+    )
+    // Y salio primero del credito de promocion, que es el que vence (ley 4).
+    expect(saldo.bolsas.filter((b) => b.tipo === 'credito_promocion')).toEqual([])
+
+    expect(await oreja.reconciliar()).toEqual({ ok: true, diferencias: [] })
+  })
+
+  it('el consumo parcial mueve `consumido` y saca del retenido', async ({ task }) => {
+    // `Reserva.consumido` estuvo declarado desde la Fase 0 sin nada que lo
+    // incrementara. Esta es la prueba de que ya existe quien lo mueva.
+    const oreja = billetera(task)
+    await conSaldo(oreja)
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: enElFuturo(),
+    })
+
+    const r = await oreja.consumirReserva(op('u1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(20_000),
+    })
+
+    expect(r.valor.consumido).toBe(20_000)
+    expect(r.valor.disponible).toBe(30_000)
+
+    const saldo = await oreja.saldo()
+    // Esa plata se fue de la billetera: 100.000 - 20.000.
+    expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(80_000)
+    expect(saldo.bolsas.filter((b) => b.tipo === 'retenido').reduce((a, b) => a + b.monto, 0)).toBe(
+      30_000,
+    )
+    expect(await oreja.reconciliar()).toEqual({ ok: true, diferencias: [] })
+  })
+
+  it('no se puede consumir mas de lo que la reserva tiene', async ({ task }) => {
+    const oreja = billetera(task)
+    await conSaldo(oreja)
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: enElFuturo(),
+    })
+    await oreja.consumirReserva(op('u1'), { reserva_id: 'promo-1', monto: guaranies(20_000) })
+
+    let error: unknown = null
+    try {
+      await oreja.consumirReserva(op('u2'), { reserva_id: 'promo-1', monto: guaranies(30_001) })
+    } catch (e) {
+      error = e
+    }
+    // Un guarani mas que lo que queda. Sin la cota, el remanente que vuelve al
+    // usuario sale negativo — y una bolsa en negativo es plata inventada.
+    expect(String(error)).toMatch(/quedan 30000/)
+
+    // Y el rechazo no dejo nada a medias.
+    const saldo = await oreja.saldo()
+    expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(80_000)
+  })
+
+  it('liberar devuelve el remanente A LA BOLSA DE LA QUE SALIO (ley 11)', async ({ task }) => {
+    // La regla anticajero. Se reserva tomando credito de promocion primero, se
+    // consume una parte, y lo que vuelve tiene que volver COMO CREDITO, con su
+    // vencimiento original — no convertido en plata retirable.
+    const oreja = billetera(task)
+    await conSaldo(oreja)
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: enElFuturo(),
+    })
+    await oreja.consumirReserva(op('u1'), { reserva_id: 'promo-1', monto: guaranies(10_000) })
+
+    const r = await oreja.liberarReserva(op('l1'), { reserva_id: 'promo-1' })
+    expect(r.valor.devuelto).toBe(40_000)
+
+    const saldo = await oreja.saldo()
+    expect(saldo.bolsas.filter((b) => b.tipo === 'retenido')).toEqual([])
+
+    // Lo que se consumio salio del credito (que va primero), asi que lo que vuelve
+    // es sobre todo disponible — pero el credito que quede tiene que volver COMO
+    // credito y con su vencimiento, nunca como disponible.
+    const credito = saldo.bolsas.filter((b) => b.tipo === 'credito_promocion')
+    for (const b of credito) expect(b.vence_en).toBe('2026-12-31T00:00:00Z')
+
+    expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(90_000)
+    expect(await oreja.reconciliar()).toEqual({ ok: true, diferencias: [] })
+  })
+
+  it('reservar deja la alarma programada para el vencimiento', async ({ task }) => {
+    // La primera mitad del mecanismo: que la alarma quede puesta, y puesta EN el
+    // instante correcto. Se comprueba leyendo la alarma, sin esperar a que suene:
+    // una prueba que espera por reloj es una prueba que falla sola algun martes.
+    const oreja = billetera(task)
+    await conSaldo(oreja)
+    const vence = new Date(Date.now() + 30 * 60 * 1000).toISOString()
+
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: vence,
+    })
+
+    await runInDurableObject(oreja, async (_do, ctx) => {
+      expect(await ctx.storage.getAlarm()).toBe(Date.parse(vence))
+    })
+  })
+
+  it('la reserva abandonada se libera sola cuando vence', async ({ task }) => {
+    // La segunda mitad: que el handler libere lo vencido y devuelva la plata.
+    //
+    // Se invoca `alarm()` directo en vez de esperar a que Cloudflare lo llame, y
+    // no es una comodidad: una reserva ya vencida hace que `reprogramarAlarma`
+    // ponga la alarma para AHORA, y entonces se dispara sola antes de que la
+    // prueba alcance a preguntar por ella. `runDurableObjectAlarm` devolvia
+    // `false` —no porque el mecanismo fallara, sino porque ya habia corrido—.
+    //
+    // Que Cloudflare invoque `alarm()` a su hora es trabajo de Cloudflare, y las
+    // dos sondas de la plataforma ya lo miden. Lo nuestro es lo que el handler
+    // hace cuando corre.
+    const oreja = billetera(task)
+    await conSaldo(oreja)
+
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: new Date(Date.now() - 1000).toISOString(),
+    })
+
+    const antes = await oreja.saldo()
+    expect(antes.bolsas.filter((b) => b.tipo === 'retenido').reduce((a, b) => a + b.monto, 0)).toBe(
+      50_000,
+    )
+
+    await runInDurableObject(oreja, async (instancia) => {
+      await instancia.alarm?.()
+    })
+
+    const despues = await oreja.saldo()
+    // El retenido volvio a sus bolsas de origen. Nada se perdio.
+    expect(despues.bolsas.filter((b) => b.tipo === 'retenido')).toEqual([])
+    expect(despues.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(100_000)
+    expect(await oreja.reconciliar()).toEqual({ ok: true, diferencias: [] })
+  })
+
+  it('sin reservas abiertas no queda ninguna alarma colgada', async ({ task }) => {
+    // Una alarma que sobrevive a la reserva que la justificaba despierta el objeto
+    // para nada, para siempre.
+    const oreja = billetera(task)
+    await conSaldo(oreja)
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: enElFuturo(),
+    })
+    await oreja.liberarReserva(op('l1'), { reserva_id: 'promo-1' })
+
+    await runInDurableObject(oreja, async (_do, ctx) => {
+      expect(await ctx.storage.getAlarm()).toBeNull()
+    })
+  })
+
+  it('la alarma que se dispara dos veces no libera dos veces', async ({ task }) => {
+    // Cloudflare reintenta las alarmas que fallan: entregar doble no es una
+    // hipotesis. La clave de idempotencia del vencimiento es derivada y estable,
+    // asi que la segunda pasada no hace nada.
+    const oreja = billetera(task)
+    await conSaldo(oreja)
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: new Date(Date.now() - 1000).toISOString(),
+    })
+
+    await runDurableObjectAlarm(oreja)
+    const primera = await oreja.saldo()
+
+    // Se fuerza una segunda pasada del handler, como haria un reintento.
+    await runInDurableObject(oreja, async (instancia) => {
+      await instancia.alarm?.()
+    })
+
+    const segunda = await oreja.saldo()
+    expect(segunda.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(
+      primera.bolsas.reduce((a, b) => a + b.monto, 0),
+    )
+    expect(segunda.asientos).toBe(primera.asientos)
+    expect(await oreja.reconciliar()).toEqual({ ok: true, diferencias: [] })
+  })
+
+  it('una reserva que todavia no vencio NO la toca la alarma', async ({ task }) => {
+    // Si la alarma liberara todo lo que encuentra, una campaña en curso se
+    // cancelaria sola. Es el defecto mas caro que puede tener este mecanismo.
+    const oreja = billetera(task)
+    await conSaldo(oreja)
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: enElFuturo(),
+    })
+
+    await runInDurableObject(oreja, async (instancia) => {
+      await instancia.alarm?.()
+    })
+
+    const saldo = await oreja.saldo()
+    expect(saldo.bolsas.filter((b) => b.tipo === 'retenido').reduce((a, b) => a + b.monto, 0)).toBe(
+      50_000,
+    )
   })
 })
 

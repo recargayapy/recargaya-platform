@@ -280,3 +280,26 @@ export function reconciliar(sql: Sql): { ok: boolean; diferencias: string[] } {
 
   return { ok: diferencias.length === 0, diferencias }
 }
+
+/**
+ * Las reservas abiertas que ya vencieron, y el proximo vencimiento pendiente.
+ *
+ * Las dos cosas en una consulta sola porque el `alarm()` necesita las dos: libera
+ * las vencidas y se reprograma para la siguiente. Si fueran dos consultas, entre
+ * una y otra podria entrar una reserva nueva y quedar sin alarma.
+ */
+export function reservasVencidas(sql: Sql, momento: string): {
+  vencidas: string[]
+  proximoVencimiento: string | null
+} {
+  const abiertas = [
+    ...sql.exec<{ reserva_id: string; vence_en: string }>(
+      "SELECT reserva_id, vence_en FROM reservas WHERE estado = 'abierta' ORDER BY vence_en",
+    ),
+  ]
+
+  const vencidas = abiertas.filter((r) => r.vence_en <= momento).map((r) => r.reserva_id)
+  const pendiente = abiertas.find((r) => r.vence_en > momento)
+
+  return { vencidas, proximoVencimiento: pendiente?.vence_en ?? null }
+}

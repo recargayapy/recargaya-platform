@@ -27,9 +27,13 @@ export interface Reserva {
   readonly reserva_id: string
   readonly tomas: readonly Toma[]
   /**
-   * Existe para el consumo parcial de una reserva, que todavia no esta
-   * construido: no hay ninguna funcion que lo incremente. Hasta que exista,
-   * siempre vale CERO y `liberarReserva` devuelve el total de las tomas.
+   * Cuanto de la reserva se gasto de verdad. Lo incrementa `consumirReserva()`.
+   *
+   * Estuvo declarado desde la Fase 0 sin nada que lo incrementara y sin nada que
+   * lo acotara — «se podia consumir mas de lo reservado» era un defecto latente,
+   * no una hipotesis. Hoy lo acota un trigger de la base
+   * (`reservas_consumido_acotado`), que es donde no se puede esquivar, y esta
+   * funcion es la unica que lo mueve.
    */
   readonly consumido: Guaranies
   readonly vence_en: string
@@ -397,6 +401,108 @@ export function reservar(
 }
 
 /**
+ * Gasta parte —o todo— de lo que una reserva tiene retenido.
+ *
+ * Es lo que pasa cuando la campaña efectivamente entrega el premio: esa plata sale
+ * de la billetera. No vuelve a ninguna bolsa, se va.
+ *
+ * QUE ORDEN SE CONSUME, y por que importa
+ *
+ * Se consume desde la PRIMERA toma hacia adelante, o sea en el mismo orden en que
+ * `decidirConsumo` las eligio: primero el credito de promocion, primero el que
+ * vence antes. Y `devolver()` entrega el remanente en orden INVERSO, desde la
+ * ultima toma hacia atras.
+ *
+ * Los dos ordenes son el mismo criterio visto de los dos lados: lo que vence antes
+ * se gasta y lo que vence despues vuelve. Al usuario no se le devuelve un credito
+ * a punto de morir.
+ */
+export function consumirReserva(
+  estado: EstadoBilletera,
+  op: Operacion,
+  entrada: { readonly reserva_id: string; readonly monto: Guaranies },
+): Resultado<{ consumido: Guaranies; disponible: Guaranies }> {
+  const previo = yaAplicada<{ consumido: Guaranies; disponible: Guaranies }>(estado, op)
+  if (previo !== null) return previo
+
+  if (entrada.monto <= 0) throw new Error('consumirReserva exige un monto positivo')
+
+  const r = estado.reservas.get(entrada.reserva_id)
+  if (r === undefined) throw new Error(`reserva desconocida: ${entrada.reserva_id}`)
+  if (r.estado !== 'abierta') {
+    throw new Error(`la reserva ${entrada.reserva_id} no esta abierta: ${r.estado}`)
+  }
+
+  // LA COTA. Sin ella el remanente que vuelve al usuario sale negativo, y una
+  // bolsa en negativo es plata inventada. La base tambien la hace cumplir; acá
+  // falla antes de escribir y con un mensaje que dice cuanto quedaba.
+  const total = r.tomas.reduce((a, t) => a + t.monto, 0)
+  const disponible = total - r.consumido
+  if (entrada.monto > disponible) {
+    throw new Error(
+      `no se puede consumir ${entrada.monto} de la reserva ${entrada.reserva_id}: quedan ${disponible}`,
+    )
+  }
+
+  // Sale de `retenido`, tomando de las bolsas de ESTA reserva y en el orden en que
+  // se retuvieron. `aplicarTomas` no sirve acá porque compara por identidad de
+  // objeto, y estas bolsas se cargaron de la base.
+  const retenidasDeLaReserva = estado.bolsas.filter(
+    (b) => b.tipo === 'retenido' && b.origen === entrada.reserva_id,
+  )
+  const resto = estado.bolsas.filter(
+    (b) => !(b.tipo === 'retenido' && b.origen === entrada.reserva_id),
+  )
+
+  let porConsumir: number = entrada.monto
+  const quedan: Bolsa[] = []
+  for (const b of retenidasDeLaReserva) {
+    if (porConsumir <= 0) {
+      quedan.push(b)
+      continue
+    }
+    const saca = Math.min(porConsumir, b.monto)
+    porConsumir -= saca
+    if (b.monto - saca > 0) quedan.push({ ...b, monto: guaranies(b.monto - saca) })
+  }
+
+  const bolsas = [...resto, ...quedan]
+  const asientos = [
+    asentar(op, 'consumo_promocion', guaranies(-entrada.monto), 'retenido', 'cns'),
+  ]
+
+  const reservas = new Map(estado.reservas)
+  reservas.set(r.reserva_id, { ...r, consumido: guaranies(r.consumido + entrada.monto) })
+
+  const valor = {
+    consumido: guaranies(r.consumido + entrada.monto),
+    disponible: guaranies(disponible - entrada.monto),
+  }
+
+  return {
+    estado: {
+      ...estado,
+      bolsas,
+      totales: acumular(estado.totales, asientos),
+      reservas,
+      aplicadas: marcarAplicada(estado, op, valor),
+    },
+    asientos,
+    eventos: [
+      evento(op, 'billetera.reserva_consumida', {
+        billetera_id: estado.billetera_id,
+        reserva_id: r.reserva_id,
+        monto: entrada.monto,
+        consumido: valor.consumido,
+        clave_idem: op.clave_idem,
+      }),
+    ],
+    valor,
+    repetida: false,
+  }
+}
+
+/**
  * Cancela una reserva y devuelve el remanente A LA BOLSA DE LA QUE SALIO.
  * Esta es la regla anticajero hecha codigo.
  */
@@ -503,16 +609,23 @@ export function verificarInvariantes(estado: EstadoBilletera): void {
     }
   }
 
-  // 3. RETENIDO tiene que sumar exactamente lo que las reservas abiertas
-  //    dicen tener tomado. `reservar()` mueve plata a esta bolsa en vez de
+  // 3. RETENIDO tiene que sumar exactamente lo que las reservas abiertas todavia
+  //    tienen sin gastar. `reservar()` mueve plata a esta bolsa en vez de
   //    debitarla contra la nada (ver bolsas.ts); si una reserva pisara a otra
-  //    en el Map, o si algo tocara `retenido` por fuera de reservar/liberar,
-  //    esta comparacion es la unica que lo nota — la del punto 2 no alcanza,
-  //    porque compara el ledger contra si mismo y los dos pueden mentir igual.
+  //    en el Map, o si algo tocara `retenido` por fuera de reservar/consumir/
+  //    liberar, esta comparacion es la unica que lo nota — la del punto 2 no
+  //    alcanza, porque compara el ledger contra si mismo y los dos pueden mentir
+  //    igual.
+  //
+  //    Es `total(tomas) - consumido` y no `total(tomas)` a secas. Antes era lo
+  //    segundo, y era correcto SOLO porque el consumo parcial no existia: nada
+  //    incrementaba `consumido`, asi que siempre valia cero. En cuanto
+  //    `consumirReserva()` empezo a moverlo, esa version pasaba a acusar de
+  //    descuadre a toda reserva consumida a medias.
   const retenidoEnBolsas = enBolsas.get('retenido') ?? 0
   const retenidoEnReservas = [...estado.reservas.values()]
     .filter((r) => r.estado === 'abierta')
-    .reduce((total, r) => total + r.tomas.reduce((s, t) => s + t.monto, 0), 0)
+    .reduce((total, r) => total + r.tomas.reduce((s, t) => s + t.monto, 0) - r.consumido, 0)
   if (retenidoEnBolsas !== retenidoEnReservas) {
     throw new Error(
       `descuadre en retenido: bolsas ${retenidoEnBolsas} vs reservas abiertas ${retenidoEnReservas}`,

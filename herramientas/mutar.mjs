@@ -617,6 +617,67 @@ const MUTACIONES = [
     oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
   },
 
+  // --- Las reservas, el consumo parcial y la alarma -------------------------
+  {
+    // LA COTA que estuvo declarada desde la Fase 0 sin nada que la hiciera
+    // cumplir. Sin ella el remanente que vuelve al usuario sale negativo.
+    invariante: 'no se puede consumir mas de lo que la reserva tiene',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  if (entrada.monto > disponible) {',
+    a: '  if (false) {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'consumirReserva incrementa consumido de verdad',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  reservas.set(r.reserva_id, { ...r, consumido: guaranies(r.consumido + entrada.monto) })',
+    a: '  reservas.set(r.reserva_id, { ...r, consumido: r.consumido })',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El invariante 4 tuvo que aprender a restar `consumido`. Con la version
+    // anterior, toda reserva consumida a medias quedaba acusada de descuadre.
+    invariante: 'retenido cuadra con lo que las reservas abiertas NO gastaron',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    .reduce((total, r) => total + r.tomas.reduce((s, t) => s + t.monto, 0) - r.consumido, 0)',
+    a: '    .reduce((total, r) => total + r.tomas.reduce((s, t) => s + t.monto, 0), 0)',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Una reserva que nace vencida —reloj corrido, reintento demorado, campaña de
+    // un minuto— dejaba el objeto sin alarma y la plata retenida para siempre.
+    // Lo encontro una prueba, no una auditoria.
+    invariante: 'una reserva ya vencida igual queda con alarma',
+    archivo: 'src/index.ts',
+    de: '    if (vencidas.length > 0) {',
+    a: '    if (false) {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'la alarma queda programada para el vencimiento de la reserva',
+    archivo: 'src/index.ts',
+    de: '    await this.ctx.storage.setAlarm(Date.parse(proximoVencimiento))',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Una alarma que sobrevive a la reserva que la justificaba despierta el objeto
+    // para nada, para siempre.
+    invariante: 'sin reservas abiertas la alarma se borra',
+    archivo: 'src/index.ts',
+    de: '      await this.ctx.storage.deleteAlarm()',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Si la alarma liberara todo lo que encuentra, una campaña en curso se
+    // cancelaria sola. Es el defecto mas caro que puede tener este mecanismo.
+    invariante: 'la alarma solo libera lo que YA vencio',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '  const vencidas = abiertas.filter((r) => r.vence_en <= momento).map((r) => r.reserva_id)',
+    a: '  const vencidas = abiertas.map((r) => r.reserva_id)',
+    oraculo: ORACULO_RUNTIME,
+  },
   // --- Mutar tambien el arnes ---------------------------------------------
   // Un arnes que no puede fallar hace que todo pase. Si estas sobreviven, las
   // pruebas no estan probando la caida: estan probando nada.

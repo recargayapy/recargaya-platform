@@ -20,12 +20,19 @@ import {
   debitar,
   reservar,
   liberarReserva,
+  consumirReserva,
   verificarInvariantes,
   verificarDelta,
 } from './billetera/nucleo.js'
 import { ESQUEMA } from './billetera/esquema.js'
 import { enUnaTransaccion } from './billetera/transaccion.js'
-import { type Sql, cargarEstado, guardarDelta, reconciliar } from './billetera/repositorio.js'
+import {
+  type Sql,
+  cargarEstado,
+  guardarDelta,
+  reconciliar,
+  reservasVencidas,
+} from './billetera/repositorio.js'
 import { guaranies } from './dinero/monto.js'
 
 export interface Entorno {
@@ -109,11 +116,103 @@ export class BilleteraDO extends DurableObject<Entorno> {
   }
 
   async reservar(op: Operacion, entrada: Parameters<typeof reservar>[2]) {
-    return this.aplicar(op, entrada.reserva_id, (e) => reservar(e, op, entrada))
+    const r = this.aplicar(op, entrada.reserva_id, (e) => reservar(e, op, entrada))
+    await this.reprogramarAlarma()
+    return r
   }
 
   async liberarReserva(op: Operacion, entrada: Parameters<typeof liberarReserva>[2]) {
-    return this.aplicar(op, entrada.reserva_id, (e) => liberarReserva(e, op, entrada))
+    const r = this.aplicar(op, entrada.reserva_id, (e) => liberarReserva(e, op, entrada))
+    await this.reprogramarAlarma()
+    return r
+  }
+
+  async consumirReserva(op: Operacion, entrada: Parameters<typeof consumirReserva>[2]) {
+    return this.aplicar(op, entrada.reserva_id, (e) => consumirReserva(e, op, entrada))
+  }
+
+  /**
+   * Deja la alarma apuntando al PROXIMO vencimiento pendiente, o la borra si no
+   * queda ninguno.
+   *
+   * Hay UNA alarma por Durable Object, no una cola: programar la de una reserva
+   * pisa la de la anterior. Por eso se reprograma despues de cada operacion que
+   * toca reservas, en vez de programarla una vez al reservar.
+   *
+   * Va afuera de la transaccion a proposito: `setAlarm` es asincrono y
+   * `transactionSync` no puede envolver un `await` — que es justamente la razon
+   * por la que se eligio la version sincrona. Si el objeto muriera entre la
+   * escritura y esta linea, la reserva queda en la base sin alarma; la red que lo
+   * cubre es que toda operacion siguiente sobre este objeto vuelve a
+   * reprogramar. No es una garantia fuerte y queda dicho: el barrido de reservas
+   * huerfanas es trabajo de una entrega posterior.
+   */
+  private async reprogramarAlarma(): Promise<void> {
+    const ahora = new Date().toISOString()
+    const { vencidas, proximoVencimiento } = reservasVencidas(this.sql, ahora)
+
+    // Si hay reservas YA vencidas, la alarma va para lo antes posible. Esta rama
+    // la encontro una prueba y no una auditoria: la primera version solo miraba el
+    // proximo vencimiento PENDIENTE, asi que una reserva creada con un vencimiento
+    // ya pasado —o que vencio entre la operacion y esta linea— dejaba el objeto
+    // sin alarma, y esa plata quedaba retenida para siempre.
+    //
+    // Que una reserva nazca vencida no es raro: alcanza con un reloj corrido, un
+    // reintento demorado, o una campaña de un minuto.
+    if (vencidas.length > 0) {
+      await this.ctx.storage.setAlarm(Date.now())
+      return
+    }
+
+    if (proximoVencimiento === null) {
+      await this.ctx.storage.deleteAlarm()
+      return
+    }
+
+    await this.ctx.storage.setAlarm(Date.parse(proximoVencimiento))
+  }
+
+  /**
+   * Una reserva sin confirmar vence sola. Sin cron y sin barrido: la alarma del
+   * propio objeto, que es lo que el plan maestro pide.
+   *
+   * Este es el UNICO lugar del nucleo del dinero que lee el reloj. En todos los
+   * demas el instante entra por parametro, para que el vencimiento se pueda
+   * probar sin esperar tres meses. Acá no hay quien lo pase: el que llama es
+   * Cloudflare.
+   *
+   * QUE IMPIDE QUE UNA SEGUNDA PASADA LIBERE DE NUEVO, con precision:
+   *
+   * Lo hace el filtro `estado = 'abierta'` de `reservasVencidas`. Despues de la
+   * primera pasada la reserva queda `cancelada`, asi que la segunda ni siquiera la
+   * ve. Eso esta probado: hay una prueba que corre el handler dos veces y verifica
+   * que el saldo y la cantidad de asientos no se mueven.
+   *
+   * La clave de idempotencia —`vencimiento:<reserva_id>`, derivada y estable— es
+   * una SEGUNDA capa, para el caso de dos pasadas que se pisen antes de que la
+   * primera escriba. Cloudflare reintenta las alarmas que fallan, asi que entregar
+   * doble no es una hipotesis.
+   *
+   * Y esto ultimo hay que decirlo entero: esa segunda capa NO esta cubierta por
+   * ninguna prueba de este arnes. Lo dijo la mutacion —cambiar la clave por una
+   * aleatoria SOBREVIVIO, porque el filtro de estado ya alcanza para el caso que
+   * las pruebas ejercitan—. La mutacion se saco en vez de dejarla mintiendo, y
+   * queda escrito acá que la garantia probada es una sola.
+   */
+  override async alarm(): Promise<void> {
+    const momento = new Date().toISOString()
+    const { vencidas } = reservasVencidas(this.sql, momento)
+
+    for (const reserva_id of vencidas) {
+      const op = {
+        clave_idem: `vencimiento:${reserva_id}`,
+        correlacion_id: `vencimiento:${reserva_id}`,
+        momento,
+      }
+      this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))
+    }
+
+    await this.reprogramarAlarma()
   }
 
   /** Lo que hay, para consulta. No toca nada. */
