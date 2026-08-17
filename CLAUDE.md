@@ -148,6 +148,19 @@ falta, miniflare pone la fecha de **hoy del reloj del sistema** y el mismo commi
 pasa hoy y falla el miércoles. `herramientas/check-runtime.mjs` lo mide y falla.
 Un comentario no cuenta como fecha.
 
+**Con qué configuración y con qué entorno corre el arnés del runtime vive en
+`pruebas-runtime/arnes-del-runtime.json`,** y no en literales repartidos. Lo leen
+tres lados: el arnés, `check-runtime.mjs` y `check-entorno.mjs`. Un dato que tres
+archivos necesitan y cada uno escribe a mano deriva; un archivo de datos no puede.
+Antes de esto, un oráculo sacaba el nombre del entorno parseando el TypeScript del
+arnés con una expresión regular, y un glob `'src/**'` alcanzaba para romperlo.
+
+**Ningún número va escrito en un comentario si se puede contar.** Tres vueltas de
+auditoría seguidas encontraron números viejos en la prosa — «cuatro pruebas» cuando
+eran nueve, «28 mutaciones» cuando eran 34, «15 nuevas» cuando eran 10. Los que
+manda son los que imprime `npm run verificar`; en la prosa va un puntero al lugar
+único donde el reparto está escrito.
+
 ## Reglas del repositorio
 
 **Nunca subir secretos.** Los secretos de la aplicación van con

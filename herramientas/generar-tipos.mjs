@@ -13,11 +13,16 @@
 
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { ARGUMENTOS, GENERADO } from './check-entorno.mjs'
+import { argumentos, GENERADO } from './check-entorno.mjs'
+import { leerArnesDesde } from './arnes-del-runtime.mjs'
 
 const RAIZ = fileURLToPath(new URL('..', import.meta.url))
 
-const r = spawnSync('npx', [...ARGUMENTOS, GENERADO], {
+// Nota: este archivo importa `check-entorno.mjs`, y hubo una version del guard del
+// CLI en la que ese import corria `main()` del oraculo — que, cuando los tipos no
+// coincidian, hacia `process.exit(1)` antes de generar y dejaba al generador
+// incapaz de arreglar al oraculo. Ver `invocado-directo.mjs`.
+const r = spawnSync('npx', [...argumentos(leerArnesDesde(RAIZ).environment), GENERADO], {
   cwd: RAIZ,
   stdio: 'inherit',
   shell: process.platform === 'win32',

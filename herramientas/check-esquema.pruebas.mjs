@@ -46,8 +46,11 @@ assert.throws(() => extraerCheckBolsa('nada por aca'), /no se encontro/)
 // --- de punta a punta ------------------------------------------------------
 // Las de arriba prueban las funciones puras. Sin esto, `main()` no lo ejercita
 // nadie: la mutacion del guard del CLI —invocarlo y que no verifique nada—
-// sobrevivia, porque estas pruebas nunca corrian el proceso. Lo encontro el
-// propio arnes de mutacion.
+// sobrevivia, porque estas pruebas nunca corrian el proceso.
+//
+// Para ser exacto con el credito: que `check-esquema.mjs` tuviera el guard viejo
+// lo encontro una auditoria adversarial. Lo que encontro el arnes de mutacion fue
+// que la mutacion nueva no tenia quien la matara.
 
 const { spawnSync } = await import('node:child_process')
 const { mkdtempSync, cpSync, writeFileSync, readFileSync, rmSync } = await import('node:fs')

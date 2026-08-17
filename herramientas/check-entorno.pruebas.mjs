@@ -12,12 +12,12 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
-import { compararGenerado } from './check-entorno.mjs'
+import { compararGenerado, argumentos } from './check-entorno.mjs'
 import { invocadoDirecto } from './invocado-directo.mjs'
 
 const RAIZ = fileURLToPath(new URL('..', import.meta.url))
 
-assert.equal(invocadoDirecto(import.meta.url), true)
+assert.equal(invocadoDirecto(import.meta), true)
 
 // --- la comparacion, pura --------------------------------------------------
 
@@ -86,6 +86,9 @@ const { spawnSync } = await import('node:child_process')
 function correrOraculoSobreCopia(perturbar) {
   const dir = mkdtempSync(join(tmpdir(), 'check-entorno-'))
   try {
+    // Si el oraculo crece y necesita otro archivo, agregalo a esta lista: la
+    // prueba va a fallar con un ENOENT que nombra la ruta completa dentro del
+    // temporal, que es diagnosticable de una lectura.
     for (const x of ['herramientas', 'src', 'pruebas-runtime', 'wrangler.jsonc', 'package.json']) {
       cpSync(join(RAIZ, x), join(dir, x), { recursive: true })
     }
@@ -170,13 +173,29 @@ const generado = (dir) => join(dir, 'worker-configuration.d.ts')
   assert.match(r.salida, /npm run tipos:generar/)
 }
 
-// El arbol de verdad quedo intacto: ninguna de las perturbaciones lo toco.
+// El arbol de verdad sigue pasando el oraculo.
+//
+// Ojo con lo que esto prueba y lo que no, porque la version anterior de este
+// comentario prometia mas: afirmaba «el arbol de verdad quedo intacto: ninguna de
+// las perturbaciones lo toco», y el oraculo mira UNA cosa —que
+// `worker-configuration.d.ts` coincida con los tipos del entorno del arnes—. Es
+// ciego a `src/`, a `package.json` y a casi todo `wrangler.jsonc`. La garantia de
+// que el arbol real no se toca la da que las perturbaciones ocurren sobre una
+// copia, no esta asercion.
 {
   const r = spawnSync(process.execPath, [join(RAIZ, 'herramientas', 'check-entorno.mjs')], {
     cwd: tmpdir(),
     encoding: 'utf8',
   })
-  assert.equal(r.status, 0, `el arbol de verdad no quedo como estaba: ${r.stdout}${r.stderr}`)
+  assert.equal(r.status, 0, `el arbol de verdad dejo de pasar el oraculo: ${r.stdout}${r.stderr}`)
 }
+
+// Y los argumentos de generacion llevan el entorno que se les pasa, no uno fijo.
+assert.equal(argumentos('produccion').includes('produccion'), true)
+assert.equal(argumentos('staging').includes('produccion'), false)
+// Sin `--strict-vars=false`: sin los literales de las vars, `--env staging` y
+// `--env produccion` generan el archivo byte a byte identico y el oraculo queda
+// ciego al entorno. Lo midio la tercera vuelta de auditoria.
+assert.equal(argumentos('staging').includes('--strict-vars=false'), false)
 
 console.log('  check-entorno.pruebas: OK')

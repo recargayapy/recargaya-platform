@@ -6,11 +6,11 @@
  * la herramienta que prueba a la herramienta, y atar su verificacion a vitest
  * seria atarla a lo mismo que no la cubre.
  *
- * Casi todos los casos de abajo salieron de una auditoria adversarial que
- * encontro que el extractor anterior —una expresion regular sobre el texto que
- * descartaba las lineas que arrancaban con `//`— daba el resultado equivocado en
- * cinco configuraciones validas y realistas. Estan uno por uno, con el nombre
- * del caso, para que la proxima reescritura tenga que pasar por todos.
+ * Muchos de los casos de abajo salieron de auditorias adversariales: el extractor
+ * original —una expresion regular sobre el texto que descartaba las lineas que
+ * arrancaban con `//`— daba el resultado equivocado en tres CLASES de error, que
+ * se manifestaban en cinco configuraciones validas y realistas. Estan uno por uno
+ * para que la proxima reescritura tenga que pasar por todos.
  *
  * Uso: node herramientas/check-runtime.pruebas.mjs
  */
@@ -21,11 +21,11 @@ import { fileURLToPath } from 'node:url'
 import {
   normalizarJsonc,
   leerConfig,
-  entornoDePruebas,
   buscarFechaImpuestaPorElArnes,
   fechaEfectiva,
   esFechaReal,
 } from './check-runtime.mjs'
+import { leerArnes } from './arnes-del-runtime.mjs'
 import { invocadoDirecto } from './invocado-directo.mjs'
 
 const RAIZ = fileURLToPath(new URL('..', import.meta.url))
@@ -34,12 +34,20 @@ const RAIZ = fileURLToPath(new URL('..', import.meta.url))
 // Este archivo se corre directo, y el modulo que importa NO. Si el guard diera
 // verdadero al importar, `main()` correria aca y el `console.log` del final no
 // seria la ultima palabra del proceso.
-assert.equal(invocadoDirecto(import.meta.url), true, 'este archivo se corre directo')
+assert.equal(invocadoDirecto(import.meta), true, 'este archivo se corre directo')
+// Y un modulo importado NO se cree invocado. Se le pasa un `meta` sin `main`
+// —que es lo que ve un Node anterior a la 22.18— para ejercitar el respaldo por
+// comparacion de rutas y no solo el camino de `import.meta.main`.
 assert.equal(
-  invocadoDirecto(new URL('check-runtime.mjs', import.meta.url).href),
+  invocadoDirecto({ url: new URL('check-runtime.mjs', import.meta.url).href }),
   false,
   'el modulo importado no se cree invocado',
 )
+// Y una procedencia que no se puede resolver responde `false`, no `true`: un
+// modulo importado que no sabe de donde viene no arranca un oraculo por las
+// dudas. La version anterior devolvia `true` aca, y por eso `main()` corria
+// adentro del import de `generar-tipos.mjs`.
+assert.equal(invocadoDirecto({ url: 'file:///no/existe/nada.mjs' }), false)
 
 // --- normalizarJsonc -------------------------------------------------------
 
@@ -99,20 +107,41 @@ assert.equal(configReal.name, 'recargaya')
 assert.equal(configReal.env.staging.name, 'recargaya-staging')
 assert.equal(configReal.env.produccion.workers_dev, false)
 
-// --- entornoDePruebas ------------------------------------------------------
+// --- leerArnes -------------------------------------------------------------
 // Es un JSON, asi que no hay parser propio que probar. Lo que se prueba es que el
-// archivo REAL diga lo que el resto de la entrega supone, y que una forma
-// invalida falle en vez de resolver a `undefined`.
+// archivo REAL diga lo que el resto de la entrega supone, y que cada forma
+// invalida falle con un mensaje en vez de resolver a `undefined`.
 
-assert.equal(
-  entornoDePruebas(readFileSync(`${RAIZ}pruebas-runtime/entorno-de-pruebas.json`, 'utf8')),
-  'staging',
+assert.deepEqual(leerArnes(readFileSync(`${RAIZ}pruebas-runtime/arnes-del-runtime.json`, 'utf8')), {
+  environment: 'staging',
+  configPath: './wrangler.jsonc',
+})
+
+assert.deepEqual(leerArnes('{ "environment": "produccion", "configPath": "./wrangler.jsonc" }'), {
+  environment: 'produccion',
+  configPath: './wrangler.jsonc',
+})
+
+assert.throws(() => leerArnes('{ "configPath": "./wrangler.jsonc" }'), /no declara un `environment`/)
+assert.throws(
+  () => leerArnes('{ "environment": "", "configPath": "./wrangler.jsonc" }'),
+  /no declara un `environment`/,
 )
+assert.throws(
+  () => leerArnes('{ "environment": 3, "configPath": "./wrangler.jsonc" }'),
+  /no declara un `environment`/,
+)
+assert.throws(() => leerArnes('no soy json'), /no es JSON valido/)
 
-assert.equal(entornoDePruebas('{ "environment": "produccion" }'), 'produccion')
-assert.throws(() => entornoDePruebas('{}'), /no declara un `environment`/)
-assert.throws(() => entornoDePruebas('{ "environment": "" }'), /no declara un `environment`/)
-assert.throws(() => entornoDePruebas('{ "environment": 3 }'), /no declara un `environment`/)
+// El configPath tiene que ser el wrangler.jsonc del proyecto. Era el agujero
+// grande de esta familia: con el arnes apuntado a otra configuracion, los oraculos
+// aprobaban un archivo que las pruebas no leian. Medido antes del arreglo: con un
+// `configPath` a una copia de fecha 2023, el oraculo firmaba 2026-08-01.
+assert.throws(() => leerArnes('{ "environment": "staging" }'), /configPath "undefined"/)
+assert.throws(
+  () => leerArnes('{ "environment": "staging", "configPath": "./otro.jsonc" }'),
+  /tiene que ser "\.\/wrangler\.jsonc"/,
+)
 
 // --- buscarFechaImpuestaPorElArnes ----------------------------------------
 // El bloque `miniflare: {}` del pool es un objeto laxo: TypeScript no revisa lo
@@ -131,6 +160,26 @@ assert.equal(
   'compatibility_date',
 )
 assert.equal(buscarFechaImpuestaPorElArnes('nada de eso aca'), null)
+
+// Un COMENTARIO que la menciona no impone nada. La version anterior era un grep
+// sobre todo el texto, y una auditoria la rompio con el comentario mas natural que
+// existe: el que documenta esta misma regla. El oraculo se ponia en rojo acusando
+// al archivo de hacer exactamente lo que el comentario dice no hacer.
+assert.equal(
+  buscarFechaImpuestaPorElArnes('// OJO: aca NO va un miniflare.compatibilityDate: lo prohibe el oraculo'),
+  null,
+)
+assert.equal(
+  buscarFechaImpuestaPorElArnes(' * `compatibilityDate:` gana sobre wrangler.jsonc'),
+  null,
+)
+assert.equal(buscarFechaImpuestaPorElArnes('/* compatibilityDate: nada */'), null)
+
+// Pero una linea de codigo si, aunque venga con un comentario al final.
+assert.equal(
+  buscarFechaImpuestaPorElArnes("      compatibilityDate: '2023-01-01', // temporal"),
+  'compatibilityDate',
+)
 
 // --- fechaEfectiva ---------------------------------------------------------
 
@@ -211,14 +260,18 @@ const { spawnSync } = await import('node:child_process')
  *  salida y la salida junta, para poder afirmar sobre el mensaje y no solo sobre
  *  el numero: un oraculo que falla con el mensaje equivocado manda a arreglar
  *  otra cosa. */
-function correrOraculoCon({ wrangler, entorno = '{ "environment": "staging" }', arnes = ARNES_OK }) {
+function correrOraculoCon({
+  wrangler,
+  entorno = '{ "environment": "staging", "configPath": "./wrangler.jsonc" }',
+  arnes = ARNES_OK,
+}) {
   const dir = mkdtempSync(join(tmpdir(), 'check-runtime-'))
   try {
     cpSync(`${RAIZ}herramientas`, join(dir, 'herramientas'), { recursive: true })
     writeFileSync(join(dir, 'wrangler.jsonc'), wrangler)
     writeFileSync(join(dir, 'vitest.runtime.config.ts'), arnes)
     mkdirSync(join(dir, 'pruebas-runtime'), { recursive: true })
-    writeFileSync(join(dir, 'pruebas-runtime', 'entorno-de-pruebas.json'), entorno)
+    writeFileSync(join(dir, 'pruebas-runtime', 'arnes-del-runtime.json'), entorno)
 
     // Se lo invoca desde OTRO directorio a proposito: el oraculo tiene que
     // resolver la raiz desde su propia ubicacion y no desde el cwd.
@@ -232,8 +285,7 @@ function correrOraculoCon({ wrangler, entorno = '{ "environment": "staging" }', 
   }
 }
 
-const ARNES_OK =
-  "cloudflareTest({ wrangler: { configPath: './wrangler.jsonc', environment: entornoDePruebas.environment } })"
+const ARNES_OK = "cloudflareTest({ wrangler: { configPath: arnes.configPath, environment: arnes.environment } })"
 
 const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": { "name": "x" } } }'
 
@@ -290,14 +342,36 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
   assert.match(r.salida, /NO SE PUDO DETERMINAR/)
 }
 
-// El arnes impone la fecha por su cuenta: la efectiva deja de ser la aprobada.
+// El arnes apunta a OTRA configuracion: los oraculos aprobarian un archivo que las
+// pruebas no leen.
 {
   const r = correrOraculoCon({
     wrangler: CON_STAGING,
-    arnes: `${ARNES_OK}\ncloudflareTest({ miniflare: { compatibilityDate: '2023-01-01' } })`,
+    entorno: '{ "environment": "staging", "configPath": "./otro-wrangler.jsonc" }',
   })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
-  assert.match(r.salida, /fija la fecha por su cuenta/)
+  assert.match(r.salida, /configPath/)
+}
+
+// El arnes impone la fecha con una linea de codigo: la efectiva deja de ser la
+// aprobada.
+{
+  const r = correrOraculoCon({
+    wrangler: CON_STAGING,
+    arnes: `${ARNES_OK}\n      compatibilityDate: '2023-01-01',`,
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /linea de codigo con `compatibilityDate:`/)
+}
+
+// Pero un comentario que la menciona NO rompe el CI. Es el caso que una auditoria
+// uso para voltear la version anterior de esta regla.
+{
+  const r = correrOraculoCon({
+    wrangler: CON_STAGING,
+    arnes: `${ARNES_OK}\n      // OJO: nada de miniflare.compatibilityDate aca.`,
+  })
+  assert.equal(r.codigo, 0, `esperaba 0 y salio ${r.codigo}: ${r.salida}`)
 }
 
 // wrangler.jsonc ilegible: falla con el mensaje del oraculo, no con un stack.
@@ -314,10 +388,41 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
 {
   const r = correrOraculoCon({
     wrangler: '{ "compatibility_date": "2026-08-01", "env": { "staging": {} } }',
-    entorno: '{ "environment": "inventado" }',
+    entorno: '{ "environment": "inventado", "configPath": "./wrangler.jsonc" }',
   })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /no declara el entorno "inventado"/)
+}
+
+// Invocado por DIRECTORIO, con un package.json que declara `main`. Es el unico
+// caso donde `import.meta.main` y la comparacion de rutas no coinciden: Node pone
+// el DIRECTORIO en `argv[1]`, asi que el respaldo por rutas responde `false` y el
+// oraculo saldria con 0 sin verificar nada — el mismo final que el guard por nombre
+// que empezo todo esto. La rama de `import.meta.main` existe exactamente para esto,
+// y sin este caso su mutacion sobrevivia.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'check-runtime-dir-'))
+  try {
+    cpSync(`${RAIZ}herramientas`, join(dir, 'oraculo'), { recursive: true })
+    writeFileSync(join(dir, 'wrangler.jsonc'), CON_STAGING)
+    writeFileSync(join(dir, 'vitest.runtime.config.ts'), ARNES_OK)
+    mkdirSync(join(dir, 'pruebas-runtime'), { recursive: true })
+    writeFileSync(
+      join(dir, 'pruebas-runtime', 'arnes-del-runtime.json'),
+      '{ "environment": "staging", "configPath": "./wrangler.jsonc" }',
+    )
+    writeFileSync(
+      join(dir, 'oraculo', 'package.json'),
+      '{ "type": "module", "main": "check-runtime.mjs" }',
+    )
+
+    const r = spawnSync(process.execPath, [join(dir, 'oraculo')], { cwd: tmpdir(), encoding: 'utf8' })
+    const salida = `${r.stdout}${r.stderr}`
+    assert.equal(r.status, 0, `esperaba 0 y salio ${r.status}: ${salida}`)
+    assert.match(salida, /OK/, `invocado por directorio no verifico nada: ${JSON.stringify(salida)}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 }
 
 console.log('  check-runtime.pruebas: OK')

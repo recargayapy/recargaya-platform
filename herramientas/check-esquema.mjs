@@ -70,4 +70,4 @@ function main() {
   console.log(`  check-esquema: TipoBolsa y el CHECK de ledger_copia coinciden (${tipos.join(', ')})`)
 }
 
-if (invocadoDirecto(import.meta.url)) main()
+if (invocadoDirecto(import.meta)) main()

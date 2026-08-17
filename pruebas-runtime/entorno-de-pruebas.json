@@ -1,4 +1,0 @@
-{
-  "//": "Con que entorno de wrangler.jsonc corren las pruebas del runtime. Vive en un archivo de datos y no dentro de vitest.runtime.config.ts porque lo leen DOS lados: el arnes, que lo pasa al pool, y herramientas/check-runtime.mjs, que resuelve la compatibility_date efectiva de ese entorno. La version anterior lo sacaba del TypeScript del arnes con una expresion regular, y una auditoria midio dos formas de romperlo: un glob como 'src/**' abria un comentario de bloque que se comia el resto del archivo, y `test.environment` —que es una opcion propia de vitest— contaba como segunda coincidencia. Un archivo de datos hace que los dos lados no puedan divergir, que era el objetivo.",
-  "environment": "staging"
-}

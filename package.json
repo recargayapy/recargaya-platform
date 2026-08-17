@@ -5,7 +5,7 @@
   "type": "module",
   "description": "RecargaYA Platform 2.0 sobre Cloudflare",
   "scripts": {
-    "tipos": "tsc --noEmit",
+    "tipos": "tsc --noEmit && tsc --noEmit -p tsconfig.configs.json",
     "tipos:generar": "node herramientas/generar-tipos.mjs",
     "probar": "vitest run",
     "probar:mirar": "vitest",
@@ -22,12 +22,13 @@
     "desplegar:produccion": "wrangler deploy --env produccion"
   },
   "engines": {
-    "//": "import.meta.main —el guard de los oraculos— existe desde Node 22.20. En un Node anterior vale undefined y el oraculo saldria con 0 sin verificar nada.",
-    "node": ">=22.20"
+    "//": "invocado-directo.mjs usa import.meta.main cuando existe, que es desde Node 22.18 (y 24.2). En un Node anterior cae al respaldo por comparacion de rutas, que es mas debil: no distingue `node <directorio>` con un package.json que declara main. El piso evita ese caso.",
+    "node": ">=22.18"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.21.3",
     "@cloudflare/workers-types": "^5.20260817.1",
+    "@types/node": "^22.20.1",
     "typescript": "^5.7.3",
     "vitest": "^4.1.10",
     "wrangler": "^4.123.0"

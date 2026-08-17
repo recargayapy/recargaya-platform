@@ -4,7 +4,7 @@
  * Van aparte de `vitest.config.ts` a proposito. Las pruebas de `tests/` son del
  * nucleo puro: corren en Node, en milisegundos, y son las que la mutacion ataca
  * decenas de veces. Las de `pruebas-runtime/` levantan workerd. Mezclarlas haria
- * que cada mutacion pague el arranque del runtime, y la mutacion ya se corre 49
+ * que cada mutacion pague el arranque del runtime, y la mutacion ya se corre 53
  * veces y va a crecer.
  *
  * Lo que esta separacion NO significa: que las pruebas del runtime sean
@@ -16,23 +16,36 @@
  * Estaba escrita, comentada, explicada — y no hacia nada. Con el archivo dentro
  * del alcance de `tsc`, una opcion inventada no compila.
  */
+import { readFileSync } from 'node:fs'
 import { defineConfig } from 'vitest/config'
 import { cloudflareTest } from '@cloudflare/vitest-pool-workers'
-import entornoDePruebas from './pruebas-runtime/entorno-de-pruebas.json'
+
+/**
+ * Se lee con `readFileSync` y no con `import ... from './x.json'` a proposito.
+ * El import avisaba en CADA corrida —«JSON import without import attributes …
+ * Add `with { type: 'json' }`»— y agregar el atributo que pide Vite rompe
+ * `npm run tipos` (`TS2823`, porque `module` no es `esnext`). Entre un aviso que
+ * se vuelve error cuando Vite cambie el default y un `tsc` en rojo, se lee el
+ * archivo. De paso `tsconfig.json` no necesita `resolveJsonModule`.
+ */
+const arnes = JSON.parse(
+  readFileSync(new URL('./pruebas-runtime/arnes-del-runtime.json', import.meta.url), 'utf8'),
+) as { configPath: string; environment: string }
 
 export default defineConfig({
   plugins: [
     cloudflareTest({
-      // Se lee el wrangler.jsonc de verdad, con el entorno de staging. Un
-      // binding inventado aca probaria una configuracion que no existe.
+      // Se lee el wrangler.jsonc de verdad. Un binding inventado aca probaria una
+      // configuracion que no existe.
       //
-      // El nombre del entorno sale de `pruebas-runtime/entorno-de-pruebas.json`,
-      // que tambien lee `check-runtime.mjs` para resolver la fecha de
-      // compatibilidad efectiva. Es un archivo de datos y no un literal aca
-      // porque asi los dos lados no pueden divergir: la version anterior lo
-      // sacaba de ESTE archivo con una expresion regular sobre el TypeScript, y
-      // una auditoria la rompio con un glob y con `test.environment`.
-      wrangler: { configPath: './wrangler.jsonc', environment: entornoDePruebas.environment },
+      // La ruta y el entorno salen de `pruebas-runtime/arnes-del-runtime.json`,
+      // que leen tambien `check-runtime.mjs` (para resolver la fecha de
+      // compatibilidad efectiva de ese entorno) y `check-entorno.mjs` (para
+      // generar los tipos de sus bindings). Es un archivo de datos y no literales
+      // aca porque asi los tres lados no pueden divergir: una version anterior
+      // sacaba el entorno de ESTE archivo con una expresion regular sobre el
+      // TypeScript, y una auditoria la rompio con un glob y con `test.environment`.
+      wrangler: { configPath: arnes.configPath, environment: arnes.environment },
 
       // Explicito, aunque el default hoy sea inerte. Con `remoteBindings` en
       // `true` —que es el default— un binding marcado `"remote": true`, o

@@ -33,16 +33,18 @@
  *
  * Asi que el oraculo hace cuatro cosas, y ninguna mas:
  *
- *   1. Lee de `pruebas-runtime/entorno-de-pruebas.json` con QUE entorno corren
- *      las pruebas — el mismo archivo que lee el arnes. Si el arnes y el oraculo
- *      miraran entornos distintos, el oraculo no mediria lo que corre.
+ *   1. Lee de `pruebas-runtime/arnes-del-runtime.json` con QUE entorno y contra
+ *      QUE configuracion corren las pruebas — el mismo archivo que lee el arnes.
+ *      Si el arnes y el oraculo miraran entornos distintos, el oraculo no mediria
+ *      lo que corre.
  *   2. Exige que ese entorno exista en `wrangler.jsonc`. Un entorno que la
  *      configuracion no declara resolveria contra la nada.
  *   3. Resuelve la fecha efectiva como la resuelve wrangler:
  *      `env.<entorno>.compatibility_date` gana sobre la de la raiz.
- *   4. Falla si no hay ninguna, y falla si el arnes la sobreescribe por su cuenta
- *      con un `compatibilityDate` de miniflare — porque ahi la fecha efectiva ya
- *      no es la que este oraculo acaba de aprobar.
+ *   4. Falla si no hay ninguna, y falla si el arnes tiene una LINEA DE CODIGO con
+ *      un `compatibilityDate` de miniflare — porque ahi la fecha efectiva ya no
+ *      es la que este oraculo acaba de aprobar. Un comentario que la mencione no
+ *      cuenta: lo que se busca es una forma de codigo, no la palabra.
  *
  * Uso:  node herramientas/check-runtime.mjs
  */
@@ -51,6 +53,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { invocadoDirecto } from './invocado-directo.mjs'
+import { leerArnesDesde } from './arnes-del-runtime.mjs'
 
 /** La raiz del repositorio, derivada de la ubicacion de este archivo y no del
  *  directorio desde el que se lo invoca: un oraculo cuyo veredicto depende de
@@ -139,43 +142,38 @@ export function leerConfig(texto) {
 }
 
 /**
- * Con que entorno corren las pruebas del runtime.
+ * El arnes no puede imponer la fecha por su cuenta.
  *
- * Sale de un archivo de datos que tambien lee `vitest.runtime.config.ts`. La
- * version anterior lo sacaba del TypeScript del arnes con una expresion regular,
- * y la segunda vuelta de auditoria la rompio de dos formas medidas: un glob como
- * `'src/**'` dentro de comillas simples abria un comentario de bloque que se
- * comia el resto del archivo, y `test.environment` —que es una opcion propia de
- * vitest, con los valores `node` o `jsdom`— contaba como segunda coincidencia. En
- * el peor caso el oraculo imprimia OK sobre un entorno llamado "node".
- *
- * Un archivo de datos hace que los dos lados no puedan divergir, que era todo el
- * objetivo. Parsear TypeScript con texto nunca lo era.
- */
-export function entornoDePruebas(textoJson) {
-  const d = JSON.parse(textoJson)
-  if (typeof d.environment !== 'string' || d.environment === '') {
-    throw new Error('entorno-de-pruebas.json no declara un `environment` que sea texto')
-  }
-  return d.environment
-}
-
-/**
- * El arnes no puede sobreescribir la fecha por su cuenta.
- *
- * El pool acepta un bloque `miniflare: { ... }` que pasa opciones crudas, y ese
- * bloque esta declarado como objeto laxo: TypeScript no revisa lo que va adentro.
- * Un `compatibilityDate` ahi gana sobre todo lo que resuelve este oraculo, y
- * quedaria imprimiendo OK sobre una fecha que no es la efectiva. Medido: con
+ * El pool acepta un bloque `miniflare: { ... }` que pasa opciones crudas al
+ * runtime, y `compatibilityDate` es una opcion LEGITIMA y bien tipada de
+ * miniflare: ningun compilador se va a quejar de ella nunca, por estricto que
+ * sea. Puesta ahi, gana sobre todo lo que este oraculo resuelve, y quedaria
+ * imprimiendo OK sobre una fecha que no es la efectiva. Medido: con
  * `miniflare: { compatibilityDate: '2023-01-01' }` el oraculo decia OK y las
  * pruebas corrian con 2023.
  *
- * No se intenta resolverlo: se prohibe. Detectar y fallar, que es lo que se puede
- * hacer bien sin parsear TypeScript.
+ * No se intenta resolverlo: se prohibe.
+ *
+ * El patron esta anclado al comienzo de linea y exige los dos puntos, o sea que
+ * busca una FORMA DE CODIGO y no la palabra. La version anterior era
+ * `/compatibilityDate|compatibility_date/` sobre todo el texto, y una auditoria
+ * la rompio con el comentario mas natural que existe: el que documenta esta
+ * misma regla. Un oraculo que se rompe cuando alguien documenta la regla es un
+ * oraculo que alguien va a borrar.
+ *
+ * Lo que esto NO cubre, y se dice: el literal movido a otro archivo e importado
+ * (`miniflare: opcionesCrudas`). Eso no lo agarra ningun grep de un solo archivo.
+ * Lo que si quedo cubierto es el `configPath`, que era el agujero grande de la
+ * misma familia: ahora vive en `arnes-del-runtime.json` y lo valida
+ * `leerArnes()`.
  */
 export function buscarFechaImpuestaPorElArnes(texto) {
-  const m = /compatibilityDate|compatibility_date/.exec(texto)
-  return m === null ? null : m[0]
+  const m = /^[^\n]*?\b(compatibilityDate|compatibility_date)\s*:/m.exec(texto)
+  if (m === null) return null
+  // Una linea que arranca con `//` o `*` es comentario: no impone nada.
+  const linea = m[0]
+  if (/^\s*(\/\/|\*|\/\*)/.test(linea)) return null
+  return m[1]
 }
 
 /**
@@ -215,13 +213,11 @@ function main() {
     const impuesta = buscarFechaImpuestaPorElArnes(arnes)
     if (impuesta !== null) {
       throw new Error(
-        `vitest.runtime.config.ts fija la fecha por su cuenta ("${impuesta}"): la efectiva dejaria de ser la de wrangler.jsonc`,
+        `vitest.runtime.config.ts tiene una linea de codigo con \`${impuesta}:\`, y eso gana sobre la fecha de wrangler.jsonc`,
       )
     }
 
-    entorno = entornoDePruebas(
-      readFileSync(join(RAIZ, 'pruebas-runtime', 'entorno-de-pruebas.json'), 'utf8'),
-    )
+    entorno = leerArnesDesde(RAIZ).environment
     config = leerConfig(readFileSync(join(RAIZ, 'wrangler.jsonc'), 'utf8'))
 
     if (config?.env?.[entorno] === undefined) {
@@ -286,4 +282,4 @@ function main() {
 // El guard vive en `invocado-directo.mjs`, compartido por los tres oraculos: la
 // primera version de este arreglo lo cambio solo aca y dejo `check-esquema.mjs`
 // con el guard por nombre. Se arregla la categoria, no el caso.
-if (invocadoDirecto(import.meta.url)) main()
+if (invocadoDirecto(import.meta)) main()

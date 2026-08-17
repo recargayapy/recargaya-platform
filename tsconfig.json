@@ -18,23 +18,22 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
 
-    "resolveJsonModule": true,
-
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "noEmit": true
   },
-  // Los archivos de configuracion tambien entran. La primera version de
-  // vitest.runtime.config.ts declaraba una opcion que el pool ya no acepta, y el
-  // schema descarta las claves desconocidas en silencio: estaba escrita,
-  // comentada, y no hacia nada. Con los configs adentro, tsc lo agarra.
+  // Los archivos de configuracion NO entran aca: entran por
+  // `tsconfig.configs.json`, que les da los tipos de Node.
+  //
+  // La separacion no es burocracia. `src/` corre en el Worker y no tiene que ver
+  // los globals de Node: si `types` incluyera "node", un `process.env` o un
+  // `Buffer` en el codigo del dinero compilarian y explotarian en Cloudflare. Los
+  // configs, en cambio, corren en Node y necesitan `node:fs`.
   "include": [
     "src/**/*.ts",
     "tests/**/*.ts",
     "pruebas-runtime/**/*.ts",
-    "vitest.config.ts",
-    "vitest.runtime.config.ts",
     "worker-configuration.d.ts"
   ]
 }

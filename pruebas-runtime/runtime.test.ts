@@ -14,16 +14,20 @@
  *
  *   · DOS estan ancladas a codigo de `src/` — las de `el Worker desplegado` — y
  *     hay una mutacion de `src/index.ts` que mata a cada una.
- *   · CUATRO —las de aislamiento y las dos homonimas— las cubre una mutacion del
- *     propio arnes: prueban una convencion de este archivo, no una linea de
- *     produccion, pero la convencion tiene oraculo.
+ *   · CUATRO —las dos de aislamiento y las dos homonimas— prueban una convencion
+ *     de este archivo y no una linea de produccion. TRES de las cuatro mueren por
+ *     su propia asercion con una mutacion del arnes; la cuarta (`el estado
+ *     sobrevive dentro de una misma prueba`) es el estado que las otras necesitan
+ *     y no la mata ninguna mutacion. La tercera vuelta de auditoria midio que la
+ *     version anterior de este parrafo decia «las cubre» de las cuatro, y de las
+ *     cuatro morian dos.
  *   · Las OCHO restantes son SONDAS DE LA PLATAFORMA: crean sus propias tablas y
  *     le hablan a la API de Cloudflare. Verifican que los mecanismos se comportan
  *     como la entrega siguiente va a suponer, y no pueden verificar que nuestro
  *     codigo los use, porque todavia no hay codigo nuestro que los use.
  *
  * Lo dice una auditoria de esta entrega, y queda escrito para que nadie lea
- * "49/49 mutaciones muertas" como si las catorce estuvieran cubiertas:
+ * "53/53 mutaciones muertas" como si las catorce estuvieran cubiertas:
  *
  *   Si `BilleteraDO` escribiera el asiento y el evento del outbox en dos `exec`
  *   sueltos, sin transaccion, las catorce pruebas de este archivo pasarian igual.
@@ -68,12 +72,35 @@ void _entornoNoPrometeDeMas
  * Medido entonces: se agrego una var a `wrangler.jsonc`, se regeneraron los
  * tipos, y `Entorno` siguio sin ella con `tsc` en verde.
  *
- * Con esta linea la asignabilidad es mutua, y eso cierra cuatro huecos de una
- * vez: un binding que falta en `Entorno`, uno vuelto opcional, uno ensanchado a
- * `unknown`, y uno con el tipo cambiado.
+ * Va sobre las CLAVES y no por asignabilidad mutua de tipos, y eso es un arreglo
+ * de la tercera vuelta. La asignabilidad mutua obligaba a generar los tipos con
+ * `--strict-vars=false`, porque `Entorno` declara `ENTORNO: string` y el generado
+ * decia `ENTORNO: "staging"`. Y sin los literales, `wrangler types --env staging`
+ * y `--env produccion` producen el archivo byte a byte identico: `check-entorno.mjs`
+ * quedaba CIEGO al entorno. Un arreglo aflojando otra comprobacion.
+ *
+ * Comparar claves cierra «falta un binding» sin pedirle nada a los tipos de valor,
+ * asi que los literales vuelven y el otro oraculo recupera la vista.
  */
-const _entornoNoPrometeDeMenos: Cloudflare.Env = {} as Entorno
+type BindingsQueFaltanEnEntorno = Exclude<keyof Cloudflare.Env, keyof Entorno>
+const _entornoNoPrometeDeMenos: BindingsQueFaltanEnEntorno extends never ? true : false = true
 void _entornoNoPrometeDeMenos
+
+/**
+ * Y que ningun binding este declarado como `any`.
+ *
+ * `any` es asignable en las dos direcciones, asi que se cuela por las dos lineas
+ * de arriba. Y el final es el mismo que el defecto original: `env.CORE.loQueSea()`
+ * compila y explota en runtime, «sin un solo ruido».
+ *
+ * El truco `0 extends 1 & T[K]` es la unica forma de detectar `any` en TypeScript:
+ * `1 & any` es `any`, y `0 extends any` es cierto, mientras que para cualquier
+ * otro tipo la interseccion no absorbe. Es opaco y por eso lleva este parrafo: sin
+ * el, el proximo que lo lea lo borra.
+ */
+type SinAny<T> = { [K in keyof T]: 0 extends 1 & T[K] ? never : T[K] }
+const _entornoSinAny: SinAny<Entorno> = {} as Entorno
+void _entornoSinAny
 
 /**
  * Una billetera por prueba, con el nombre derivado de `task.fullName`.
@@ -91,15 +118,15 @@ void _entornoNoPrometeDeMenos
  * Durable Object — el aislamiento no aislaba, con un comentario aca diciendo que
  * si. `task.fullName` incluye el camino completo.
  *
- * El ultimo `describe` de este archivo tiene dos pruebas con texto identico a
- * proposito: son el oraculo de esto, y la mutacion que vuelve a `task.name` las
- * mata.
+ * Dos `describe` de este archivo tienen una prueba con el mismo texto a proposito:
+ * son el oraculo de esto, y la mutacion que vuelve a `prueba.name` las mata.
  */
 function billetera(prueba: { readonly name: string; readonly fullName: string }) {
   // Recibe la prueba entera y no un texto ya elegido, a proposito: asi hay UN
   // solo lugar donde se decide que campo usar, y por lo tanto un solo lugar que
-  // la mutacion tiene que romper. Con el nombre resuelto en cada llamada, la
-  // mutacion cambiaba una sola de las catorce y sobrevivia.
+  // la mutacion tiene que romper. Con el nombre resuelto en cada sitio de
+  // llamada, `String.replace` cambiaba el primero de los doce y los otros once
+  // quedaban sin mutar, asi que la mutacion sobrevivia.
   return env.BILLETERA.get(env.BILLETERA.idFromName(prueba.fullName))
 }
 
@@ -370,30 +397,49 @@ describe('el aislamiento entre pruebas', () => {
   })
 })
 
-// Estos dos `describe` tienen una prueba con EL MISMO TEXTO a proposito. Son el
-// oraculo de que el aislamiento use el camino completo y no solo el texto del
-// `it`: con `task.name` los dos daban el mismo id de Durable Object y la segunda
-// veia la tabla de la primera. La mutacion `task.fullName` -> `task.name` muere
-// aca, y sin este par no moriria en ningun lado.
-describe('dos pruebas con el mismo texto · grupo A', () => {
-  it('no comparten Durable Object', async ({ task }) => {
-    await runInDurableObject(billetera(task), (_do, ctx) => {
-      ctx.storage.sql.exec('CREATE TABLE homonima (n INTEGER NOT NULL) STRICT')
-      ctx.storage.sql.exec('INSERT INTO homonima (n) VALUES (1)')
+/**
+ * Dos `describe` con una prueba de TEXTO IDENTICO a proposito. Son el oraculo de
+ * que el aislamiento use el camino completo y no solo el texto del `it`: con
+ * `task.name` los dos daban el mismo id de Durable Object y el segundo veia la
+ * tabla del primero. La mutacion `prueba.fullName` -> `prueba.name` muere aca, y
+ * sin este par no moriria en ningun lado.
+ *
+ * Son SIMETRICAS —cada una mira antes de escribir— y eso es un arreglo de la
+ * tercera vuelta de auditoria. La version anterior era A escribe / B comprueba, o
+ * sea que sólo detectaba la colision si A corria primero: invirtiendo los dos
+ * `describe`, la mutacion sobrevivia con la suite en verde. Un oraculo que depende
+ * del orden de las pruebas es una convencion, no un oraculo.
+ *
+ * Lo que sigue siendo convencion, y no encontre como blindar: que el texto de los
+ * dos `it` sea identico. Si alguien renombra uno «para que se entienda cual es
+ * cual», el par deja de ser homonimo y el oraculo se apaga en silencio. De ahi que
+ * este parrafo este arriba de los dos, y no de uno.
+ */
+function comprobarQueNadieEscribioAca(sufijo: 'A' | 'B') {
+  return async ({ task }: { task: { readonly name: string; readonly fullName: string } }) => {
+    const oreja = billetera(task)
+
+    // Nadie mas tiene que haber escrito en MI Durable Object. Mirar antes de
+    // escribir es lo que hace que el par no dependa de cual corre primero.
+    const ajenas = await runInDurableObject(oreja, (_do, ctx) => [
+      ...ctx.storage.sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name LIKE 'homonima_%'",
+      ),
+    ])
+    expect(ajenas).toEqual([{ n: 0 }])
+
+    await runInDurableObject(oreja, (_do, ctx) => {
+      ctx.storage.sql.exec(`CREATE TABLE homonima_${sufijo} (n INTEGER NOT NULL) STRICT`)
     })
-  })
+  }
+}
+
+describe('dos pruebas con el mismo texto · grupo A', () => {
+  it('no comparten Durable Object', comprobarQueNadieEscribioAca('A'))
 })
 
 describe('dos pruebas con el mismo texto · grupo B', () => {
-  it('no comparten Durable Object', async ({ task }) => {
-    const tablas = await runInDurableObject(billetera(task), (_do, ctx) => [
-      ...ctx.storage.sql.exec<{ n: number }>(
-        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'homonima'",
-      ),
-    ])
-
-    expect(tablas).toEqual([{ n: 0 }])
-  })
+  it('no comparten Durable Object', comprobarQueNadieEscribioAca('B'))
 })
 
 describe('el Worker desplegado', () => {

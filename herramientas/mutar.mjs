@@ -17,7 +17,17 @@
  */
 
 import { readFileSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
+
+// La raiz sale de la ubicacion de este archivo y no del cwd. Corrido desde
+// `herramientas/` moria con un ENOENT y un stack pelado. Los tres oraculos ya lo
+// resolvian asi; este quedo atras — la categoria se arreglo en tres de cuatro
+// lugares, que es la forma mas facil de creer que se arreglo.
+const RAIZ = fileURLToPath(new URL('..', import.meta.url))
+const rutaDe = (archivo) => join(RAIZ, archivo)
 
 /**
  * Cada mutacion nombra el invariante que ataca. Si alguna sobrevive, el nombre
@@ -196,8 +206,9 @@ const MUTACIONES = [
   // --- Los oraculos nuevos ------------------------------------------------
   // Un oraculo sin jueces fue el defecto n.º 1 de la Fase 0: se rompio la
   // deteccion de descuadre y ninguna prueba se dio cuenta. Las de este bloque
-  // atacan a `check-runtime.mjs`, `check-entorno.mjs` y el guard compartido, y su
-  // oraculo son las pruebas propias de cada herramienta.
+  // atacan a los oraculos y a los modulos que comparten, y su oraculo son las
+  // pruebas propias de cada herramienta. (No lleva un numero a proposito: la
+  // version anterior decia «estas siete» cuando eran ocho.)
   {
     // EL caso que check-runtime existe para agarrar: sin fecha declarada,
     // miniflare pone la del reloj del sistema. Si el oraculo inventara una, el
@@ -234,7 +245,7 @@ const MUTACIONES = [
     // quedaria imprimiendo OK sobre una fecha que no es la efectiva.
     invariante: 'check-runtime prohibe que el arnes imponga la fecha por su cuenta',
     archivo: 'herramientas/check-runtime.mjs',
-    de: '  const m = /compatibilityDate|compatibility_date/.exec(texto)',
+    de: "  const m = /^[^\\n]*?\\b(compatibilityDate|compatibility_date)\\s*:/m.exec(texto)",
     a: '  const m = null',
     oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
   },
@@ -244,17 +255,46 @@ const MUTACIONES = [
     // modulo, no verificaba nada y salia con 0.
     invariante: 'el guard distingue invocado de importado',
     archivo: 'herramientas/invocado-directo.mjs',
-    de: '    return realpathSync(arrancado) === realpathSync(fileURLToPath(urlDelModulo))',
-    a: '    return false',
+    de: "  if (typeof meta.main === 'boolean') return meta.main",
+    a: '',
     oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
   },
   {
-    // El mismo guard, del otro lado: si diera verdadero siempre, importar el
-    // modulo correria `main()` y las pruebas dejarian de ser el unico que habla.
-    invariante: 'el guard no se cree invocado cuando lo importan',
+    // El respaldo por comparacion de rutas, para un Node anterior a la 22.18. Las
+    // pruebas le pasan un `meta` sin `main` justamente para ejercitarlo.
+    invariante: 'el respaldo del guard compara la ruta real del modulo',
     archivo: 'herramientas/invocado-directo.mjs',
-    de: '  if (arrancado === undefined) return false',
-    a: '  if (arrancado === undefined) return true\n  return true',
+    de: '    return realpathSync(arrancado) === realpathSync(fileURLToPath(meta.url))',
+    a: '    return true',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // El `catch` tiene que responder `false`. Devolvia `true` —«ante la duda,
+    // corre»— y con eso importar `check-entorno.mjs` desde `generar-tipos.mjs`
+    // ejecutaba `main()` del oraculo adentro del import: cuando los tipos no
+    // coincidian, hacia `process.exit(1)` antes de generar y el generador quedaba
+    // incapaz de arreglar al oraculo.
+    invariante: 'el guard no arranca un oraculo cuando no sabe de donde viene',
+    archivo: 'herramientas/invocado-directo.mjs',
+    de: '  } catch {\n    return false\n  }',
+    a: '  } catch {\n    return true\n  }',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    // El configPath del arnes tiene que ser el wrangler.jsonc del proyecto. Era el
+    // agujero grande de esta familia: apuntado a otra configuracion, los oraculos
+    // aprobaban un archivo que las pruebas no leian.
+    invariante: 'el arnes no puede leer otra configuracion que la del proyecto',
+    archivo: 'herramientas/arnes-del-runtime.mjs',
+    de: '  if (d.configPath !== CONFIG_ESPERADO) {',
+    a: '  if (false) {',
+    oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
+  },
+  {
+    invariante: 'el arnes declara un environment que es texto',
+    archivo: 'herramientas/arnes-del-runtime.mjs',
+    de: "  if (typeof d.environment !== 'string' || d.environment === '') {",
+    a: '  if (false) {',
     oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
   },
   {
@@ -264,7 +304,7 @@ const MUTACIONES = [
     // presumia de arreglar categorias.
     invariante: 'check-esquema corre de verdad cuando se lo invoca',
     archivo: 'herramientas/check-esquema.mjs',
-    de: 'if (invocadoDirecto(import.meta.url)) main()',
+    de: 'if (invocadoDirecto(import.meta)) main()',
     a: 'if (false) main()',
     oraculo: ['node', 'herramientas/check-esquema.pruebas.mjs'],
   },
@@ -298,7 +338,7 @@ const MUTACIONES = [
     // El guard del CLI, ahora compartido. Las pruebas de punta a punta lo cubren.
     invariante: 'check-runtime corre de verdad cuando se lo invoca',
     archivo: 'herramientas/check-runtime.mjs',
-    de: 'if (invocadoDirecto(import.meta.url)) main()',
+    de: 'if (invocadoDirecto(import.meta)) main()',
     a: 'if (false) main()',
     oraculo: ['node', 'herramientas/check-runtime.pruebas.mjs'],
   },
@@ -326,12 +366,11 @@ const MUTACIONES = [
   // configuracion porque levantan workerd, y no tiene sentido pagar ese arranque
   // en cada una de las mutaciones de arriba.
   //
-  // Decir lo que falta: de las doce pruebas de `pruebas-runtime/`, solo las dos
-  // de `/salud` estan ancladas a codigo de `src/`. Las otras diez son sondas de
-  // la plataforma y no hay linea de produccion que romper para matarlas. Esta
-  // lista NO prueba que esas diez sirvan; el encabezado de
-  // `pruebas-runtime/runtime.test.ts` dice que tiene que hacer la entrega
-  // siguiente para cerrarlo.
+  // Decir lo que falta: de las catorce pruebas de `pruebas-runtime/`, solo las dos
+  // de `el Worker desplegado` estan ancladas a codigo de `src/`. El reparto exacto
+  // —y que tiene que hacer la entrega siguiente para cerrarlo— vive en el
+  // encabezado de `pruebas-runtime/runtime.test.ts`, en un solo lugar, porque este
+  // comentario ya quedo viejo dos veces.
   {
     invariante: 'la prueba de /salud lee los vars del entorno de verdad',
     archivo: 'src/index.ts',
@@ -368,7 +407,7 @@ const MUTACIONES = [
     // nadie se enteraria. Muta el archivo de datos, que es de donde sale el
     // nombre desde que se dejo de parsear el TypeScript del arnes.
     invariante: 'el arnes del runtime lee el entorno que dice leer',
-    archivo: 'pruebas-runtime/entorno-de-pruebas.json',
+    archivo: 'pruebas-runtime/arnes-del-runtime.json',
     de: '"environment": "staging"',
     a: '"environment": "produccion"',
     oraculo: ['npx', 'vitest', 'run', '--config', 'vitest.runtime.config.ts', '--silent'],
@@ -399,13 +438,15 @@ const MUTACIONES = [
     // Y que el nombre sea el CAMINO COMPLETO y no solo el texto del `it`.
     // `task.name` no incluye el `describe`: dos pruebas con el mismo texto en dos
     // grupos distintos daban el mismo Durable Object, con un comentario diciendo
-    // que no. Los dos ultimos `describe` de runtime.test.ts existen para que esta
-    // mutacion tenga donde morir.
+    // que no. Dos `describe` de runtime.test.ts tienen una prueba con el mismo
+    // texto para que esta mutacion tenga donde morir, y son simetricos para que no
+    // dependa de cual corre primero.
     //
     // Nota de la pasada de mutacion: la primera version de esta mutacion cambiaba
     // `billetera(task.fullName)` en el sitio de LLAMADA y sobrevivia, porque
-    // `String.replace` con un texto reemplaza solo la primera aparicion y quedaban
-    // trece sin mutar. El arreglo no es escribir la mutacion con mas cuidado: es
+    // `String.replace` con un texto reemplaza solo la primera aparicion y de las
+    // doce llamadas quedaban once sin mutar. (Ahora la herramienta rechaza de plano
+    // una mutacion cuyo fragmento aparece mas de una vez.) El arreglo no es escribir la mutacion con mas cuidado: es
     // que `billetera()` reciba la prueba entera, para que la decision viva en un
     // solo lugar. Una mutacion dificil de escribir suele estar señalando un
     // diseño con la decision repartida.
@@ -436,15 +477,99 @@ const MUTACIONES = [
     a: '',
     oraculo: ['npx', 'tsc', '--noEmit'],
   },
+  {
+    // `any` es asignable en las dos direcciones, asi que se colaba por las dos
+    // comprobaciones de arriba — y el final era el mismo que el defecto original:
+    // `env.CORE.loQueSea()` compila y explota en runtime sin un solo ruido.
+    invariante: 'ningun binding de Entorno puede declararse como any',
+    archivo: 'src/index.ts',
+    de: '  readonly CORE: D1Database\n',
+    a: '  readonly CORE: any\n',
+    oraculo: ['npx', 'tsc', '--noEmit'],
+  },
 ]
+
+const ORACULO_POR_DEFECTO = ['npx', 'vitest', 'run', '--silent']
+
+/**
+ * El arbol tiene que estar SANO antes de empezar.
+ *
+ * `execFileSync` cuenta como "mutacion muerta" cualquier salida distinta de 0 del
+ * oraculo, sin haber comprobado nunca que el oraculo pase con el codigo intacto.
+ * Sobre un arbol ya en rojo por otra causa, las 49 se reportan muertas y el
+ * titular dice "Todas murieron. Las pruebas prueban algo." Medido: una mutacion
+ * INOCUA —agregar un comentario— se reportaba muerta.
+ *
+ * Se corre cada oraculo distinto una vez, antes de tocar nada. Cuesta unos
+ * segundos y convierte el veredicto en un veredicto.
+ */
+function comprobarLineaBase() {
+  const oraculos = new Map()
+  for (const m of MUTACIONES) {
+    const cmd = m.oraculo ?? ORACULO_POR_DEFECTO
+    oraculos.set(cmd.join(' '), cmd)
+  }
+
+  console.log(`  Linea de base — ${oraculos.size} oraculos sobre el arbol intacto\n`)
+
+  for (const [nombre, cmd] of oraculos) {
+    const [ejecutable, ...args] = cmd
+    try {
+      execFileSync(ejecutable, args, { stdio: 'pipe', cwd: RAIZ })
+      console.log(`  ✓  ${nombre}`)
+    } catch {
+      console.log(`  ✗  ${nombre}`)
+      console.log('')
+      console.log('     ESTE ORACULO YA FALLA SIN MUTACIONES.')
+      console.log('     Sobre un arbol en rojo, toda mutacion se reporta muerta y el')
+      console.log('     veredicto de abajo no vale nada. Arreglalo antes de mutar.')
+      console.log('')
+      process.exit(1)
+    }
+  }
+  console.log('')
+}
+
+/** Sello de los archivos que las mutaciones tocan, para comprobar al final que el
+ *  arbol quedo como estaba. Sin esto, "restaura en un finally" es una intencion. */
+function sellar() {
+  const h = createHash('sha256')
+  for (const archivo of [...new Set(MUTACIONES.map((m) => m.archivo))].sort()) {
+    h.update(archivo)
+    h.update(readFileSync(rutaDe(archivo)))
+  }
+  return h.digest('hex')
+}
 
 let sobrevivientes = []
 let muertas = 0
 
-console.log(`\n  Mutacion — ${MUTACIONES.length} invariantes bajo ataque\n`)
+/** El archivo mutado en este instante, para poder restaurarlo si nos matan. */
+let enVuelo = null
+
+// Un Ctrl-C dejaba el arbol con un invariante roto A PROPOSITO en el codigo del
+// dinero, porque el `finally` no corre con una señal. Y peor: el SIGINT mataba al
+// hijo, `execFileSync` tiraba, la mutacion se contaba como muerta y la corrida
+// seguia hasta imprimir "49/49 — Todas murieron". Un veredicto verde con un
+// oraculo que nunca corrio.
+for (const señal of ['SIGINT', 'SIGTERM']) {
+  process.on(señal, () => {
+    if (enVuelo !== null) {
+      writeFileSync(rutaDe(enVuelo.archivo), enVuelo.original)
+      console.log(`\n\n  ${señal} — restaurado ${enVuelo.archivo}`)
+    }
+    console.log('  INTERRUMPIDA. El veredicto no vale: no se corrieron todas.\n')
+    process.exit(130)
+  })
+}
+
+comprobarLineaBase()
+const selloInicial = sellar()
+
+console.log(`  Mutacion — ${MUTACIONES.length} invariantes bajo ataque\n`)
 
 for (const m of MUTACIONES) {
-  const original = readFileSync(m.archivo, 'utf8')
+  const original = readFileSync(rutaDe(m.archivo), 'utf8')
 
   if (!original.includes(m.de)) {
     console.log(`  ?  ${m.invariante}`)
@@ -454,21 +579,37 @@ for (const m of MUTACIONES) {
     continue
   }
 
-  writeFileSync(m.archivo, original.replace(m.de, m.a))
+  // `String.replace` con un texto reemplaza SOLO la primera aparicion. Una
+  // mutacion cuyo fragmento aparece dos veces muta a medias, y muere o sobrevive
+  // por un motivo distinto al que declara. Ya paso una vez.
+  const apariciones = original.split(m.de).length - 1
+  if (apariciones > 1) {
+    console.log(`  ?  ${m.invariante}`)
+    console.log(`     EL FRAGMENTO APARECE ${apariciones} VECES en ${m.archivo}.`)
+    console.log(`     String.replace muta solo la primera: la mutacion es ambigua.\n`)
+    sobrevivientes.push(`${m.invariante} (fragmento ambiguo)`)
+    continue
+  }
+
+  enVuelo = { archivo: m.archivo, original }
+  writeFileSync(rutaDe(m.archivo), original.replace(m.de, m.a))
 
   // El oraculo por defecto es vitest. Algunas mutaciones atacan un lugar que
   // vitest no ve — el CHECK de una migracion SQL, o una herramienta de node
   // plano — y declaran su propio oraculo en vez de fingir que vitest las
   // cubre.
-  const [cmd, ...args] = m.oraculo ?? ['npx', 'vitest', 'run', '--silent']
+  const [cmd, ...args] = m.oraculo ?? ORACULO_POR_DEFECTO
 
   let murio = false
   try {
-    execFileSync(cmd, args, { stdio: 'pipe' })
+    // `timeout` porque un oraculo del runtime que se cuelgue dejaba el arbol
+    // mutado indefinidamente, con el codigo del dinero escrito en disco.
+    execFileSync(cmd, args, { stdio: 'pipe', cwd: RAIZ, timeout: 300_000 })
   } catch {
     murio = true // el oraculo fallo: la mutacion murio, que es lo que queremos
   } finally {
-    writeFileSync(m.archivo, original)
+    writeFileSync(rutaDe(m.archivo), original)
+    enVuelo = null
   }
 
   if (murio) {
@@ -482,6 +623,17 @@ for (const m of MUTACIONES) {
 }
 
 console.log(`\n  ${muertas}/${MUTACIONES.length} mutaciones muertas`)
+
+// El arbol tiene que haber vuelto exactamente a donde estaba. "Se restaura en un
+// finally" era una intencion; esto es la comprobacion.
+const selloFinal = sellar()
+if (selloFinal !== selloInicial) {
+  console.log('')
+  console.log('  EL ARBOL NO QUEDO COMO ESTABA. Algun archivo mutado no se restauro.')
+  console.log('  Corré `git status` y `git diff` antes de seguir.')
+  console.log('')
+  process.exit(1)
+}
 
 if (sobrevivientes.length > 0) {
   console.log(`\n  ${sobrevivientes.length} sobrevivieron. Cada una es un agujero en las pruebas:\n`)
