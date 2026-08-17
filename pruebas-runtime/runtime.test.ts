@@ -10,42 +10,45 @@
  *
  * QUE PRUEBAN Y QUE NO — leer esto antes de confiar en el numero de abajo.
  *
- * De las catorce pruebas de este archivo:
+ * De las diecinueve pruebas de este archivo:
  *
- *   · DOS estan ancladas a codigo de `src/` — las de `el Worker desplegado` — y
- *     hay una mutacion de `src/index.ts` que mata a cada una.
+ *   · DOCE estan ancladas a codigo de `src/` y tienen una mutacion que las mata:
+ *     las siete del esquema (ejecutan la cadena que exporta
+ *     `src/billetera/esquema.ts`, no una tabla de juguete), las tres de la
+ *     transaccion (llaman a `enUnaTransaccion` de `src/billetera/transaccion.ts`),
+ *     y las dos de `el Worker desplegado`.
  *   · CUATRO —las dos de aislamiento y las dos homonimas— prueban una convencion
- *     de este archivo y no una linea de produccion. TRES de las cuatro mueren por
+ *     de este archivo y no una linea de produccion. Tres de las cuatro mueren por
  *     su propia asercion con una mutacion del arnes; la cuarta (`el estado
- *     sobrevive dentro de una misma prueba`) es el estado que las otras necesitan
- *     y no la mata ninguna mutacion. La tercera vuelta de auditoria midio que la
- *     version anterior de este parrafo decia «las cubre» de las cuatro, y de las
- *     cuatro morian dos.
- *   · Las OCHO restantes son SONDAS DE LA PLATAFORMA: crean sus propias tablas y
- *     le hablan a la API de Cloudflare. Verifican que los mecanismos se comportan
- *     como la entrega siguiente va a suponer, y no pueden verificar que nuestro
- *     codigo los use, porque todavia no hay codigo nuestro que los use.
+ *     sobrevive dentro de una misma prueba`) es el estado que las otras necesitan.
+ *   · Las TRES restantes son SONDAS DE LA PLATAFORMA: las dos de la alarma y la de
+ *     `transactionSync`. Verifican que Cloudflare se comporta como suponemos, y no
+ *     pueden verificar que nuestro codigo lo use, porque todavia no hay codigo
+ *     nuestro que use la alarma. Eso lo cierra el vencimiento de reservas.
  *
- * Lo dice una auditoria de esta entrega, y queda escrito para que nadie lea
- * "53/53 mutaciones muertas" como si las catorce estuvieran cubiertas:
+ * LA LEY 5 YA TIENE ORACULO, y hasta esta entrega no lo tenia. La version anterior
+ * de este encabezado decia, medido por una auditoria:
  *
- *   Si `BilleteraDO` escribiera el asiento y el evento del outbox en dos `exec`
- *   sueltos, sin transaccion, las catorce pruebas de este archivo pasarian igual.
- *   La ley 5 NO tiene oraculo todavia.
+ *   «Si `BilleteraDO` escribiera el asiento y el evento del outbox en dos `exec`
+ *   sueltos, sin transaccion, las catorce pruebas de este archivo pasarian igual.»
  *
- * Lo que la entrega siguiente tiene que hacer para cerrarlo, y no es opcional:
+ * Era cierto: las pruebas llamaban a `ctx.storage.transaction()` directo, o sea
+ * comprobaban que Cloudflare implementa transacciones. Ahora llaman al helper de
+ * `src/`, y la mutacion «el asiento y el evento del outbox van en la MISMA
+ * transaccion» le saca la transaccion al helper y muere.
  *
- *   1. El DDL del DO vive en `src/`, exportado como constante, y estas pruebas
- *      ejecutan ESA cadena en vez de una tabla de juguete. Recien ahi se pueden
- *      agregar las mutaciones que le saquen `STRICT` y el `CHECK`.
- *   2. La transaccion vive en un helper de `src/`, y la prueba de rollback llama
- *      al helper. La mutacion que le saca la transaccion tiene que morir.
- *   3. Una prueba que llame al metodo publico del DO con una caida inyectada
- *      entre las dos escrituras — el patron que ya existe en `tests/arnes.ts`.
+ * Lo que TODAVIA falta para cerrar la ley 5 de punta a punta, y no es opcional:
+ * una prueba que llame al METODO PUBLICO del `BilleteraDO` con una caida inyectada
+ * entre la escritura del asiento y la del outbox — el patron que ya existe en
+ * `tests/arnes.ts`. Hoy se comprueba que el helper deshace; falta comprobar que el
+ * metodo del DO pasa por el helper. Eso llega cuando el DO se reescriba sobre este
+ * esquema, que es el resto de esta misma entrega.
  */
 import { env, SELF, runInDurableObject, runDurableObjectAlarm } from 'cloudflare:test'
 import { describe, it, expect } from 'vitest'
 import type { Entorno } from '../src/index.js'
+import { ESQUEMA } from '../src/billetera/esquema.js'
+import { enUnaTransaccion } from '../src/billetera/transaccion.js'
 
 /**
  * El `env` de las pruebas se tipa con `Cloudflare.Env`, que lo GENERA wrangler
@@ -149,44 +152,62 @@ function dentroDeMediaHora(): number {
   return Date.now() + 30 * 60 * 1000
 }
 
-describe('el SQLite del Durable Object', () => {
-  it('existe y guarda lo que se le escribe', async ({ task }) => {
-    const filas = await runInDurableObject(billetera(task), (_do, ctx) => {
-      ctx.storage.sql.exec('CREATE TABLE t (clave TEXT PRIMARY KEY, monto INTEGER NOT NULL) STRICT')
-      ctx.storage.sql.exec("INSERT INTO t (clave, monto) VALUES ('a', 100000)")
-      return [...ctx.storage.sql.exec<{ clave: string; monto: number }>('SELECT clave, monto FROM t')]
+/** Crea el esquema REAL del BilleteraDO. No una tabla de juguete: la cadena que
+ *  exporta `src/billetera/esquema.ts` y que el Durable Object va a ejecutar. */
+function crearEsquema(ctx: { storage: { sql: { exec: (s: string) => unknown } } }) {
+  for (const sentencia of ESQUEMA) ctx.storage.sql.exec(sentencia)
+}
+
+describe('el esquema real del Durable Object', () => {
+  it('se crea entero, y dos veces seguidas no rompe', async ({ task }) => {
+    // Lo segundo importa: el constructor del DO lo va a ejecutar en cada
+    // instanciacion, no solo la primera. De ahi los `IF NOT EXISTS`.
+    const tablas = await runInDurableObject(billetera(task), (_do, ctx) => {
+      crearEsquema(ctx)
+      crearEsquema(ctx)
+      return [
+        ...ctx.storage.sql.exec<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        ),
+      ].map((f) => f.name)
     })
 
-    expect(filas).toEqual([{ clave: 'a', monto: 100000 }])
+    expect(tablas).toEqual([
+      'aplicadas',
+      'asientos',
+      'bolsas',
+      'outbox',
+      'reservas',
+      'tomas',
+      'totales_ledger',
+    ])
   })
 
-  it('aplica STRICT: un entero no acepta texto', async ({ task }) => {
-    // Importa para la entrega siguiente: los guaranies van a vivir en columnas
-    // INTEGER, y STRICT es lo que impide que un '100000' de texto entre y ordene
-    // como texto.
+  it('aplica STRICT: un guarani de texto no entra en la columna del monto', async ({ task }) => {
+    // Sin STRICT, un '100000' de TEXTO entra y ordena como texto: '9' > '100000'.
+    // La restriccion tiene que estar adentro de la unica puerta al dinero.
     //
-    // El `CREATE TABLE` va AFUERA del try a proposito: si un DDL roto cayera
-    // adentro, su error haria pasar la prueba. Y se afirma sobre el MENSAJE, no
-    // sobre "hubo error": la version anterior usaba `expect(error).not.toBeNull()`
-    // y la auditoria la hizo pasar con un INSERT a una columna inexistente, o
-    // sea afirmando "algo tiro error" en vez de "STRICT manda".
+    // Se afirma sobre el MENSAJE y hay control positivo, porque «hubo un error» lo
+    // cumple tambien un INSERT a una columna que no existe.
     const r = await runInDurableObject(billetera(task), (_do, ctx) => {
-      ctx.storage.sql.exec('CREATE TABLE m (monto INTEGER NOT NULL) STRICT')
+      crearEsquema(ctx)
 
       let error: string | null = null
       try {
-        ctx.storage.sql.exec("INSERT INTO m (monto) VALUES ('cien mil')")
+        ctx.storage.sql.exec(
+          "INSERT INTO bolsas (tipo, monto, origen) VALUES ('disponible', 'cien mil', 'x')",
+        )
       } catch (e) {
         error = (e as Error).message
       }
 
-      // Control positivo: el INSERT valido SI entra. Sin esto no se distingue
-      // "la restriccion manda" de "el INSERT no funciona".
-      ctx.storage.sql.exec('INSERT INTO m (monto) VALUES (100000)')
+      ctx.storage.sql.exec(
+        "INSERT INTO bolsas (tipo, monto, origen) VALUES ('disponible', 100000, 'x')",
+      )
 
       return {
         error,
-        filas: [...ctx.storage.sql.exec<{ monto: number }>('SELECT monto FROM m')],
+        filas: [...ctx.storage.sql.exec<{ monto: number }>('SELECT monto FROM bolsas')],
       }
     })
 
@@ -194,33 +215,143 @@ describe('el SQLite del Durable Object', () => {
     expect(r.filas).toEqual([{ monto: 100000 }])
   })
 
-  it('aplica CHECK: una bolsa inventada no entra', async ({ task }) => {
-    // `ledger_copia` en D1 ya usa un CHECK para los tipos de bolsa, y
-    // `check-esquema.mjs` existe para que TypeScript y ese CHECK no se
-    // desincronicen. La entrega siguiente pone el MISMO CHECK adentro del DO,
-    // que es donde nace el asiento. Esta sonda confirma que ahi tambien manda.
+  it('aplica el CHECK: una bolsa inventada no entra', async ({ task }) => {
     const r = await runInDurableObject(billetera(task), (_do, ctx) => {
-      ctx.storage.sql.exec(
-        "CREATE TABLE b (tipo TEXT NOT NULL CHECK (tipo IN ('disponible', 'retenido'))) STRICT",
-      )
+      crearEsquema(ctx)
 
       let error: string | null = null
       try {
-        ctx.storage.sql.exec("INSERT INTO b (tipo) VALUES ('inventada')")
+        ctx.storage.sql.exec(
+          "INSERT INTO bolsas (tipo, monto, origen) VALUES ('inventada', 1, 'x')",
+        )
       } catch (e) {
         error = (e as Error).message
       }
 
-      ctx.storage.sql.exec("INSERT INTO b (tipo) VALUES ('retenido')")
+      ctx.storage.sql.exec("INSERT INTO bolsas (tipo, monto, origen) VALUES ('retenido', 1, 'x')")
 
       return {
         error,
-        filas: [...ctx.storage.sql.exec<{ tipo: string }>('SELECT tipo FROM b')],
+        filas: [...ctx.storage.sql.exec<{ tipo: string }>('SELECT tipo FROM bolsas')],
       }
     })
 
     expect(r.error).toMatch(/CHECK/i)
     expect(r.filas).toEqual([{ tipo: 'retenido' }])
+  })
+
+  it('una bolsa en cero o negativa no entra', async ({ task }) => {
+    // Una bolsa en cero no es una bolsa: es una fila que ensucia la precedencia.
+    // Y una en negativo es plata inventada.
+    const errores = await runInDurableObject(billetera(task), (_do, ctx) => {
+      crearEsquema(ctx)
+      const intentar = (monto: number) => {
+        try {
+          ctx.storage.sql.exec(
+            `INSERT INTO bolsas (tipo, monto, origen) VALUES ('disponible', ${monto}, 'x')`,
+          )
+          return null
+        } catch (e) {
+          return (e as Error).message
+        }
+      }
+      return { cero: intentar(0), negativa: intentar(-1), positiva: intentar(1) }
+    })
+
+    expect(errores.cero).toMatch(/CHECK/i)
+    expect(errores.negativa).toMatch(/CHECK/i)
+    expect(errores.positiva).toBeNull()
+  })
+
+  it('un asiento no se edita ni se borra: ley 2, hecha cumplir', async ({ task }) => {
+    const r = await runInDurableObject(billetera(task), (_do, ctx) => {
+      crearEsquema(ctx)
+      ctx.storage.sql.exec(
+        `INSERT INTO asientos (asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en)
+         VALUES ('a1', 'compra', -50000, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00Z')`,
+      )
+
+      const intentar = (sql: string) => {
+        try {
+          ctx.storage.sql.exec(sql)
+          return null
+        } catch (e) {
+          return (e as Error).message
+        }
+      }
+
+      return {
+        editar: intentar("UPDATE asientos SET monto = 0 WHERE asiento_id = 'a1'"),
+        borrar: intentar("DELETE FROM asientos WHERE asiento_id = 'a1'"),
+        quedan: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM asientos')],
+      }
+    })
+
+    expect(r.editar).toMatch(/no se edita/)
+    expect(r.borrar).toMatch(/no se borra/)
+    expect(r.quedan).toEqual([{ n: 1 }])
+  })
+
+  it('el mismo asiento_id no entra dos veces: un duplicado es un pago doble', async ({ task }) => {
+    const r = await runInDurableObject(billetera(task), (_do, ctx) => {
+      crearEsquema(ctx)
+      const insertar = () => {
+        try {
+          ctx.storage.sql.exec(
+            `INSERT INTO asientos (asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en)
+             VALUES ('a1', 'compra', -1, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00Z')`,
+          )
+          return null
+        } catch (e) {
+          return (e as Error).message
+        }
+      }
+      return { primero: insertar(), segundo: insertar() }
+    })
+
+    expect(r.primero).toBeNull()
+    expect(r.segundo).not.toBeNull()
+  })
+
+  it('consumido no puede superar el total de las tomas de la reserva', async ({ task }) => {
+    // LA COTA. `Reserva.consumido` existia declarado y nada lo acotaba: se podia
+    // consumir mas de lo reservado, y el remanente que vuelve al usuario habria
+    // salido negativo. Va como trigger porque un CHECK no puede mirar otra tabla.
+    const r = await runInDurableObject(billetera(task), (_do, ctx) => {
+      crearEsquema(ctx)
+      ctx.storage.sql.exec(
+        `INSERT INTO reservas (reserva_id, consumido, vence_en, estado)
+         VALUES ('r1', 0, '2026-08-17T00:30:00Z', 'abierta')`,
+      )
+      ctx.storage.sql.exec(
+        `INSERT INTO tomas (reserva_id, orden, tipo, monto, origen)
+         VALUES ('r1', 0, 'disponible', 30000, 'x')`,
+      )
+
+      const consumir = (monto: number) => {
+        try {
+          ctx.storage.sql.exec(`UPDATE reservas SET consumido = ${monto} WHERE reserva_id = 'r1'`)
+          return null
+        } catch (e) {
+          return (e as Error).message
+        }
+      }
+
+      return {
+        parcial: consumir(10000),
+        exacto: consumir(30000),
+        pasado: consumir(30001),
+        final: [...ctx.storage.sql.exec<{ consumido: number }>('SELECT consumido FROM reservas')],
+      }
+    })
+
+    // Consumir parte, y consumir el total, son los dos legitimos.
+    expect(r.parcial).toBeNull()
+    expect(r.exacto).toBeNull()
+    // Un guarani mas que el total, no.
+    expect(r.pasado).toMatch(/consumido no puede superar/)
+    // Y el rechazo no dejo el valor a medio escribir.
+    expect(r.final).toEqual([{ consumido: 30000 }])
   })
 })
 
@@ -230,13 +361,18 @@ describe('la transaccion de storage', () => {
     // misma transaccion. Esta sonda mide que el mecanismo cumple: una caida en
     // el medio no deja ni uno de los dos. Lo que NO mide —y esta escrito arriba—
     // es que nuestro codigo lo use.
-    const quedaron = await runInDurableObject(billetera(task), async (_do, ctx) => {
-      ctx.storage.sql.exec('CREATE TABLE asientos (id TEXT PRIMARY KEY) STRICT')
-      ctx.storage.sql.exec('CREATE TABLE outbox (id TEXT PRIMARY KEY) STRICT')
+    const quedaron = await runInDurableObject(billetera(task), (_do, ctx) => {
+      crearEsquema(ctx)
 
       try {
-        await ctx.storage.transaction(async () => {
-          ctx.storage.sql.exec("INSERT INTO asientos (id) VALUES ('a1')")
+        // Llama al helper de `src/`, no a la API de Cloudflare directo. Es lo que
+        // hace que exista UNA linea que romper: hay una mutacion que le saca la
+        // transaccion al helper y tiene que morir.
+        enUnaTransaccion(ctx, () => {
+          ctx.storage.sql.exec(
+            `INSERT INTO asientos (asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en)
+             VALUES ('a1', 'compra', -1, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00Z')`,
+          )
           throw new Error('caida inyectada entre el asiento y el evento')
         })
       } catch {
@@ -257,13 +393,18 @@ describe('la transaccion de storage', () => {
     // El par de la sonda de arriba. Una prueba de rollback sola pasaria igual si
     // la transaccion nunca escribiera nada: hay que verificar tambien que el
     // camino sano SI persiste, o no se distingue "deshizo" de "no hizo".
-    const quedaron = await runInDurableObject(billetera(task), async (_do, ctx) => {
-      ctx.storage.sql.exec('CREATE TABLE asientos (id TEXT PRIMARY KEY) STRICT')
-      ctx.storage.sql.exec('CREATE TABLE outbox (id TEXT PRIMARY KEY) STRICT')
+    const quedaron = await runInDurableObject(billetera(task), (_do, ctx) => {
+      crearEsquema(ctx)
 
-      await ctx.storage.transaction(async () => {
-        ctx.storage.sql.exec("INSERT INTO asientos (id) VALUES ('a1')")
-        ctx.storage.sql.exec("INSERT INTO outbox (id) VALUES ('e1')")
+      enUnaTransaccion(ctx, () => {
+        ctx.storage.sql.exec(
+          `INSERT INTO asientos (asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en)
+           VALUES ('a1', 'compra', -1, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00Z')`,
+        )
+        ctx.storage.sql.exec(
+          `INSERT INTO outbox (tipo, cuerpo, correlacion_id, creado_en)
+           VALUES ('billetera.debitada', '{}', 'c1', '2026-08-17T00:00:00Z')`,
+        )
       })
 
       return {
@@ -274,6 +415,25 @@ describe('la transaccion de storage', () => {
 
     expect(quedaron.asientos).toEqual([{ n: 1 }])
     expect(quedaron.outbox).toEqual([{ n: 1 }])
+  })
+
+  it('el helper devuelve lo que calculo adentro de la transaccion', async ({ task }) => {
+    // Que devuelva el valor no es cosmetico: sin eso, quien llama tiene que volver
+    // a consultar despues del commit para saber que quedo, y esa segunda consulta
+    // ya esta fuera de la transaccion.
+    const saldo = await runInDurableObject(billetera(task), (_do, ctx) => {
+      crearEsquema(ctx)
+      return enUnaTransaccion(ctx, () => {
+        ctx.storage.sql.exec(
+          "INSERT INTO bolsas (tipo, monto, origen) VALUES ('disponible', 100000, 'carga')",
+        )
+        return [
+          ...ctx.storage.sql.exec<{ total: number }>('SELECT SUM(monto) AS total FROM bolsas'),
+        ][0]?.total
+      })
+    })
+
+    expect(saldo).toBe(100000)
   })
 
   it('transactionSync tambien deshace, asi que la eleccion es nuestra y no forzada', async ({

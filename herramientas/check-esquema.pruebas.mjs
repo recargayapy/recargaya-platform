@@ -11,7 +11,13 @@
  */
 
 import assert from 'node:assert/strict'
-import { compararEsquemas, extraerTipoBolsa, extraerCheckBolsa } from './check-esquema.mjs'
+import {
+  compararEsquemas,
+  compararOrden,
+  extraerTipoBolsa,
+  extraerCheckBolsa,
+  extraerTiposDelEsquemaDO,
+} from './check-esquema.mjs'
 
 assert.deepEqual(
   compararEsquemas(['disponible', 'retenido'], ['disponible', 'retenido']),
@@ -41,6 +47,32 @@ assert.deepEqual(
 assert.throws(() => extraerTipoBolsa('nada por aca'), /no se encontro/)
 assert.throws(() => extraerCheckBolsa('nada por aca'), /no se encontro/)
 
+// --- la tercera frontera: el esquema del Durable Object -------------------
+
+assert.deepEqual(
+  extraerTiposDelEsquemaDO(
+    "export const TIPOS_DE_BOLSA = [\n  'disponible',\n  'retenido',\n] as const\n",
+  ),
+  ['disponible', 'retenido'],
+)
+
+assert.deepEqual(
+  extraerTiposDelEsquemaDO("export const TIPOS_DE_BOLSA = ['a'] as const"),
+  ['a'],
+)
+
+assert.throws(() => extraerTiposDelEsquemaDO('nada por aca'), /no se encontro/)
+
+// El orden importa entre TypeScript y el DO, porque la lista del DO se interpola
+// dentro de los CHECK del DDL.
+assert.equal(compararOrden(['a', 'b'], ['a', 'b']).ok, true)
+assert.equal(compararOrden(['a', 'b'], ['b', 'a']).ok, false)
+assert.deepEqual(compararOrden(['a', 'b'], ['b', 'a']), {
+  ok: false,
+  tipos: ['a', 'b'],
+  delDO: ['b', 'a'],
+})
+
 
 
 // --- de punta a punta ------------------------------------------------------
@@ -65,6 +97,7 @@ const RAIZ = fileURLToPath(new URL('..', import.meta.url))
 function correrSobreCopia(perturbar) {
   const dir = mkdtempSync(join(tmpdir(), 'check-esquema-'))
   try {
+    // Si el oraculo crece y necesita otro archivo, agregalo a esta lista.
     for (const x of ['herramientas', 'src', 'migraciones']) {
       cpSync(join(RAIZ, x), join(dir, x), { recursive: true })
     }
@@ -104,6 +137,35 @@ const MIGRACION = ['migraciones', 'core', '0001_cimientos.sql']
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /se desincronizaron/)
   assert.match(r.salida, /retenido/)
+}
+
+// Un tipo de bolsa que le falta al esquema del DO. Es la frontera nueva, y la mas
+// peligrosa: gobierna la tabla donde nace el asiento.
+{
+  const r = correrSobreCopia((dir) => {
+    const p = join(dir, 'src', 'billetera', 'esquema.ts')
+    writeFileSync(p, readFileSync(p, 'utf8').replace("  'retenido',\n", ''))
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /esquema del Durable Object se desincronizaron/)
+  assert.match(r.salida, /retenido/)
+}
+
+// Los mismos tipos en distinto orden: no rompe ninguna operacion, pero cambia el
+// DDL generado, y se reporta aparte para no confundirlo con un descuadre.
+{
+  const r = correrSobreCopia((dir) => {
+    const p = join(dir, 'src', 'billetera', 'esquema.ts')
+    writeFileSync(
+      p,
+      readFileSync(p, 'utf8').replace(
+        "  'disponible',\n  'ganancia_creador',",
+        "  'ganancia_creador',\n  'disponible',",
+      ),
+    )
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /DISTINTO ORDEN/)
 }
 
 console.log('  check-esquema.pruebas: OK (incluidas las de punta a punta)')
