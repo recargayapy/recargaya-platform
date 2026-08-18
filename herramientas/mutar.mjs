@@ -191,8 +191,16 @@ const MUTACIONES = [
     // TypeScript, y el CHECK vive en SQL, del otro lado de esa frontera. Es
     // justo la frontera donde se escondio el defecto de la auditoria — el
     // agujero que `check-esquema.mjs` existe para cerrar.
+    //
+    // APUNTA A 0002 Y NO A 0001, y eso cambio en la ronda de arreglos de la 1.2.
+    // 0002 reconstruye `ledger_copia`, asi que su CHECK es el que gobierna; el
+    // oraculo pasa a comparar solo ese —comparar tambien los historicos obligaba a
+    // editar migraciones ya aplicadas para poder agregar un valor—. Con la mutacion
+    // sobre 0001 SOBREVIVIA, y sobrevivia con razon: perturbar la definicion de una
+    // tabla que 0002 vuelve a crear no cambia el esquema que la base termina
+    // teniendo. La mutacion sigue al invariante, no al archivo.
     invariante: 'el CHECK de ledger_copia incluye retenido',
-    archivo: 'migraciones/core/0001_cimientos.sql',
+    archivo: 'migraciones/core/0002_eventos_de_la_billetera.sql',
     de: "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion', 'retenido'))",
     a: "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion'))",
     oraculo: conNode('herramientas/check-esquema.mjs'),
@@ -387,10 +395,13 @@ const MUTACIONES = [
     oraculo: ORACULO_RUNTIME,
   },
   {
+    // La entrega 1.2 movio el 404 de `index.ts` al enrutador, que es donde ahora
+    // viven todas las rutas. La mutacion lo sigue: una que apunta a un fragmento
+    // inexistente no muta nada, y `mutar.mjs` la reporta como sobreviviente.
     invariante: 'una ruta desconocida da 404 y no otra cosa',
-    archivo: 'src/index.ts',
-    de: "    return new Response('no encontrado', { status: 404 })",
-    a: "    return new Response('no encontrado', { status: 500 })",
+    archivo: 'src/api/rutas.ts',
+    de: "  throw new Problema(404, 'no_encontrado')",
+    a: "  throw new Problema(500, 'no_encontrado')",
     oraculo: ORACULO_RUNTIME,
   },
 
@@ -551,10 +562,15 @@ const MUTACIONES = [
     // `check-esquema.mjs` leia SOLO `0001_cimientos.sql` con la ruta escrita a
     // mano, y 0002 reconstruye `ledger_copia`: el oraculo habria seguido aprobando
     // la definicion de una tabla que ya no existe.
-    invariante: 'check-esquema mira TODAS las migraciones, no la primera',
+    // Cambio de la ronda de arreglos de la 1.2: el oraculo ya no compara TODAS las
+    // declaraciones historicas —eso obligaba a editar una migracion ya aplicada para
+    // poder agregar un valor— sino la ULTIMA, que es la que gobierna. La mutacion
+    // sigue al invariante: mirar la primera es mirar la definicion que la base ya no
+    // tiene.
+    invariante: 'check-esquema compara la ULTIMA declaracion, que es la que gobierna',
     archivo: 'herramientas/check-esquema.mjs',
-    de: '  for (const { archivo, check } of enSql) {',
-    a: '  for (const { archivo, check } of enSql.slice(0, 1)) {',
+    de: '  return enSql[enSql.length - 1]',
+    a: '  return enSql[0]',
     oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
   },
   {
@@ -709,8 +725,8 @@ const MUTACIONES = [
   {
     invariante: 'check-esquema compara tambien el esquema del Durable Object',
     archivo: 'herramientas/check-esquema.mjs',
-    de: '  const contraDO = compararEsquemas(tipos, delDO)\n  if (!contraDO.ok) {',
-    a: '  const contraDO = compararEsquemas(tipos, delDO)\n  if (false) {',
+    de: '  const contraDO = compararEsquemas(tiposDeBolsa, delDO)\n  if (!contraDO.ok) {',
+    a: '  const contraDO = compararEsquemas(tiposDeBolsa, delDO)\n  if (false) {',
     oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
   },
   {
@@ -1170,6 +1186,480 @@ const MUTACIONES = [
     de: '  readonly CORE: D1Database\n',
     a: '  readonly CORE: any\n',
     oraculo: ORACULO_TIPOS,
+  },
+  {
+    // --- La entrega 1.2: identidad, capacidades y el primer endpoint ---------
+  // Las de este bloque atacan lo que la 1.2 trajo. Las que nombran una ley la
+  // nombran a proposito: si sobreviven, la ley no esta probada, esta escrita.
+    invariante: "una cuenta cerrada no puede nada, aunque tenga la capacidad vigente",
+    archivo: "src/identidad/capacidades.ts",
+    de: "  if (persona.estado === 'cerrada') return no('persona_cerrada')\n",
+    a: "",
+  },
+  {
+    invariante: "una cuenta suspendida tampoco",
+    archivo: "src/identidad/capacidades.ts",
+    de: "  if (persona.estado === 'suspendida') return no('persona_suspendida')\n",
+    a: "",
+  },
+  {
+    invariante: "una capacidad no vale antes de que la otorguen",
+    archivo: "src/identidad/capacidades.ts",
+    de: "  if (o.desde > momento) return false\n",
+    a: "",
+  },
+  {
+    invariante: "el hasta es EXCLUSIVE: en su propio instante la capacidad ya no vale",
+    archivo: "src/identidad/capacidades.ts",
+    de: "  if (o.hasta !== null && o.hasta <= momento) return false",
+    a: "  if (o.hasta !== null && o.hasta < momento) return false",
+  },
+  {
+    // LEY 4. La vigencia es una union de ventanas y no puede depender del orden de
+  // las filas. Esta mutacion es literalmente "mira la primera": si sobrevive, la
+  // ley esta escrita en un comentario y no en el codigo.
+    invariante: "la vigencia no depende del orden de las filas (ley 4)",
+    archivo: "src/identidad/capacidades.ts",
+    de: "  if (suyas.some((o) => vigente(o, momento))) return SI",
+    a: "  if (suyas.length > 0 && vigente(suyas[0], momento)) return SI",
+  },
+  {
+    invariante: "entre una vencida y una futura, el motivo declarado es vencida",
+    archivo: "src/identidad/capacidades.ts",
+    de: "  if (suyas.some((o) => o.hasta !== null && o.hasta <= momento)) return no('capacidad_vencida')\n  if (suyas.some((o) => o.desde > momento)) return no('capacidad_futura')",
+    a: "  if (suyas.some((o) => o.desde > momento)) return no('capacidad_futura')\n  if (suyas.some((o) => o.hasta !== null && o.hasta <= momento)) return no('capacidad_vencida')",
+  },
+  {
+    invariante: "las ventanas de OTRA capacidad no contestan por esta",
+    archivo: "src/identidad/capacidades.ts",
+    de: "  const suyas = persona.otorgamientos.filter((o) => o.capacidad === capacidad)",
+    a: "  const suyas = [...persona.otorgamientos]",
+  },
+  {
+    invariante: "las capacidades vigentes salen en el orden declarado, no en el de las filas",
+    archivo: "src/identidad/capacidades.ts",
+    de: "  return CAPACIDADES.filter((c) => puede(persona, c, momento).puede)",
+    a: "  return [...new Set(persona.otorgamientos.map((o) => o.capacidad))].filter(\n    (c) => puede(persona, c, momento).puede,\n  )",
+  },
+  {
+    invariante: "una ventana no puede terminar antes de empezar",
+    archivo: "src/identidad/capacidades.ts",
+    de: "  if (hasta !== null && hasta < desde) {",
+    a: "  if (false) {",
+  },
+  {
+    invariante: "un otorgamiento no entra con una capacidad inventada",
+    archivo: "src/identidad/capacidades.ts",
+    de: "  if (!esCapacidad(fila.capacidad)) {",
+    a: "  if (false) {",
+  },
+  {
+    invariante: "la ventana del token vence cuando la alcanza, no despues",
+    archivo: "src/identidad/actor.ts",
+    de: "  if (edad >= ventana_ms) return 'vencido'",
+    a: "  if (edad > ventana_ms) return 'vencido'",
+  },
+  {
+    invariante: "un reloj apenas adelantado se perdona, uno que miente no",
+    archivo: "src/identidad/actor.ts",
+    de: "  if (-edad > margen_ms) return 'del_futuro'",
+    a: "  if (-edad >= margen_ms) return 'del_futuro'",
+  },
+  {
+    invariante: "una firma que no verifica no entra",
+    archivo: "src/identidad/actor.ts",
+    de: "  if (!valida) throw new TokenInvalido('firma_invalida')\n",
+    a: "",
+  },
+  {
+    // Si la version quedara fuera de lo firmado, cambiar `v1` por `v2` no
+  // invalidaria nada — y el dia que exista un v2 con otras reglas, eso seria una
+  // forma de elegir cual se aplica.
+    invariante: "una version de token que no conocemos se rechaza, no se interpreta",
+    archivo: "src/identidad/actor.ts",
+    de: "  if (version !== PREFIJO) throw new TokenInvalido('version_desconocida')\n",
+    a: "",
+  },
+  {
+    invariante: "un token de persona sin id no se completa con un valor por defecto",
+    archivo: "src/identidad/actor.ts",
+    de: "    if (typeof persona_id !== 'string' || persona_id.length === 0) {",
+    a: "    if (false) {",
+  },
+  {
+    // La forma exacta en que esto se rompe en la vida real: alguien pone un valor
+  // por defecto "para que no explote". La puerta queda abierta con un secreto que
+  // conoce cualquiera que lea el codigo.
+    invariante: "sin secreto la puerta se cierra, no se inventa uno",
+    archivo: "src/identidad/actor.ts",
+    de: "  if (s.length < LARGO_MINIMO_DEL_SECRETO) throw new TokenInvalido('secreto_debil')",
+    a: "",
+  },
+  {
+    invariante: "la ley 9 se revisa a cualquier profundidad",
+    archivo: "src/bitacora/bitacora.ts",
+    de: "    revisarDetalle(valor)\n",
+    a: "",
+  },
+  {
+    invariante: "la lista de claves personales no se escapa por mayusculas",
+    archivo: "src/bitacora/bitacora.ts",
+    de: "    if (CLAVES_PERSONALES.includes(clave.toLowerCase())) throw new DatoPersonalEnBitacora(clave)",
+    a: "    if (CLAVES_PERSONALES.includes(clave)) throw new DatoPersonalEnBitacora(clave)",
+  },
+  {
+    invariante: "la correlacion que entra de afuera esta acotada en largo y alfabeto",
+    archivo: "src/api/rutas.ts",
+    de: "const CORRELACION_VALIDA = /^[A-Za-z0-9:_-]{1,64}$/",
+    a: "const CORRELACION_VALIDA = /^[^]*$/",
+  },
+  {
+    invariante: "administrar cuentas ajenas es solo de la plataforma",
+    archivo: "src/api/rutas.ts",
+    de: "  if (actor.tipo !== 'plataforma') throw new Problema(403, 'solo_la_plataforma')",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "nadie mira la billetera de otro",
+    archivo: "src/api/rutas.ts",
+    de: "  throw new Problema(403, 'no_es_tuyo')",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // EL ORDEN, que es toda la decision de donde se escribe la bitacora. Sin este
+  // await, la plata se mueve y el renglon que dice quien la pidio puede no llegar
+  // nunca. El oraculo es la prueba que le esconde la tabla a proposito.
+    invariante: "no se acredita sin haber escrito antes la intencion",
+    archivo: "src/api/rutas.ts",
+    de: "  await registrarIntencion(dep.CORE, {\n    actor_id: actorId(actor),\n    accion: 'billetera.acreditacion.pedida',\n    objetivo: persona.billetera_id,\n    detalle: { persona_id, monto, bolsa, clave_idem },\n    correlacion_id,\n    ocurrido_en: momento,\n  })\n",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "el motivo del rechazo no sale por la respuesta",
+    archivo: "src/api/rutas.ts",
+    de: "      return json({ error: 'no_autorizado', correlacion_id }, 401, correlacion_id)",
+    a: "      return json({ error: 'no_autorizado', motivo: e.motivo, correlacion_id }, 401, correlacion_id)",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Una revocacion que no ocurrio no puede quedar escrita como si hubiera
+  // ocurrido. Un registro de auditoria que dice algo que no paso es peor que no
+  // tener registro: al segundo se le busca la vuelta, al primero se le cree.
+    invariante: "una revocacion que no ocurrio no se escribe en la bitacora",
+    archivo: "src/identidad/personas.ts",
+    de: "    sentenciaDeBitacoraSi(\n      d1,",
+    a: "    sentenciaDeBitacora(\n      d1,",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "no puede haber dos ventanas abiertas de la misma capacidad",
+    archivo: "migraciones/core/0003_identidad.sql",
+    de: "CREATE UNIQUE INDEX IF NOT EXISTS idx_capacidad_abierta_unica",
+    a: "CREATE INDEX IF NOT EXISTS idx_capacidad_abierta_unica",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "la base tampoco acepta una ventana que termina antes de empezar",
+    archivo: "migraciones/core/0003_identidad.sql",
+    de: "  CHECK (hasta IS NULL OR hasta >= otorgada_en),\n",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "dos personas no pueden compartir billetera",
+    archivo: "migraciones/core/0003_identidad.sql",
+    de: "CREATE UNIQUE INDEX IF NOT EXISTS idx_personas_billetera",
+    a: "CREATE INDEX IF NOT EXISTS idx_personas_billetera",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "el instante entra a capacidades con una sola forma escrita",
+    archivo: "migraciones/core/0003_identidad.sql",
+    de: "  CHECK (otorgada_en LIKE '____-__-__T__:__:__.___Z' AND NOT otorgada_en GLOB '*[^0-9.:TZ-]*'),\n",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El CHECK vive del otro lado de la frontera de TypeScript: ni los tipos, ni
+  // vitest, ni la mutacion del nucleo lo miran. Solo este oraculo.
+    invariante: "el CHECK de capacidades incluye distribuidor",
+    archivo: "migraciones/core/0003_identidad.sql",
+    de: "CHECK (capacidad IN ('cliente', 'vendedor', 'creador', 'distribuidor'))",
+    a: "CHECK (capacidad IN ('cliente', 'vendedor', 'creador'))",
+    oraculo: conNode('herramientas/check-esquema.mjs'),
+  },
+  {
+    invariante: "check-esquema mira TODAS las fronteras declaradas, no la primera",
+    archivo: "herramientas/check-esquema.mjs",
+    de: "  for (const frontera of FRONTERAS) {",
+    a: "  for (const frontera of FRONTERAS.slice(0, 1)) {",
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    invariante: "check-esquema sigue el renombre de una tabla reconstruida",
+    archivo: "herramientas/check-esquema.mjs",
+    de: "    const siguiente = renombres.find(\n      (r) => r.de === actual && (r.posicion === undefined || r.posicion > posicion),\n    )",
+    a: "    const siguiente = undefined",
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    invariante: "check-esquema falla si una frontera no tiene ningun CHECK que mirar",
+    archivo: "herramientas/check-esquema.mjs",
+    de: "    if (enSql.length === 0) {",
+    a: "    if (false) {",
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    invariante: "la billetera se nombra con su NOMBRE, no con su hash",
+    archivo: "src/index.ts",
+    de: "    const nombre = this.ctx.id.name\n",
+    a: "    const nombre = this.ctx.id.toString()\n",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "una persona no puede quedar sin billetera_id",
+    archivo: "migraciones/core/0003_identidad.sql",
+    de: "CREATE TRIGGER IF NOT EXISTS personas_exigen_billetera_al_insertar\nBEFORE INSERT ON personas\nWHEN NEW.billetera_id IS NULL\nBEGIN\n  SELECT RAISE(ABORT, 'una persona sin billetera_id no es una persona');\nEND;\n",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "un registro de auditoria no se edita",
+    archivo: "migraciones/core/0003_identidad.sql",
+    de: "CREATE TRIGGER IF NOT EXISTS bitacora_sin_update\nBEFORE UPDATE ON bitacora\nBEGIN\n  SELECT RAISE(ABORT, 'un registro de auditoria no se edita');\nEND;\n",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "un registro de auditoria no se borra",
+    archivo: "migraciones/core/0003_identidad.sql",
+    de: "CREATE TRIGGER IF NOT EXISTS bitacora_sin_delete\nBEFORE DELETE ON bitacora\nBEGIN\n  SELECT RAISE(ABORT, 'un registro de auditoria no se borra');\nEND;\n",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Con el mismo secreto en los dos entornos —el movimiento natural de quien lo pone
+  // a mano dos veces— esto es lo unico que impide que un token de staging acredite
+  // guaranies de verdad.
+    invariante: "un token de otro entorno no entra",
+    archivo: "src/identidad/actor.ts",
+    de: "  if (interpretado.entorno !== entorno) throw new TokenInvalido('entorno_ajeno')\n",
+    a: "",
+  },
+  {
+    invariante: "el persona_id que entra de afuera tiene alfabeto",
+    archivo: "src/api/rutas.ts",
+    de: "    if (pedido !== undefined && !personaIdValido(pedido)) {",
+    a: "    if (false) {",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "nadie puede llamarse como se llama la plataforma en la bitacora",
+    archivo: "src/api/rutas.ts",
+    de: "    !IDS_RESERVADOS.includes(valor.toLowerCase())",
+    a: "    true",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El guarda va ANTES de leer el cuerpo. `acreditar()` igual lo repite adentro, asi
+  // que sacarlo de acá no abre la puerta: lo que cambia es que el Worker parsea el
+  // cuerpo entero de alguien que no tenia por que llegar hasta ahi.
+    invariante: "en la ruta que crea dinero, el guarda corre antes que el cuerpo",
+    archivo: "src/api/rutas.ts",
+    de: "    exigirPlataforma(actor)\n    return acreditar(dep, actor, correlacion_id, momento, await cuerpoJson(peticion))",
+    a: "    return acreditar(dep, actor, correlacion_id, momento, await cuerpoJson(peticion))",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "un vence_en mal escrito se rechaza en la puerta, no adentro del DO",
+    archivo: "src/api/rutas.ts",
+    de: "  let vence_en: string | null\n  try {\n    vence_en = instanteOpcional(cuerpo['vence_en'])\n  } catch {\n    throw new Problema(400, 'vence_en_invalido')\n  }",
+    a: "  const vence_en = (cuerpo['vence_en'] ?? null) as string | null",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "no se acredita plata que nace vencida",
+    archivo: "src/api/rutas.ts",
+    de: "  if (vence_en !== null && vence_en <= momento) {",
+    a: "  if (false) {",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "el credito de promocion no entra sin vencimiento (ley 11), en la puerta",
+    archivo: "src/api/rutas.ts",
+    de: "  if (bolsa === 'credito_promocion' && vence_en === null) {",
+    a: "  if (false) {",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "los textos libres que van al ledger estan acotados",
+    archivo: "src/api/rutas.ts",
+    de: "  if (valor.length > LARGO_MAXIMO_DE_TEXTO) throw new Problema(400, 'texto_demasiado_largo')\n",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // La condicion de la bitacora tiene que ser el MISMO predicado que decide el
+  // cambio. Esta mutacion la vuelve a la que tenia la primera version —el valor
+  // recien escrito— que con la sentencia ahora PRIMERO no encuentra nada y deja la
+  // revocacion sin registro. Antes dejaba un registro de mas; ahora dejaria uno de
+  // menos. Las dos son mentiras distintas del mismo error.
+    invariante: "la bitacora de la revocacion pregunta lo mismo que el UPDATE",
+    archivo: "src/identidad/personas.ts",
+    de: "        sql: 'SELECT 1 FROM capacidades WHERE persona_id = ? AND capacidad = ? AND hasta IS NULL',\n        valores: [persona_id, capacidad],",
+    a: "        sql: 'SELECT 1 FROM capacidades WHERE persona_id = ? AND capacidad = ? AND hasta = ?',\n        valores: [persona_id, capacidad, ctx.momento],",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "ninguna tabla del nucleo se declara sin STRICT",
+    archivo: "herramientas/check-esquema.mjs",
+    de: "      if (!t.estricta) salida.push({ archivo, tabla: t.tabla })",
+    a: "      if (false) salida.push({ archivo, tabla: t.tabla })",
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    invariante: "check-esquema distingue una tabla STRICT de una que no lo es",
+    archivo: "herramientas/check-esquema.mjs",
+    de: "estricta: /\\bSTRICT\\b/i.test(m[3])",
+    a: "estricta: true",
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    // SEGUNDA VUELTA DE AUDITORIA: los defectos que nacieron de los arreglos de la
+  // primera. Cada uno tenia consecuencia medida, y varios eran de plata.
+    invariante: "restringida_a ausente es null, no cadena vacia",
+    archivo: "src/api/rutas.ts",
+    de: "function textoOpcional(valor: unknown): string | null {\n  if (valor === undefined || valor === null) return null\n  if (typeof valor !== 'string') throw new Problema(400, 'texto_invalido')\n  if (valor.length === 0) return null\n  return acotar(valor)\n}",
+    a: "function textoOpcional(valor: unknown): string | null {\n  if (valor === undefined) return null\n  if (typeof valor !== 'string') throw new Problema(400, 'texto_invalido')\n  return acotar(valor)\n}",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "la clave de idempotencia esta acotada",
+    archivo: "src/api/rutas.ts",
+    de: "  if (!CLAVE_IDEM_VALIDA.test(clave_idem)) throw new Problema(400, 'clave_idem_invalida')\n",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "un persona_id no puede llevar los dos puntos del prefijo de la billetera",
+    archivo: "src/api/rutas.ts",
+    de: "const PERSONA_VALIDA = /^[A-Za-z0-9_-]{1,64}$/",
+    a: "const PERSONA_VALIDA = /^[A-Za-z0-9:_-]{1,64}$/",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "una ventana ya ocupada da 409 y no un 500 opaco",
+    archivo: "src/identidad/personas.ts",
+    de: "  const ocupada = persona.otorgamientos.some(\n    (o) => o.capacidad === capacidad && o.desde === ctx.momento,\n  )\n  if (ocupada) throw new VentanaYaOcupada(persona_id, capacidad, ctx.momento)\n",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "un registro de auditoria no se pisa con un REPLACE",
+    archivo: "migraciones/core/0003_identidad.sql",
+    de: "CREATE TRIGGER IF NOT EXISTS bitacora_sin_pisar\nBEFORE INSERT ON bitacora\nWHEN EXISTS (SELECT 1 FROM bitacora WHERE id = NEW.id)\nBEGIN\n  SELECT RAISE(ABORT, 'un registro de auditoria no se pisa');\nEND;\n",
+    a: "",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El cambio y su registro entran juntos o no entra ninguno. La mutacion los
+  // convierte en dos escrituras sueltas: con la bitacora resuelta aparte, un INSERT
+  // de persona que falla deja el renglon huerfano.
+    invariante: "el cambio y su registro entran en la MISMA transaccion",
+    archivo: "src/identidad/personas.ts",
+    de: "  return d1.batch(sentencias)",
+    a: "  return Promise.all(sentencias.map((x) => x.run()))",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "el SQL que esta adentro de un comentario no es SQL",
+    archivo: "herramientas/check-esquema.mjs",
+    de: "  return sql.replace(/--[^\\n]*/g, '')",
+    a: "  return sql",
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    invariante: "el oraculo ordena las migraciones como las aplica wrangler",
+    archivo: "herramientas/check-esquema.mjs",
+    de: "    if (Number.isNaN(na) || Number.isNaN(nb) || na === nb) return a < b ? -1 : a > b ? 1 : 0\n    return na - nb",
+    a: "    return a < b ? -1 : a > b ? 1 : 0",
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    invariante: "un renombre solo alcanza a lo declarado antes que el",
+    archivo: "herramientas/check-esquema.mjs",
+    de: "      (r) => r.de === actual && (r.posicion === undefined || r.posicion > posicion),",
+    a: "      (r) => r.de === actual,",
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    invariante: "el secreto debil tiene su propio motivo",
+    archivo: "src/identidad/actor.ts",
+    de: "  if (s.length < LARGO_MINIMO_DEL_SECRETO) throw new TokenInvalido('secreto_debil')",
+    a: "  if (s.length < LARGO_MINIMO_DEL_SECRETO) throw new TokenInvalido('sin_secreto')",
+  },
+  {
+    invariante: "una firma ilegible dice que la firma es ilegible",
+    archivo: "src/identidad/actor.ts",
+    de: "    throw new TokenInvalido('firma_ilegible')",
+    a: "    throw new TokenInvalido('cuerpo_ilegible')",
+  },
+  {
+    invariante: "un token de persona no puede llamarse como la plataforma",
+    archivo: "src/identidad/actor.ts",
+    de: "    if (RESERVADOS.includes(persona_id.toLowerCase())) throw new TokenInvalido('cuerpo_invalido')\n",
+    a: "",
+  },
+  {
+    // La herramienta que emite tokens. Su oraculo es que el token que emite lo
+  // VERIFIQUE la puerta — o sea el mismo codigo que corre en el Worker. Es lo unico
+  // que hace que «no se duplica la logica de firma» sea un hecho.
+    invariante: "el token se emite para un entorno declarado, nunca por defecto",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "  if (opciones.entorno === null) {",
+    a: "  if (false) {",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    invariante: "--persona sin valor no cae en la plataforma",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "      if (valor === undefined || valor.startsWith('--')) throw new Error(`${arg} necesita un valor`)",
+    a: "      if (valor === undefined) throw new Error(`${arg} necesita un valor`)",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    invariante: "un argumento desconocido se rechaza en vez de ignorarse",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "    else throw new Error(`argumento desconocido: ${arg}`)",
+    a: "    else i += 0",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    invariante: "el secreto explicito gana sobre el guardado",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "  if (typeof delArgumento === 'string' && delArgumento.length > 0) return delArgumento\n",
+    a: "",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    invariante: "una cadena vacia no es un secreto",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "  if (typeof delEntorno === 'string' && delEntorno.length > 0) return delEntorno",
+    a: "  if (typeof delEntorno === 'string') return delEntorno",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    // Sin `bundle`, el import del modulo real muere resolviendo `momento.js` — que es
+  // exactamente el motivo por el que esta herramienta bundlea en vez de copiar la
+  // firma. Si esto sobreviviera, seria que las pruebas no cargan el codigo de verdad.
+    invariante: "la herramienta carga el modulo de verdad, no un cascaron",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "      bundle: true,",
+    a: "      bundle: false,",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
   },
 ]
 

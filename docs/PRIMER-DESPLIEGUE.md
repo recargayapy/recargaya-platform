@@ -136,3 +136,79 @@ npx wrangler secret put NOMBRE_DEL_SECRETO --env staging
 Quedan guardados dentro de Cloudflare, cifrados, y ni vos ni nadie los vuelve a
 leer. Es otra cosa distinta del `CLOUDFLARE_API_TOKEN`: ése es la llave para
 desplegar, éstos son las llaves que usa la aplicación cuando corre.
+
+---
+
+## `SECRETO_SERVICIO` — desde la entrega 1.2, sin esto la puerta no abre
+
+El primer endpoint identifica a quien llama con un token firmado, y la firma sale
+de un secreto que **tenés que cargar vos**, una vez por entorno:
+
+```bash
+# generá uno al azar y guardalo donde guardes tus contraseñas
+openssl rand -base64 48
+
+npx wrangler secret put SECRETO_SERVICIO --env staging
+```
+
+Tres cosas que conviene saber antes, porque cada una tiene su síntoma:
+
+**Tiene un largo mínimo de 32 caracteres.** Uno más corto se rechaza y la puerta
+queda cerrada para todos. El log lo dice con esas palabras —«es más corto que el
+mínimo»— y no «no está configurado», que es lo que decía antes y mandaba a
+buscar el `wrangler secret put` que ya habías hecho.
+
+**Si no lo cargás, el Worker responde 401 a todo.** Es a propósito: un despliegue
+sin secreto es una puerta sin cerradura, y preferimos que no entre nadie a que
+entre cualquiera. `/salud` sigue contestando, así que el despliegue no se ve
+roto — mirá el log.
+
+**Usá uno DISTINTO en staging y en producción.** El token lleva adentro el
+nombre del entorno, así que uno de staging no sirve en producción aunque el
+secreto fuera el mismo. Igual, que sean distintos es la línea de defensa que no
+depende de que nadie se haya olvidado de nada.
+
+---
+
+## Cómo hablarle a la puerta
+
+El endpoint pide un token firmado. Para emitir uno:
+
+```bash
+SECRETO_SERVICIO="el-que-cargaste" npm run token -- --entorno staging
+```
+
+En PowerShell:
+
+```powershell
+$env:SECRETO_SERVICIO = "el-que-cargaste"
+npm run token -- --entorno staging
+```
+
+**Qué esperar:** una línea larga que empieza con `v1.`, y abajo un aviso de
+cuántos minutos vale. **Vale cinco minutos**; después emitís otro.
+
+Con eso ya podés tocar las rutas:
+
+```bash
+TOKEN=$(SECRETO_SERVICIO="..." npm run token --silent -- --entorno staging)
+
+curl -s -X POST https://recargaya-staging.TU-SUBDOMINIO.workers.dev/personas \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"persona_id":"prueba-1"}'
+```
+
+**Qué esperar:** un JSON con `"estado":"activa"` y el `billetera_id` derivado.
+
+Si te devuelve `401 no_autorizado`, es una de tres: el secreto que usaste para
+emitir no es el que está cargado en Cloudflare, el token pasó los cinco minutos,
+o lo emitiste para el entorno equivocado. La respuesta **no dice cuál** a
+propósito —eso le ahorraría trabajo a quien esté probando la puerta— pero el log
+del Worker sí lo dice. Lo ves con `npx wrangler tail --env staging`.
+
+Para un token que actúe como una persona y no como la plataforma:
+
+```bash
+npm run token -- --entorno staging --persona prueba-1
+```

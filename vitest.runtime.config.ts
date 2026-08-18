@@ -72,16 +72,29 @@ export default defineConfig({
       // contra la base de produccion ni por accidente ni por cuatro segundos.
       remoteBindings: false,
 
-      // El unico binding que las pruebas agregan, y no es un recurso de
-      // Cloudflare: es el texto de las migraciones, para que el archivo de pruebas
-      // pueda aplicarlas con `applyD1Migrations`.
+      // Los bindings que las pruebas agregan. Ninguno de los dos se declara en
+      // `wrangler.jsonc`, y por motivos distintos:
       //
-      // NO se declara en `wrangler.jsonc` ni entra en `Entorno`. Los guardas de
-      // deriva de `runtime.test.ts` comparan las claves de `Cloudflare.Env` contra
-      // las de `Entorno`, y un binding que solo existe en las pruebas los cegaria:
-      // habria que aflojar el guarda para agregarlo. Se lee con un cast local y
-      // documentado, que es el precio correcto.
-      miniflare: { bindings: { MIGRACIONES: migraciones } },
+      // `MIGRACIONES` no es un recurso de Cloudflare: es el texto de las
+      // migraciones, para que el archivo de pruebas pueda aplicarlas con
+      // `applyD1Migrations`. Los guardas de deriva de `runtime.test.ts` comparan
+      // las claves de `Cloudflare.Env` contra las de `Entorno`, y un binding que
+      // solo existe en las pruebas los cegaria: habria que aflojar el guarda para
+      // agregarlo. Se lee con un cast local y documentado, que es el precio
+      // correcto.
+      //
+      // `SECRETO_SERVICIO` SI existe en produccion, pero como SECRETO
+      // (`wrangler secret put`), y un secreto nunca entra a `wrangler.jsonc` — ahi
+      // quedaria versionado. Acá lleva un valor de juguete: es lo que hace que las
+      // pruebas del endpoint puedan firmar tokens de verdad en vez de simular la
+      // verificacion, que es lo unico que probaria algo. Que este valor no sirva
+      // para nada afuera es la razon por la que puede estar escrito.
+      miniflare: {
+        bindings: {
+          MIGRACIONES: migraciones,
+          SECRETO_SERVICIO: 'secreto-de-juguete-solo-para-las-pruebas',
+        },
+      },
     }),
   ],
   test: {

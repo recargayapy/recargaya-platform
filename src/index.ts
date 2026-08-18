@@ -41,6 +41,7 @@ import {
 import { LOTE, PASADAS_MAXIMAS, sentencias } from './billetera/publicador.js'
 import { cuandoDespertar } from './billetera/alarma.js'
 import { guaranies } from './dinero/monto.js'
+import { atender } from './api/rutas.js'
 
 export interface Entorno {
   readonly ENTORNO: string
@@ -48,6 +49,26 @@ export interface Entorno {
   readonly CORE: D1Database
   readonly BILLETERA: DurableObjectNamespace<BilleteraDO>
   readonly SECUENCIA: DurableObjectNamespace<SecuenciaDO>
+
+  /**
+   * El secreto que firma los tokens de servicio. Va con `wrangler secret put`,
+   * NUNCA en `wrangler.jsonc`.
+   *
+   * POR QUE ES OPCIONAL, y no es para que compile.
+   *
+   * `check-entorno.mjs` y los tres guardas de `runtime.test.ts` comparan esta
+   * interfaz contra el `Env` que wrangler GENERA desde `wrangler.jsonc`. Un
+   * secreto no esta ahi —justamente porque es un secreto— asi que declararlo
+   * obligatorio romperia el oraculo que impide que `Entorno` prometa bindings
+   * que no existen. Aflojar ese guarda para que entre un campo seria arreglar el
+   * codigo rompiendo el oraculo, que es el patron que este proyecto ya cazo dos
+   * veces.
+   *
+   * Y ademas es la verdad: un despliegue al que nadie le puso el secreto existe.
+   * `secretoDelServicio()` lo trata como lo que es —la puerta se cierra para
+   * todos, ruidosamente— en vez de dejar entrar a cualquiera.
+   */
+  readonly SECRETO_SERVICIO?: string
 }
 
 /**
@@ -86,6 +107,44 @@ export class BilleteraDO extends DurableObject<Entorno> {
   }
 
   /**
+   * Como se llama esta billetera en TODO el resto del sistema.
+   *
+   * Es `ctx.id.name` —el texto que se le paso a `idFromName`— y NO
+   * `ctx.id.toString()`, que devuelve el hash hexadecimal de ese texto.
+   *
+   * POR QUE, y lo encontro una auditoria adversarial de la entrega 1.2 midiendo
+   * de punta a punta:
+   *
+   *     personas.billetera_id      : "billetera:d-1"
+   *     ledger_copia.billetera_id  : "2bce9f51…29c1"
+   *     SELECT … FROM ledger_copia JOIN personas USING (billetera_id)  ->  0 filas
+   *
+   * Tres columnas que se llaman igual, dos espacios de identificadores distintos, y
+   * ninguna consulta que las una. La ley 1 dice que el panel lee el read model; el
+   * read model existe desde 0001 con su indice `(billetera_id, asentado_en DESC)`
+   * para el extracto, y desde D1 no habia forma de ir de una persona a sus asientos:
+   * `idFromName` solo se puede calcular adentro de un Worker con el binding, no en
+   * una consulta de reportes. Nada fallaba. Simplemente no se podia preguntar.
+   *
+   * Se elige el nombre y no el hash porque el nombre es el que se puede derivar,
+   * leer y escribir desde los dos lados.
+   *
+   * Si el objeto no tiene nombre —creado con `idFromString`— esto TIRA en vez de
+   * caer al hash. Un respaldo silencioso reintroduciria exactamente los dos
+   * espacios de identificadores, que es el defecto que esta propiedad cierra.
+   */
+  private get billeteraId(): string {
+    const nombre = this.ctx.id.name
+    if (nombre === undefined) {
+      throw new Error(
+        'esta billetera se creo con idFromString y no tiene nombre estable: ' +
+          'el ledger de D1 quedaria sin forma de atarse a una persona',
+      )
+    }
+    return nombre
+  }
+
+  /**
    * reserva_id → veces seguidas que su liberacion por vencimiento fallo.
    *
    * EN MEMORIA a proposito, y no en una columna. Lo unico que tiene que evitar es
@@ -119,7 +178,7 @@ export class BilleteraDO extends DurableObject<Entorno> {
     operar: (estado: EstadoBilletera) => Resultado<T>,
   ): { valor: T; repetida: boolean } {
     return enUnaTransaccion(this.ctx, () => {
-      const estado = cargarEstado(this.sql, this.ctx.id.toString(), op.clave_idem, reserva_id)
+      const estado = cargarEstado(this.sql, this.billeteraId, op.clave_idem, reserva_id)
       const r = operar(estado)
       if (r.repetida) return { valor: r.valor, repetida: true }
 
@@ -246,14 +305,20 @@ export class BilleteraDO extends DurableObject<Entorno> {
       const momento = new Date().toISOString()
 
       try {
-        const lote = sentencias(this.ctx.id.toString(), filas, momento)
+        const lote = sentencias(this.billeteraId, filas, momento)
         await this.env.CORE.batch(lote.map((s) => this.env.CORE.prepare(s.sql).bind(...s.valores)))
       } catch (e) {
         // El contador va en su propia transaccion: es lo unico que se escribe y
         // tiene que quedar aunque el lote no haya salido.
         enUnaTransaccion(this.ctx, () => contarIntento(this.sql, ids))
+        // El nombre se toma de `this.ctx.id` directo y no del getter: el getter TIRA
+        // cuando el objeto no tiene nombre, y este `console.error` esta adentro del
+        // manejador de errores que existe para que `publicar()` NO relance. Con el
+        // getter acá, un objeto sin nombre hacia que el catch volviera a tirar, la
+        // alarma muriera entera, y la unica linea de diagnostico del modo de falla
+        // fuera justamente la que falla. Lo midio la segunda vuelta de auditoria.
         console.error(
-          `billetera ${this.ctx.id.toString()}: no se pudo publicar el outbox (${ids.length} filas desde la ${ids[0]})`,
+          `billetera ${this.ctx.id.name ?? this.ctx.id.toString()}: no se pudo publicar el outbox (${ids.length} filas desde la ${ids[0]})`,
           e,
         )
         break
@@ -398,7 +463,7 @@ export class BilleteraDO extends DurableObject<Entorno> {
         const previos = this.liberacionesFallidas.get(reserva_id) ?? 0
         this.liberacionesFallidas.set(reserva_id, previos + 1)
         console.error(
-          `billetera ${this.ctx.id.toString()}: no se pudo liberar la reserva vencida ${reserva_id} (intento ${previos + 1})`,
+          `billetera ${this.ctx.id.name ?? this.ctx.id.toString()}: no se pudo liberar la reserva vencida ${reserva_id} (intento ${previos + 1})`,
           e,
         )
       }
@@ -413,7 +478,7 @@ export class BilleteraDO extends DurableObject<Entorno> {
 
   /** Lo que hay, para consulta. No toca nada. */
   async saldo() {
-    const estado = cargarEstado(this.sql, this.ctx.id.toString(), '')
+    const estado = cargarEstado(this.sql, this.billeteraId, '')
     const asientos = [...this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM asientos')][0]
     return { bolsas: estado.bolsas, asientos: asientos?.n ?? 0 }
   }
@@ -462,6 +527,28 @@ export default {
       })
     }
 
-    return new Response('no encontrado', { status: 404 })
+    /**
+     * Todo lo demas entra por la puerta de la entrega 1.2.
+     *
+     * El reloj y el generador de identificadores se INYECTAN, no se leen adentro.
+     * Es la misma decision que tomo todo el nucleo del dinero: el unico lugar del
+     * sistema que lee el reloj para decidir de quien es un guarani es `alarm()`,
+     * donde no hay quien se lo pase. Acá si hay, asi que se pasa.
+     *
+     * Y no es una costura decorativa: `pruebas-runtime/auditoria.test.ts` la usa
+     * para reproducir los dos casos de MISMO MILISEGUNDO que ninguna prueba por
+     * `SELF.fetch` puede provocar. (Dice «mismo milisegundo» y no «carrera» porque
+     * esas dos pruebas son secuenciales: lo que fijan es el instante, no la
+     * concurrencia. La version anterior decia «carreras» y lo corrigio una
+     * auditoria.) Se dice donde porque la primera version de este
+     * parrafo prometia que «una prueba puede fijar el instante» cuando no habia
+     * ninguna que lo hiciera — lo midio una auditoria.
+     */
+    return atender(
+      peticion,
+      entorno,
+      () => new Date().toISOString(),
+      () => crypto.randomUUID(),
+    )
   },
 }

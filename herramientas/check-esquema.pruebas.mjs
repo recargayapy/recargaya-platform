@@ -12,42 +12,267 @@
 
 import assert from 'node:assert/strict'
 import {
+  FRONTERAS,
+  enOrdenDeAplicacion,
+  sinComentarios,
+  checkDeColumna,
+  checksDeLaFrontera,
   compararEsquemas,
   compararOrden,
+  extraerTipo,
   extraerTipoBolsa,
-  extraerCheckBolsa,
   extraerTiposDelEsquemaDO,
+  nombreFinal,
+  renombresDeclarados,
+  tablasDeclaradas,
 } from './check-esquema.mjs'
 
-assert.deepEqual(
-  compararEsquemas(['disponible', 'retenido'], ['disponible', 'retenido']),
-  { ok: true, faltantes: [], sobrantes: [] },
-)
+// --- comparacion pura ------------------------------------------------------
 
-assert.deepEqual(
-  compararEsquemas(['disponible', 'retenido'], ['disponible']),
-  { ok: false, faltantes: ['retenido'], sobrantes: [] },
-)
+assert.deepEqual(compararEsquemas(['disponible', 'retenido'], ['disponible', 'retenido']), {
+  ok: true,
+  faltantes: [],
+  sobrantes: [],
+})
 
-assert.deepEqual(
-  compararEsquemas(['disponible'], ['disponible', 'fantasma']),
-  { ok: false, faltantes: [], sobrantes: ['fantasma'] },
-)
+assert.deepEqual(compararEsquemas(['disponible', 'retenido'], ['disponible']), {
+  ok: false,
+  faltantes: ['retenido'],
+  sobrantes: [],
+})
+
+assert.deepEqual(compararEsquemas(['disponible'], ['disponible', 'fantasma']), {
+  ok: false,
+  faltantes: [],
+  sobrantes: ['fantasma'],
+})
+
+// --- lectura del tipo de TypeScript ---------------------------------------
 
 assert.deepEqual(extraerTipoBolsa(`export type TipoBolsa = 'disponible' | 'retenido'\n`), [
   'disponible',
   'retenido',
 ])
 
+// El nombre entra por parametro: es lo que hace que agregar una frontera no pida
+// una funcion nueva. Si esto se rompiera, `Capacidad` y `EstadoPersona` quedarian
+// sin extractor.
+assert.deepEqual(extraerTipo(`export type Capacidad = 'cliente' | 'vendedor'\n`, 'Capacidad'), [
+  'cliente',
+  'vendedor',
+])
+
+// Y que no se confunda de tipo cuando hay dos declarados en el mismo archivo,
+// que es exactamente el caso de `capacidades.ts`.
+{
+  const archivo = `export type Capacidad = 'cliente' | 'vendedor'\nexport type EstadoPersona = 'activa' | 'cerrada'\n`
+  assert.deepEqual(extraerTipo(archivo, 'EstadoPersona'), ['activa', 'cerrada'])
+}
+
+assert.throws(() => extraerTipo('nada por aca', 'TipoBolsa'), /no se encontro/)
+
+// --- lectura del SQL -------------------------------------------------------
+
+const SQL_DE_JUGUETE = `
+CREATE TABLE personas (
+  id     TEXT PRIMARY KEY,
+  estado TEXT NOT NULL CHECK (estado IN ('activa', 'cerrada'))
+) STRICT;
+
+CREATE TABLE pedidos (
+  id     TEXT PRIMARY KEY,
+  estado TEXT NOT NULL CHECK (estado IN ('creado', 'pagado'))
+) STRICT;
+`
+
 assert.deepEqual(
-  extraerCheckBolsa(`  bolsa TEXT NOT NULL CHECK (bolsa IN ('disponible', 'retenido')),\n`),
-  ['disponible', 'retenido'],
+  tablasDeclaradas(SQL_DE_JUGUETE).map((t) => t.tabla),
+  ['personas', 'pedidos'],
 )
 
-assert.throws(() => extraerTipoBolsa('nada por aca'), /no se encontro/)
-assert.throws(() => extraerCheckBolsa('nada por aca'), /no se encontro/)
+// EL CASO QUE SE COMIA UNA TABLA. Con el terminador anterior —que buscaba
+// `) STRICT;`— una tabla sin STRICT no cortaba, y la expresion seguia hasta el
+// terminador de la SIGUIENTE, haciendola desaparecer del oraculo.
+{
+  const conUnaSinStrict = `
+CREATE TABLE juguete (
+  id TEXT PRIMARY KEY
+);
 
-// --- la tercera frontera: el esquema del Durable Object -------------------
+CREATE TABLE capacidades (
+  capacidad TEXT NOT NULL CHECK (capacidad IN ('cliente'))
+) STRICT;
+`
+  const tablas = tablasDeclaradas(conUnaSinStrict)
+  assert.deepEqual(
+    tablas.map((t) => [t.tabla, t.estricta]),
+    [
+      ['juguete', false],
+      ['capacidades', true],
+    ],
+  )
+}
+
+assert.deepEqual(checkDeColumna(tablasDeclaradas(SQL_DE_JUGUETE)[0].cuerpo, 'estado'), [
+  'activa',
+  'cerrada',
+])
+
+// Una columna que la tabla no declara devuelve null, no una lista vacia: la
+// diferencia importa porque `checksDeLaFrontera` cuenta cuantas encontro, y una
+// lista vacia contaria como "la encontre y no tiene valores".
+assert.equal(checkDeColumna(tablasDeclaradas(SQL_DE_JUGUETE)[0].cuerpo, 'bolsa'), null)
+
+// EL CASO QUE OBLIGO A MIRAR LA TABLA Y NO SOLO LA COLUMNA.
+//
+// `estado` existe en las dos tablas con listas distintas. Buscando por nombre de
+// columna, cada una fallaba contra el tipo de la otra. Esta prueba es el oraculo
+// de esa decision.
+{
+  const enPersonas = checksDeLaFrontera(['x.sql'], () => SQL_DE_JUGUETE, 'personas', 'estado')
+  const enPedidos = checksDeLaFrontera(['x.sql'], () => SQL_DE_JUGUETE, 'pedidos', 'estado')
+  assert.deepEqual(
+    enPersonas.map((x) => x.check),
+    [['activa', 'cerrada']],
+  )
+  assert.deepEqual(
+    enPedidos.map((x) => x.check),
+    [['creado', 'pagado']],
+  )
+}
+
+// EL SQL QUE ESTA ADENTRO DE UN COMENTARIO NO ES SQL.
+//
+// Los encabezados de este proyecto CITAN DDL viejo textualmente. La segunda vuelta
+// de auditoria midio la consecuencia: el oraculo comparaba el COMENTARIO, decia OK,
+// y encima nombraba el archivo correcto en el mensaje.
+{
+  const conCita = `
+-- La version anterior decia:
+--   CREATE TABLE capacidades (
+--     capacidad TEXT NOT NULL CHECK (capacidad IN ('cliente', 'vendedor')),
+--   ) STRICT;
+CREATE TABLE capacidades (
+  capacidad TEXT NOT NULL CHECK (capacidad IN ('cliente'))
+) STRICT;
+`
+  assert.equal(sinComentarios('SELECT 1; -- y esto no\nSELECT 2;'), 'SELECT 1; \nSELECT 2;')
+  const hallado = checksDeLaFrontera(['x.sql'], () => conCita, 'capacidades', 'capacidad')
+  assert.deepEqual(
+    hallado.map((h) => h.check),
+    [['cliente']],
+    'el oraculo comparo la cita del comentario en vez de la tabla',
+  )
+}
+
+// `) STRICT, WITHOUT ROWID;` es SQL legitimo y no puede comerse la tabla siguiente.
+// Es el defecto de la primera vuelta (`);` pelado) resucitado por su propio arreglo:
+// el terminador nuevo no admitia la coma.
+{
+  const conSufijoCompuesto = `
+CREATE TABLE puente (
+  a TEXT NOT NULL,
+  b TEXT NOT NULL,
+  PRIMARY KEY (a, b)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE capacidades (
+  capacidad TEXT NOT NULL CHECK (capacidad IN ('cliente'))
+) STRICT;
+`
+  const tablas = tablasDeclaradas(conSufijoCompuesto)
+  assert.deepEqual(
+    tablas.map((t) => [t.tabla, t.estricta]),
+    [
+      ['puente', true],
+      ['capacidades', true],
+    ],
+  )
+}
+
+// --- el orden de aplicacion ------------------------------------------------
+// wrangler compara el prefijo con `parseInt`; `sort()` compara texto. Con un archivo
+// sin relleno a cuatro digitos, «la ultima» del oraculo no es la ultima que aplica
+// la base — y desde que el oraculo compara SOLO la ultima, eso decide el veredicto.
+assert.deepEqual(enOrdenDeAplicacion(['0010_decima.sql', '9_novena.sql']), [
+  '9_novena.sql',
+  '0010_decima.sql',
+])
+assert.deepEqual(
+  enOrdenDeAplicacion(['0003_c.sql', '0001_a.sql', '0002_b.sql']),
+  ['0001_a.sql', '0002_b.sql', '0003_c.sql'],
+)
+
+// --- renombres -------------------------------------------------------------
+
+// Lleva `posicion`: un renombre solo puede afectar a una tabla creada ANTES que el.
+assert.deepEqual(renombresDeclarados('ALTER TABLE a_nueva RENAME TO a;'), [
+  { de: 'a_nueva', a: 'a', posicion: 0 },
+])
+
+assert.equal(nombreFinal('a_nueva', [{ de: 'a_nueva', a: 'a' }]), 'a')
+assert.equal(nombreFinal('sin_renombre', []), 'sin_renombre')
+
+// La cadena entera, no un solo salto.
+assert.equal(
+  nombreFinal('a', [
+    { de: 'a', a: 'b' },
+    { de: 'b', a: 'c' },
+  ]),
+  'c',
+)
+
+// Un renombre circular tiene que tirar, no colgarse. Un oraculo que no termina no
+// da veredicto, que es peor que uno que se equivoca.
+assert.throws(
+  () =>
+    nombreFinal('a', [
+      { de: 'a', a: 'b' },
+      { de: 'b', a: 'a' },
+    ]),
+  /circular/,
+)
+
+// LA TABLA RECONSTRUIDA. Es el caso de 0002 (`ledger_copia_nueva`) y de 0003
+// (`personas_nueva`, `capacidades_nueva`): el CREATE TABLE que gobierna lleva el
+// nombre provisorio. Sin resolver el renombre, el oraculo no lo ve — y es
+// justamente el ultimo, o sea el que manda.
+{
+  const sql = `
+CREATE TABLE IF NOT EXISTS personas_nueva (
+  estado TEXT NOT NULL CHECK (estado IN ('activa', 'suspendida'))
+) STRICT;
+ALTER TABLE personas_nueva RENAME TO personas;
+`
+  const hallado = checksDeLaFrontera(['x.sql'], () => sql, 'personas', 'estado')
+  assert.deepEqual(
+    hallado.map((h) => [h.declarada, h.check]),
+    [['personas_nueva', ['activa', 'suspendida']]],
+  )
+}
+
+// UN RENOMBRE ESCRITO ARRIBA DEL CREATE NO LE APLICA A LA TABLA NUEVA.
+//
+// El patron es renombrar la vieja a `x_historica` y despues crear una `x` nueva.
+// Buscando el renombre por nombre sin mirar el orden, el oraculo concluia que la
+// tabla NUEVA se llamaba `x_historica`, la perdia de vista, y firmaba.
+{
+  const renombrarYRecrear = `
+ALTER TABLE capacidades RENAME TO capacidades_historica;
+
+CREATE TABLE capacidades (
+  capacidad TEXT NOT NULL CHECK (capacidad IN ('cliente'))
+) STRICT;
+`
+  const hallado = checksDeLaFrontera(['x.sql'], () => renombrarYRecrear, 'capacidades', 'capacidad')
+  assert.deepEqual(
+    hallado.map((h) => [h.declarada, h.check]),
+    [['capacidades', ['cliente']]],
+    'el renombre de arriba se le aplico a la tabla creada abajo',
+  )
+}
+
+// --- el esquema del Durable Object ----------------------------------------
 
 assert.deepEqual(
   extraerTiposDelEsquemaDO(
@@ -56,15 +281,8 @@ assert.deepEqual(
   ['disponible', 'retenido'],
 )
 
-assert.deepEqual(
-  extraerTiposDelEsquemaDO("export const TIPOS_DE_BOLSA = ['a'] as const"),
-  ['a'],
-)
-
 assert.throws(() => extraerTiposDelEsquemaDO('nada por aca'), /no se encontro/)
 
-// El orden importa entre TypeScript y el DO, porque la lista del DO se interpola
-// dentro de los CHECK del DDL.
 assert.equal(compararOrden(['a', 'b'], ['a', 'b']).ok, true)
 assert.equal(compararOrden(['a', 'b'], ['b', 'a']).ok, false)
 assert.deepEqual(compararOrden(['a', 'b'], ['b', 'a']), {
@@ -73,19 +291,19 @@ assert.deepEqual(compararOrden(['a', 'b'], ['b', 'a']), {
   delDO: ['b', 'a'],
 })
 
-
+// Las fronteras declaradas no pueden quedar en cero por un descuido de edicion:
+// con la lista vacia, `main()` no compara nada y sale 0.
+assert.ok(FRONTERAS.length >= 3, 'se esperaban al menos tres fronteras declaradas')
 
 // --- de punta a punta ------------------------------------------------------
 // Las de arriba prueban las funciones puras. Sin esto, `main()` no lo ejercita
 // nadie: la mutacion del guard del CLI —invocarlo y que no verifique nada—
 // sobrevivia, porque estas pruebas nunca corrian el proceso.
-//
-// Para ser exacto con el credito: que `check-esquema.mjs` tuviera el guard viejo
-// lo encontro una auditoria adversarial. Lo que encontro el arnes de mutacion fue
-// que la mutacion nueva no tenia quien la matara.
 
 const { spawnSync } = await import('node:child_process')
-const { mkdtempSync, cpSync, writeFileSync, readFileSync, rmSync } = await import('node:fs')
+const { mkdtempSync, cpSync, writeFileSync, readFileSync, readdirSync, rmSync } = await import(
+  'node:fs'
+)
 const { tmpdir } = await import('node:os')
 const { join } = await import('node:path')
 const { fileURLToPath } = await import('node:url')
@@ -112,26 +330,62 @@ function correrSobreCopia(perturbar) {
   }
 }
 
-const MIGRACION = ['migraciones', 'core', '0001_cimientos.sql']
+const CARPETA = ['migraciones', 'core']
+
+/** Los .sql, ordenados. */
+function migracionesDe(dir) {
+  return readdirSync(join(dir, ...CARPETA))
+    .filter((n) => n.endsWith('.sql'))
+    .sort()
+}
+
+/**
+ * La ULTIMA migracion que declara cierto texto, que es la que gobierna.
+ *
+ * Va "la ultima que lo declara" y no "la ultima" a secas, y ese es un arreglo que
+ * pidio esta misma entrega: la version anterior perturbaba `migraciones.pop()`
+ * sin mas, y funcionaba porque el CHECK de `bolsa` casualmente vivia en la
+ * ultima. Con 0003 —que no toca `bolsa`— esa prueba se rompia sin que nada
+ * estuviera mal. Una prueba que depende de que la proxima migracion hable del
+ * mismo tema no es un oraculo: es una casualidad con fecha de vencimiento.
+ */
+function ultimaQueDeclara(dir, textoBuscado) {
+  const candidatas = migracionesDe(dir).filter((n) =>
+    readFileSync(join(dir, ...CARPETA, n), 'utf8').includes(textoBuscado),
+  )
+  assert.ok(candidatas.length > 0, `ninguna migracion declara ${textoBuscado}`)
+  return candidatas.pop()
+}
+
+function reemplazarEn(dir, archivo, de, a) {
+  const p = join(dir, ...CARPETA, archivo)
+  const texto = readFileSync(p, 'utf8')
+  assert.ok(texto.includes(de), `${archivo} no contiene el fragmento a perturbar`)
+  writeFileSync(p, texto.replace(de, a))
+}
+
+const CHECK_BOLSA =
+  "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion', 'retenido'))"
+const CHECK_CAPACIDAD = "CHECK (capacidad IN ('cliente', 'vendedor', 'creador', 'distribuidor'))"
+const CHECK_ESTADO = "CHECK (estado IN ('activa', 'suspendida', 'cerrada'))"
 
 // Camino sano.
 {
   const r = correrSobreCopia(() => {})
   assert.equal(r.codigo, 0, `esperaba 0 y salio ${r.codigo}: ${r.salida}`)
-  assert.match(r.salida, /coinciden/)
+  assert.match(r.salida, /check-esquema: el esquema del DO y/)
 }
 
-// Un tipo de bolsa que le falta al CHECK: el defecto que esta herramienta existe
-// para agarrar, comprobado a traves del proceso y no solo de la funcion pura.
+// FRONTERA 1 — un tipo de bolsa que le falta al CHECK, en la ULTIMA migracion que
+// lo declara. 0002 reconstruye `ledger_copia` para arreglarle la clave primaria,
+// asi que el CHECK que gobierna de verdad es el suyo, no el de 0001.
 {
   const r = correrSobreCopia((dir) => {
-    const p = join(dir, ...MIGRACION)
-    writeFileSync(
-      p,
-      readFileSync(p, 'utf8').replace(
-        "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion', 'retenido'))",
-        "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion'))",
-      ),
+    reemplazarEn(
+      dir,
+      ultimaQueDeclara(dir, CHECK_BOLSA),
+      CHECK_BOLSA,
+      "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion'))",
     )
   })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
@@ -139,8 +393,73 @@ const MIGRACION = ['migraciones', 'core', '0001_cimientos.sql']
   assert.match(r.salida, /retenido/)
 }
 
-// Un tipo de bolsa que le falta al esquema del DO. Es la frontera nueva, y la mas
-// peligrosa: gobierna la tabla donde nace el asiento.
+// FRONTERA 2 — la capacidad que se agrega en TypeScript y se olvida en el SQL.
+// Es EL defecto que la entrega 1.2 trajo con ella, y se comprueba en la direccion
+// en que va a ocurrir: primero el tipo, despues el olvido.
+{
+  const r = correrSobreCopia((dir) => {
+    const p = join(dir, 'src', 'identidad', 'capacidades.ts')
+    writeFileSync(
+      p,
+      readFileSync(p, 'utf8').replace(
+        "export type Capacidad = 'cliente' | 'vendedor' | 'creador' | 'distribuidor'",
+        "export type Capacidad = 'cliente' | 'vendedor' | 'creador' | 'distribuidor' | 'afiliado'",
+      ),
+    )
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /Capacidad/)
+  assert.match(r.salida, /afiliado/)
+}
+
+// Y en la direccion contraria: el CHECK que pierde un valor que el tipo si tiene.
+{
+  const r = correrSobreCopia((dir) => {
+    reemplazarEn(
+      dir,
+      ultimaQueDeclara(dir, CHECK_CAPACIDAD),
+      CHECK_CAPACIDAD,
+      "CHECK (capacidad IN ('cliente', 'vendedor', 'creador'))",
+    )
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /distribuidor/)
+}
+
+// FRONTERA 3 — `personas.estado`. Es la que prueba que mirar la tabla sirve: si
+// el oraculo comparara por nombre de columna, esta perturbacion tambien haria
+// fallar a `pedidos.estado` y el mensaje hablaria de la tabla equivocada.
+{
+  const r = correrSobreCopia((dir) => {
+    reemplazarEn(
+      dir,
+      ultimaQueDeclara(dir, CHECK_ESTADO),
+      CHECK_ESTADO,
+      "CHECK (estado IN ('activa', 'suspendida'))",
+    )
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /EstadoPersona/)
+  assert.match(r.salida, /cerrada/)
+}
+
+// `pedidos.estado` NO puede hacer fallar a nada: no es una frontera declarada.
+// Sin esta prueba, un oraculo que confunda las tablas pasaria las de arriba y se
+// notaria recien cuando alguien tocara pedidos.
+{
+  const r = correrSobreCopia((dir) => {
+    reemplazarEn(
+      dir,
+      ultimaQueDeclara(dir, "CHECK (estado IN ('creado', 'pagado', 'repartido', 'cancelado'))"),
+      "CHECK (estado IN ('creado', 'pagado', 'repartido', 'cancelado'))",
+      "CHECK (estado IN ('creado', 'pagado', 'repartido'))",
+    )
+  })
+  assert.equal(r.codigo, 0, `esperaba 0 y salio ${r.codigo}: ${r.salida}`)
+}
+
+// Un tipo de bolsa que le falta al esquema del DO. Es la frontera mas peligrosa:
+// gobierna la tabla donde nace el asiento.
 {
   const r = correrSobreCopia((dir) => {
     const p = join(dir, 'src', 'billetera', 'esquema.ts')
@@ -168,48 +487,14 @@ const MIGRACION = ['migraciones', 'core', '0001_cimientos.sql']
   assert.match(r.salida, /DISTINTO ORDEN/)
 }
 
-// LA MISMA ROTURA, PERO EN LA ULTIMA MIGRACION Y NO EN LA PRIMERA.
-//
-// Lo pidio el arnes de mutacion: `enSql.slice(0, 1)` —o sea, mirar solo la primera
-// migracion, que era literalmente lo que hacia la version anterior de
-// `check-esquema.mjs` con la ruta a `0001_cimientos.sql` escrita a mano—
-// SOBREVIVIO. Y no es teorico: 0002 reconstruye `ledger_copia` para arreglarle la
-// clave primaria, asi que el CHECK que gobierna de verdad es el ULTIMO, no el
-// primero. El oraculo estaba aprobando la definicion de una tabla que ya no existe.
-//
-// Se perturba "la ultima" y no "0002" por nombre: cuando llegue 0003, esta prueba
-// tiene que seguir apuntando a la que manda.
+// Y si NINGUNA migracion declara el CHECK de una frontera, el oraculo tiene que
+// fallar en vez de decir OK sin haber comparado nada. Es la forma que tomaria un
+// cambio en como se escribe la columna: la expresion regular deja de encontrarla,
+// la lista queda vacia, y un bucle sobre una lista vacia no se queja.
 {
-  const { readdirSync } = await import('node:fs')
   const r = correrSobreCopia((dir) => {
-    const carpeta = join(dir, 'migraciones', 'core')
-    const ultima = readdirSync(carpeta).filter((n) => n.endsWith('.sql')).sort().pop()
-    const p = join(carpeta, ultima)
-    const texto = readFileSync(p, 'utf8')
-    assert.match(texto, /CHECK \(bolsa IN/, `${ultima} no declara ningun CHECK de bolsa`)
-    writeFileSync(
-      p,
-      texto.replace(
-        "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion', 'retenido'))",
-        "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion'))",
-      ),
-    )
-  })
-  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
-  assert.match(r.salida, /se desincronizaron/)
-  assert.match(r.salida, /retenido/)
-}
-
-// Y si NINGUNA migracion declara el CHECK, el oraculo tiene que fallar en vez de
-// decir OK sin haber comparado nada. Es la forma que tomaria un cambio en como se
-// escribe la columna: la expresion regular deja de encontrarla, la lista queda
-// vacia, y un bucle sobre una lista vacia no se queja.
-{
-  const { readdirSync } = await import('node:fs')
-  const r = correrSobreCopia((dir) => {
-    const carpeta = join(dir, 'migraciones', 'core')
-    for (const n of readdirSync(carpeta).filter((x) => x.endsWith('.sql'))) {
-      const p = join(carpeta, n)
+    for (const n of migracionesDe(dir)) {
+      const p = join(dir, ...CARPETA, n)
       writeFileSync(p, readFileSync(p, 'utf8').replaceAll('CHECK (bolsa IN', 'CHECK (bolsita IN'))
     }
   })
@@ -217,4 +502,119 @@ const MIGRACION = ['migraciones', 'core', '0001_cimientos.sql']
   assert.match(r.salida, /NINGUNA migracion/)
 }
 
-console.log('  check-esquema.pruebas: OK (incluidas las de punta a punta)')
+// UN RENOMBRE QUE EL ORACULO NO SIGUE.
+//
+// Se perturba EL RENOMBRE, no el CHECK. La version anterior de este bloque decia
+// eso y hacia otra cosa: repetia byte por byte la perturbacion del bloque de mas
+// arriba, con una asercion `/a → b|a/` cuya segunda alternativa aceptaba cualquier
+// mensaje que mencionara la tabla. Lo encontro una auditoria.
+//
+// Rompiendo el renombre, la tabla reconstruida de 0003 queda llamandose
+// `capacidades_nueva` para el oraculo. La declaracion que gobierna desaparece de la
+// lista y la que manda pasa a ser la de 0001 — o sea que el oraculo compara contra
+// una definicion que la base ya no tiene. Se comprueba haciendo que las dos digan
+// cosas distintas: se le agrega `afiliado` SOLO a la de 0003. Con el renombre
+// resuelto, el oraculo mira la de 0003 y falla; sin resolverlo, mira la de 0001,
+// coincide, y firma.
+{
+  const r = correrSobreCopia((dir) => {
+    const archivo = ultimaQueDeclara(dir, CHECK_CAPACIDAD)
+    reemplazarEn(
+      dir,
+      archivo,
+      CHECK_CAPACIDAD,
+      "CHECK (capacidad IN ('cliente', 'vendedor', 'creador', 'distribuidor', 'afiliado'))",
+    )
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /capacidades_nueva → capacidades/)
+  assert.match(r.salida, /afiliado/)
+}
+
+// UNA TABLA SIN STRICT NO PUEDE PASAR DESAPERCIBIDA.
+//
+// Es el defecto de arriba visto desde el proceso entero: antes, agregar una tabla
+// sin STRICT delante de `capacidades_nueva` la borraba del oraculo y la salida
+// seguia siendo `exit 0`. Ahora corta con un error que la nombra.
+{
+  const r = correrSobreCopia((dir) => {
+    const archivo = ultimaQueDeclara(dir, CHECK_CAPACIDAD)
+    reemplazarEn(
+      dir,
+      archivo,
+      'CREATE TABLE capacidades_nueva (',
+      'CREATE TABLE floja (\n  id TEXT PRIMARY KEY\n);\n\nCREATE TABLE capacidades_nueva (',
+    )
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /SIN STRICT/)
+  assert.match(r.salida, /floja/)
+}
+
+// EL ESQUEMA TIENE QUE PODER EVOLUCIONAR SIN REESCRIBIR LA HISTORIA.
+//
+// Agregar un valor al tipo y una migracion nueva que reconstruya la tabla con el
+// CHECK correcto es EXACTAMENTE lo que el proyecto haria. Con la version que
+// comparaba TODAS las declaraciones historicas, esto fallaba contra el CHECK de
+// `0001_cimientos.sql` —una migracion ya aplicada en staging— y la unica salida
+// verde era editarla. Lo midio una auditoria.
+{
+  const r = correrSobreCopia((dir) => {
+    const p = join(dir, 'src', 'identidad', 'capacidades.ts')
+    writeFileSync(
+      p,
+      readFileSync(p, 'utf8').replace(
+        "export type Capacidad = 'cliente' | 'vendedor' | 'creador' | 'distribuidor'",
+        "export type Capacidad = 'cliente' | 'vendedor' | 'creador' | 'distribuidor' | 'afiliado'",
+      ),
+    )
+    writeFileSync(
+      join(dir, ...CARPETA, '0004_afiliado.sql'),
+      [
+        'CREATE TABLE capacidades_v2 (',
+        '  persona_id  TEXT NOT NULL REFERENCES personas(id),',
+        "  capacidad   TEXT NOT NULL CHECK (capacidad IN ('cliente', 'vendedor', 'creador', 'distribuidor', 'afiliado')),",
+        '  otorgada_en TEXT NOT NULL,',
+        '  hasta       TEXT,',
+        '  PRIMARY KEY (persona_id, capacidad, otorgada_en)',
+        ') STRICT;',
+        'INSERT INTO capacidades_v2 SELECT * FROM capacidades;',
+        'DROP TABLE capacidades;',
+        'ALTER TABLE capacidades_v2 RENAME TO capacidades;',
+        '',
+      ].join('\n'),
+    )
+  })
+  assert.equal(r.codigo, 0, `esperaba 0 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /0004_afiliado\.sql/)
+}
+
+// DE PUNTA A PUNTA: una migracion nueva cuyo comentario cita el DDL viejo completo
+// y cuya tabla real achica la lista. Es la forma exacta que midio la auditoria.
+{
+  const r = correrSobreCopia((dir) => {
+    writeFileSync(
+      join(dir, ...CARPETA, '0004_recorte.sql'),
+      [
+        '-- La version anterior de esta tabla decia:',
+        '--   CREATE TABLE capacidades (',
+        "--     capacidad TEXT NOT NULL CHECK (capacidad IN ('cliente', 'vendedor', 'creador', 'distribuidor')),",
+        '--   ) STRICT;',
+        'DROP TABLE capacidades;',
+        'CREATE TABLE capacidades (',
+        '  persona_id  TEXT NOT NULL REFERENCES personas(id),',
+        "  capacidad   TEXT NOT NULL CHECK (capacidad IN ('cliente')),",
+        '  otorgada_en TEXT NOT NULL,',
+        '  hasta       TEXT,',
+        '  PRIMARY KEY (persona_id, capacidad, otorgada_en)',
+        ') STRICT;',
+        '',
+      ].join('\n'),
+    )
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /se desincronizaron/)
+  assert.match(r.salida, /0004_recorte\.sql/)
+}
+
+console.log('  check-esquema.pruebas: OK (3 fronteras, renombres, comentarios, orden, STRICT y punta a punta)')
