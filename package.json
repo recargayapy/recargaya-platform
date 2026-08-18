@@ -15,12 +15,14 @@
     "entorno": "node herramientas/check-entorno.mjs && node herramientas/check-entorno.pruebas.mjs",
     "runtime": "node herramientas/check-runtime.mjs && node herramientas/check-runtime.pruebas.mjs && npm run probar:runtime",
     "mutar": "node herramientas/mutar.mjs",
-    "verificar": "npm run entorno && npm run tipos && npm run probar && npm run esquema && npm run portabilidad && npm run runtime && npm run mutar",
+    "verificar": "npm run entorno && npm run tipos && npm run probar && npm run esquema && npm run token:pruebas && npm run portabilidad && npm run runtime && npm run mutar",
     "migrar:staging": "wrangler d1 migrations apply CORE --env staging --remote",
     "migrar:local": "wrangler d1 migrations apply CORE --env staging --local",
     "desarrollo": "wrangler dev --env staging",
     "desplegar:staging": "wrangler deploy --env staging",
-    "desplegar:produccion": "wrangler deploy --env produccion"
+    "desplegar:produccion": "wrangler deploy --env produccion",
+    "token": "node herramientas/emitir-token.mjs",
+    "token:pruebas": "node herramientas/emitir-token.pruebas.mjs"
   },
   "engines": {
     "//": "invocado-directo.mjs usa import.meta.main cuando existe, que es desde Node 22.18 (y 24.2). En un Node anterior cae al respaldo por comparacion de rutas, que es mas debil: no distingue `node <directorio>` con un package.json que declara main. El piso evita ese caso.",
@@ -30,6 +32,7 @@
     "@cloudflare/vitest-pool-workers": "^0.21.3",
     "@cloudflare/workers-types": "^5.20260817.1",
     "@types/node": "^22.20.1",
+    "esbuild": "^0.28.1",
     "typescript": "^5.7.3",
     "vitest": "^4.1.10",
     "wrangler": "^4.123.0"

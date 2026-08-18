@@ -1613,6 +1613,54 @@ const MUTACIONES = [
     de: "    if (RESERVADOS.includes(persona_id.toLowerCase())) throw new TokenInvalido('cuerpo_invalido')\n",
     a: "",
   },
+  {
+    // La herramienta que emite tokens. Su oraculo es que el token que emite lo
+  // VERIFIQUE la puerta — o sea el mismo codigo que corre en el Worker. Es lo unico
+  // que hace que «no se duplica la logica de firma» sea un hecho.
+    invariante: "el token se emite para un entorno declarado, nunca por defecto",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "  if (opciones.entorno === null) {",
+    a: "  if (false) {",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    invariante: "--persona sin valor no cae en la plataforma",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "      if (valor === undefined || valor.startsWith('--')) throw new Error(`${arg} necesita un valor`)",
+    a: "      if (valor === undefined) throw new Error(`${arg} necesita un valor`)",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    invariante: "un argumento desconocido se rechaza en vez de ignorarse",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "    else throw new Error(`argumento desconocido: ${arg}`)",
+    a: "    else i += 0",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    invariante: "el secreto explicito gana sobre el guardado",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "  if (typeof delArgumento === 'string' && delArgumento.length > 0) return delArgumento\n",
+    a: "",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    invariante: "una cadena vacia no es un secreto",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "  if (typeof delEntorno === 'string' && delEntorno.length > 0) return delEntorno",
+    a: "  if (typeof delEntorno === 'string') return delEntorno",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    // Sin `bundle`, el import del modulo real muere resolviendo `momento.js` — que es
+  // exactamente el motivo por el que esta herramienta bundlea en vez de copiar la
+  // firma. Si esto sobreviviera, seria que las pruebas no cargan el codigo de verdad.
+    invariante: "la herramienta carga el modulo de verdad, no un cascaron",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "      bundle: true,",
+    a: "      bundle: false,",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
 ]
 
 const ORACULO_POR_DEFECTO = ORACULO_NUCLEO

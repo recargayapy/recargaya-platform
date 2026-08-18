@@ -167,3 +167,48 @@ roto — mirá el log.
 nombre del entorno, así que uno de staging no sirve en producción aunque el
 secreto fuera el mismo. Igual, que sean distintos es la línea de defensa que no
 depende de que nadie se haya olvidado de nada.
+
+---
+
+## Cómo hablarle a la puerta
+
+El endpoint pide un token firmado. Para emitir uno:
+
+```bash
+SECRETO_SERVICIO="el-que-cargaste" npm run token -- --entorno staging
+```
+
+En PowerShell:
+
+```powershell
+$env:SECRETO_SERVICIO = "el-que-cargaste"
+npm run token -- --entorno staging
+```
+
+**Qué esperar:** una línea larga que empieza con `v1.`, y abajo un aviso de
+cuántos minutos vale. **Vale cinco minutos**; después emitís otro.
+
+Con eso ya podés tocar las rutas:
+
+```bash
+TOKEN=$(SECRETO_SERVICIO="..." npm run token --silent -- --entorno staging)
+
+curl -s -X POST https://recargaya-staging.TU-SUBDOMINIO.workers.dev/personas \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"persona_id":"prueba-1"}'
+```
+
+**Qué esperar:** un JSON con `"estado":"activa"` y el `billetera_id` derivado.
+
+Si te devuelve `401 no_autorizado`, es una de tres: el secreto que usaste para
+emitir no es el que está cargado en Cloudflare, el token pasó los cinco minutos,
+o lo emitiste para el entorno equivocado. La respuesta **no dice cuál** a
+propósito —eso le ahorraría trabajo a quien esté probando la puerta— pero el log
+del Worker sí lo dice. Lo ves con `npx wrangler tail --env staging`.
+
+Para un token que actúe como una persona y no como la plataforma:
+
+```bash
+npm run token -- --entorno staging --persona prueba-1
+```
