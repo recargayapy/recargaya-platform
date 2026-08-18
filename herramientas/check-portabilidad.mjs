@@ -91,6 +91,17 @@ export function buscarComandosLiterales(texto) {
     if (e !== null && !/'junction'/.test(linea)) {
       hallazgos.push({ linea: i + 1, comando: 'symlinkSync sin junction' })
     }
+
+    // Y los oraculos que `mutar.mjs` declara como arreglo. No son una llamada
+    // —los ejecuta el bucle, mas abajo— asi que las dos reglas de arriba no los
+    // ven, y sin embargo terminan en un `execFileSync` igual.
+    //
+    // Esta rama se agrego cuando el propio arnes de mutacion mostro, en su linea
+    // de base, dos oraculos con `npx` que habian sobrevivido a un rebase: el
+    // tramo que los escribio es anterior al arreglo de portabilidad. La regla
+    // cubria las llamadas y no las declaraciones — media frontera otra vez.
+    const o = /\boraculo\s*:\s*\[\s*'([^']+)'/.exec(linea)
+    if (o !== null) hallazgos.push({ linea: i + 1, comando: `oraculo: '${o[1]}'` })
   })
 
   return hallazgos

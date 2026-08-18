@@ -21,7 +21,12 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
-import { ORACULO_NUCLEO, ORACULO_RUNTIME, ORACULO_TIPOS } from './binarios.mjs'
+import {
+  ORACULO_NUCLEO,
+  ORACULO_RUNTIME,
+  ORACULO_TIPOS,
+  entornoParaOraculo,
+} from './binarios.mjs'
 
 /** Un oraculo de Node plano: el MISMO Node que ya corre, no el que este en el
  *  PATH. Ver `binarios.mjs` — un comando por nombre depende del sistema. */
@@ -118,7 +123,11 @@ const MUTACIONES = [
     a: '',
   },
   {
-    invariante: 'ningun asiento se duplica',
+    // La comprobacion se mudo de `verificarInvariantes` a `verificarDelta` cuando
+    // el estado se angosto: los asientos ya no vuelven del nucleo, salen como
+    // delta. Entre operaciones lo hace cumplir la PRIMARY KEY de la tabla, que
+    // tiene su propia prueba en el runtime.
+    invariante: 'ningun asiento se duplica dentro de una operacion',
     archivo: 'src/billetera/nucleo.ts',
     de: '    if (vistos.has(a.asiento_id)) throw new Error(`asiento duplicado: ${a.asiento_id}`)',
     a: '',
@@ -146,12 +155,6 @@ const MUTACIONES = [
     archivo: 'src/billetera/nucleo.ts',
     de: '  const bolsas = [...bolsasSinTomas, ...retenidas]',
     a: '  const bolsas = bolsasSinTomas',
-  },
-  {
-    invariante: 'reservar() rechaza un reserva_id con reserva abierta existente',
-    archivo: 'src/billetera/nucleo.ts',
-    de: "  if (estado.reservas.get(entrada.reserva_id)?.estado === 'abierta') {\n    throw new Error(`ya existe una reserva abierta con reserva_id: ${entrada.reserva_id}`)\n  }",
-    a: '',
   },
   {
     invariante: 'liberarReserva() vacia retenido de la reserva que libera',
@@ -391,6 +394,197 @@ const MUTACIONES = [
     oraculo: ORACULO_RUNTIME,
   },
 
+  // --- El publicador del outbox --------------------------------------------
+  // La otra mitad de la ley 5. El evento ya se escribia en la misma transaccion
+  // que el cambio; lo que faltaba era sacarlo de ahi. Es el unico camino por el
+  // que la plata llega a los reportes, y es el que menos ruido hace cuando se
+  // rompe: `saldo()` y `reconciliar()` siguen dando bien, porque la plata esta.
+  // Lo unico que esta mal es que nadie afuera se entera.
+  {
+    invariante: 'el asiento va al ledger y no al registro de eventos',
+    archivo: 'src/billetera/publicador.ts',
+    de: "  return tipo === TIPO_ASIENTO ? 'ledger_copia' : 'eventos_billetera'",
+    a: "  return 'eventos_billetera'",
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // El id del outbox es lo que hace que la segunda entrega no duplique: es un
+    // AUTOINCREMENT, o sea estable entre reintentos. Con una constante, la primera
+    // fila se queda con la clave y el `OR IGNORE` descarta todas las demas — plata
+    // acreditada que los reportes nunca ven.
+    invariante: 'el evento se identifica por el id del outbox',
+    archivo: 'src/billetera/publicador.ts',
+    de: '        billetera_id,\n        f.id,',
+    a: '        billetera_id,\n        0,',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'sin fallos previos, la copia a D1 no espera nada',
+    archivo: 'src/billetera/publicador.ts',
+    de: '  if (intentos <= 0) return 0',
+    a: '',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Sin techo, veinte fallos son doce dias de espera. Y con `2 ** 1024` de por
+    // medio, `Infinity`: `setAlarm(Infinity)` no es una espera larga, es un error.
+    invariante: 'la espera entre reintentos tiene techo',
+    archivo: 'src/billetera/publicador.ts',
+    de: '  return Math.min(2 ** (intentos - 1) * 1000, RETRASO_MAXIMO_MS)',
+    a: '  return 2 ** (intentos - 1) * 1000',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Un lote de cero filas es un publicador que lee cero para siempre, con el
+    // outbox creciendo y todo en verde.
+    invariante: 'el lote del publicador no puede ser cero',
+    archivo: 'src/billetera/publicador.ts',
+    de: 'export const LOTE = 50',
+    a: 'export const LOTE = 0',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // LEY 6, y el oraculo es la prueba que reproduce la caida entre la escritura en
+    // D1 y la marca en el Durable Object. Sin `OR IGNORE` el lote entero falla por
+    // la clave primaria, el publicador lo atrapa, y las filas quedan pendientes
+    // para siempre: el outbox se traba sin un solo error visible.
+    invariante: 'la segunda entrega del mismo asiento no rompe ni duplica',
+    archivo: 'src/billetera/publicador.ts',
+    de: "  'INSERT OR IGNORE INTO ledger_copia",
+    a: "  'INSERT INTO ledger_copia",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'la segunda entrega del mismo evento no rompe ni duplica',
+    archivo: 'src/billetera/publicador.ts',
+    de: "  'INSERT OR IGNORE INTO eventos_billetera",
+    a: "  'INSERT INTO eventos_billetera",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El asiento sale por el outbox y se escribe donde se inserta el asiento, no
+    // como un evento que el nucleo tenga que acordarse de emitir. Sin esta linea,
+    // `ledger_copia` queda vacia para siempre y el panel muestra una billetera sin
+    // movimientos mientras la plata se mueve adentro del Durable Object.
+    invariante: 'el asiento tambien sale por el outbox',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '  for (const a of asientos) {\n    sql.exec(\n      \'INSERT INTO outbox (tipo, cuerpo, correlacion_id, creado_en) VALUES (?, ?, ?, ?)\',\n      TIPO_ASIENTO,',
+    a: '  for (const a of asientos.slice(0, 0)) {\n    sql.exec(\n      \'INSERT INTO outbox (tipo, cuerpo, correlacion_id, creado_en) VALUES (?, ?, ?, ?)\',\n      TIPO_ASIENTO,',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Si lo publicado no se marca, se republica en cada pasada para siempre. D1 lo
+    // absorbe —las claves primarias estan— asi que no se rompe nada: simplemente el
+    // objeto no para nunca, y la cola nunca se vacia.
+    invariante: 'lo publicado se marca como publicado',
+    archivo: 'src/billetera/repositorio.ts',
+    de: 'export function marcarPublicadas(sql: Sql, ids: readonly number[], momento: string): void {\n  for (const id of ids) {',
+    a: 'export function marcarPublicadas(sql: Sql, ids: readonly number[], momento: string): void {\n  for (const id of ids.slice(0, 0)) {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Sin contar los intentos, la espera nunca crece: el objeto despierta en bucle
+    // contra una D1 que no contesta, y el diagnostico no tiene nada que mostrar.
+    invariante: 'un intento fallido se cuenta',
+    archivo: 'src/index.ts',
+    de: '        enUnaTransaccion(this.ctx, () => contarIntento(this.sql, ids))',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // ESTA es la linea que hace que el publicador arranque solo. Sin ella los
+    // eventos esperan a que alguien vuelva a tocar la billetera —podrian ser
+    // meses— y no falla nada: `saldo()` y `reconciliar()` siguen dando bien.
+    invariante: 'el outbox pendiente programa la alarma',
+    archivo: 'src/index.ts',
+    de: '      intentosDeLaCabeza: cabeza === null ? null : cabeza.intentos,',
+    a: '      intentosDeLaCabeza: null,',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Y que el vencimiento no pierda su alarma cuando el outbox tambien pide una:
+    // gana el mas cercano, no el mas lejano.
+    invariante: 'la alarma que decidio alarma.ts es la que se programa',
+    archivo: 'src/index.ts',
+    de: '    else await this.ctx.storage.setAlarm(cuando)',
+    a: '    else await this.ctx.storage.setAlarm(cuando + 60 * 60 * 1000)',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Toda operacion reprograma, no solo las que tocan reservas. La version
+    // anterior lo dejaba a criterio de cada metodo y `acreditar` no lo hacia.
+    invariante: 'toda operacion reprograma la alarma',
+    archivo: 'src/index.ts',
+    de: '    const r = this.aplicar(op, reserva_id, operar)\n    await this.reprogramarAlarma()',
+    a: '    const r = this.aplicar(op, reserva_id, operar)',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'la alarma publica lo que quedo pendiente',
+    archivo: 'src/index.ts',
+    de: '    await this.publicar()\n\n    await this.reprogramarAlarma()',
+    a: '    await this.reprogramarAlarma()',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Una sola publicacion por vez. El `await` a D1 ABRE la compuerta de entrada
+    // del objeto —input gates protegen solo durante storage— asi que la alarma
+    // puede dispararse mientras un `publicar()` por RPC espera a D1.
+    invariante: 'dos publicaciones no se solapan',
+    archivo: 'src/index.ts',
+    de: '    if (this.publicando) return { publicados: 0, pendientes: resumenDelOutbox(this.sql).pendientes }',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Una reserva descuadrada no puede tapar el outbox: si `alarm()` tirara,
+    // Cloudflare reintenta unas veces y despues deja de hacerlo, con el outbox
+    // pendiente y sin nadie que lo despierte.
+    invariante: 'una liberacion que falla no arrastra al publicador',
+    archivo: 'src/index.ts',
+    de: '      try {\n        this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n        this.liberacionesFallidas.delete(reserva_id)\n      } catch (e) {',
+    a: '      this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n      this.liberacionesFallidas.delete(reserva_id)\n      try {\n      } catch (e) {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El oraculo de la carpeta de migraciones. La version anterior de
+    // `check-esquema.mjs` leia SOLO `0001_cimientos.sql` con la ruta escrita a
+    // mano, y 0002 reconstruye `ledger_copia`: el oraculo habria seguido aprobando
+    // la definicion de una tabla que ya no existe.
+    invariante: 'check-esquema mira TODAS las migraciones, no la primera',
+    archivo: 'herramientas/check-esquema.mjs',
+    de: '  for (const { archivo, check } of enSql) {',
+    a: '  for (const { archivo, check } of enSql.slice(0, 1)) {',
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    // Y que una lista vacia no pase por OK. Es la forma que tomaria un cambio en
+    // como se escribe la columna: la expresion regular deja de encontrarla y un
+    // bucle sobre cero elementos no se queja de nada.
+    invariante: 'check-esquema falla si no encuentra ningun CHECK que comparar',
+    archivo: 'herramientas/check-esquema.mjs',
+    de: '  if (enSql.length === 0) {',
+    a: '  if (false) {',
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    // Y la deriva entre lo que el arnes migra y lo que wrangler despliega. Sin
+    // esto, las pruebas del publicador pueden aprobar un esquema de D1 que nadie
+    // va a tener nunca, con todo en verde.
+    invariante: 'el arnes no puede migrar una carpeta distinta de la que se despliega',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: '    if (deWrangler[0] !== declarado.migrationsDir) {',
+    a: '    if (false) {',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    invariante: 'el arnes declara un migrationsDir que es texto',
+    archivo: 'herramientas/arnes-del-runtime.mjs',
+    de: "  if (typeof d.migrationsDir !== 'string' || d.migrationsDir === '') {",
+    a: '  if (false) {',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+
   // --- La frontera con el sistema operativo --------------------------------
   // Un comando lanzado por nombre anda en Linux, anda en el CI, y muere en la
   // maquina del dueño: en Windows `npx` es `npx.cmd`, y desde Node 20.12 un `.cmd`
@@ -444,6 +638,438 @@ const MUTACIONES = [
     oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
   },
 
+  // --- El esquema del Durable Object y la transaccion ----------------------
+  // Estas son las que la entrega 1.0 dejo anotadas como obligatorias: hasta que el
+  // DDL y la transaccion salieran de las pruebas y entraran a `src/`, no habia
+  // linea de produccion que romper y las sondas del runtime no probaban nada
+  // nuestro. Ahora si.
+  {
+    invariante: 'el esquema del DO aplica STRICT en las bolsas',
+    archivo: 'src/billetera/esquema.ts',
+    de: '    restringida_a TEXT\n  ) STRICT`,',
+    a: '    restringida_a TEXT\n  )`,',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'el esquema del DO restringe los tipos de bolsa',
+    archivo: 'src/billetera/esquema.ts',
+    de: "const CHECK_TIPO_BOLSA = `IN ('${TIPOS_DE_BOLSA.join(\"', '\")}')`",
+    a: "const CHECK_TIPO_BOLSA = `IN ('${TIPOS_DE_BOLSA.join(\"', '\")}', 'inventada')`",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Una bolsa en cero no es una bolsa: es una fila que ensucia la precedencia.
+    invariante: 'una bolsa no puede quedar en cero ni en negativo',
+    archivo: 'src/billetera/esquema.ts',
+    de: '    monto         INTEGER NOT NULL CHECK (monto > 0),\n    vence_en      TEXT ${CHECK_VENCE_EN},\n    origen        TEXT NOT NULL,\n    restringida_a TEXT\n  ) STRICT`,',
+    a: '    monto         INTEGER NOT NULL,\n    vence_en      TEXT ${CHECK_VENCE_EN},\n    origen        TEXT NOT NULL,\n    restringida_a TEXT\n  ) STRICT`,',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Ley 2, hecha cumplir y no prometida.
+    invariante: 'un asiento no se puede editar',
+    archivo: 'src/billetera/esquema.ts',
+    de: "     SELECT RAISE(ABORT, 'un asiento no se edita: se compensa con otro asiento');",
+    a: '     SELECT 1;',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'un asiento no se puede borrar',
+    archivo: 'src/billetera/esquema.ts',
+    de: "     SELECT RAISE(ABORT, 'un asiento no se borra: se compensa con otro asiento');",
+    a: '     SELECT 1;',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // LA COTA que el plan maestro pedia y que no existia en ningun lado:
+    // `Reserva.consumido` estaba declarado y nada lo acotaba.
+    invariante: 'consumido no puede superar el total de las tomas',
+    archivo: 'src/billetera/esquema.ts',
+    de: '   WHEN NEW.consumido > (SELECT COALESCE(SUM(monto), 0) FROM tomas WHERE reserva_id = NEW.reserva_id)',
+    a: '   WHEN 0',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // LA LEY 5. Hasta esta entrega no tenia oraculo: si el DO escribia el asiento y
+    // el evento en dos `exec` sueltos, las catorce pruebas del runtime pasaban
+    // igual. Con la transaccion en un helper, hay una linea que romper.
+    invariante: 'el asiento y el evento del outbox van en la MISMA transaccion',
+    archivo: 'src/billetera/transaccion.ts',
+    de: '  return ctx.storage.transactionSync(cambios)',
+    a: '  return cambios()',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'la transaccion devuelve lo que se calculo adentro',
+    archivo: 'src/billetera/transaccion.ts',
+    de: 'export function enUnaTransaccion<T>(ctx: ConTransaccion, cambios: () => T): T {\n  return ctx.storage.transactionSync(cambios)',
+    a: 'export function enUnaTransaccion<T>(ctx: ConTransaccion, cambios: () => T): T {\n  ctx.storage.transactionSync(cambios)\n  return undefined as T',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'check-esquema compara tambien el esquema del Durable Object',
+    archivo: 'herramientas/check-esquema.mjs',
+    de: '  const contraDO = compararEsquemas(tipos, delDO)\n  if (!contraDO.ok) {',
+    a: '  const contraDO = compararEsquemas(tipos, delDO)\n  if (false) {',
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    invariante: 'check-esquema nota el orden distinto entre TypeScript y el DO',
+    archivo: 'herramientas/check-esquema.mjs',
+    de: "  return { ok: tipos.join('|') === delDO.join('|'), tipos, delDO }",
+    a: '  return { ok: true, tipos, delDO }',
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+
+  // --- El Durable Object sobre SQL ----------------------------------------
+  // Estas atacan la cascara: la traduccion a tablas y el camino que recorre toda
+  // operacion de plata. Su oraculo son las pruebas del runtime, que llaman al
+  // METODO PUBLICO del DO — no a las piezas por separado.
+  {
+    // LA LEY 5, contra el metodo publico. Sin la transaccion, un debito que falla
+    // deja el asiento escrito y el evento no, o al reves.
+    invariante: 'el metodo publico del DO escribe todo en UNA transaccion',
+    archivo: 'src/index.ts',
+    de: '    return enUnaTransaccion(this.ctx, () => {',
+    a: '    return ((f) => f())(() => {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'el evento del outbox se escribe con el asiento',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '  for (const e of eventos) {',
+    a: '  for (const e of []) {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Sin marcar la clave, la idempotencia no existe: el reintento vuelve a pagar.
+    invariante: 'la clave de idempotencia queda marcada al aplicar',
+    archivo: 'src/billetera/repositorio.ts',
+    de: "  sql.exec(\n    'INSERT INTO aplicadas (clave_idem, valor, aplicada_en) VALUES (?, ?, ?)',",
+    a: "  if (false) sql.exec(\n    'INSERT INTO aplicadas (clave_idem, valor, aplicada_en) VALUES (?, ?, ?)',",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El acumulado que `verificarInvariantes` compara contra las bolsas. Si no se
+    // persiste, la billetera se descuadra en la operacion siguiente.
+    invariante: 'los totales del ledger se persisten con el asiento',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '  for (const [bolsa, total] of estado.totales) {',
+    a: '  for (const [bolsa, total] of []) {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El estado tiene que salir del SQLite, no de una propiedad de la clase.
+    invariante: 'el estado se carga de la base en cada operacion',
+    archivo: 'src/billetera/repositorio.ts',
+    de: "      'SELECT tipo, monto, vence_en, origen, restringida_a FROM bolsas ORDER BY id',",
+    a: "      'SELECT tipo, monto, vence_en, origen, restringida_a FROM bolsas WHERE 0 ORDER BY id',",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El esquema se crea antes de atender nada. Sin esto, la primera operacion
+    // corre contra tablas que no existen.
+    invariante: 'el DO crea su esquema antes de atender',
+    archivo: 'src/index.ts',
+    de: '      for (const sentencia of ESQUEMA) ctx.storage.sql.exec(sentencia)',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // La reconciliacion exhaustiva es lo unico que puede notar que el acumulado
+    // se corrompio por su cuenta. Si siempre dijera que si, no serviria de nada.
+    invariante: 'la reconciliacion compara de verdad',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '    if (a !== b) diferencias.push(`${bolsa}: asientos ${a} vs totales_ledger ${b}`)',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+
+  {
+    // El resumen de un job exitoso no puede parecer un desastre. Ver
+    // `entornoParaOraculo` en binarios.mjs.
+    invariante: 'las corridas de mutacion no escriben en el resumen del CI',
+    archivo: 'herramientas/binarios.mjs',
+    de: '  delete copia.GITHUB_ACTIONS',
+    a: '',
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+  {
+    invariante: 'el entorno del oraculo conserva todo lo demas',
+    archivo: 'herramientas/binarios.mjs',
+    de: '  const copia = { ...entorno }',
+    a: '  const copia = {}',
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+
+  // --- El instante, la otra magnitud que ordena plata -----------------------
+  {
+    // LA FORMA UNICA. La primera version aceptaba los milisegundos como opcionales
+    // y afirmaba que las dos formas «ordenan igual entre si». No ordenan igual:
+    // `.` es 0x2E y `Z` es 0x5A, asi que dentro del mismo segundo la larga va
+    // antes que la corta — al reves que el reloj. Medido de punta a punta: la
+    // alarma decia YA y el filtro que la justifica decia TODAVIA NO.
+    invariante: 'el instante tiene UNA sola forma, con milisegundos',
+    archivo: 'src/dinero/momento.ts',
+    de: 'const FORMA = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$/',
+    a: 'const FORMA = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{3})?Z$/',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Y que la revision corra TAMBIEN cuando la operacion resulta repetida. Es el
+    // orden de dos lineas, y una auditoria midio que nada lo sostenia.
+    invariante: 'el momento se revisa aunque la operacion sea repetida',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  instante(op.momento)\n\n  const previo = estado.aplicadas.get(op.clave_idem)\n  if (previo === undefined) return null',
+    a: '  const previo = estado.aplicadas.get(op.clave_idem)\n  if (previo === undefined) {\n    instante(op.momento)\n    return null\n  }',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // El CHECK del lado de adentro de la base. La puerta de TypeScript no cubre lo
+    // que ya esta guardado ni lo que entre por otro camino.
+    invariante: 'un vencimiento mal escrito no entra en la base',
+    archivo: 'src/billetera/esquema.ts',
+    de: "  `${col} LIKE '${FORMA_INSTANTE}' AND NOT ${col} GLOB '${ALFABETO_INSTANTE}'`",
+    a: '  `${col} IS NOT NULL`',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Y que el CHECK mire el ALFABETO y no solo el ancho: sin la clase negada,
+    // `abcd-ef-ghTij:kl:mn.opqZ` entra.
+    invariante: 'el CHECK del instante mira tambien que sean digitos',
+    archivo: 'src/billetera/esquema.ts',
+    de: "const ALFABETO_INSTANTE = '*[^0-9.:TZ-]*'",
+    a: "const ALFABETO_INSTANTE = '*[^ -~]*'",
+    oraculo: ORACULO_RUNTIME,
+  },
+
+  // El vencimiento compara TEXTO (`vence_en <= momento`) y la alarma compara
+  // RELOJ (`Date.parse`). Con un huso distinto de `Z` los dos dejan de coincidir,
+  // y nada falla: la plata se cuenta mal. Lo encontro una auditoria adversarial.
+  {
+    invariante: 'un instante con otro huso no entra',
+    archivo: 'src/dinero/momento.ts',
+    de: '  if (!FORMA.test(valor)) {',
+    a: '  if (false) {',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // `2026-02-30` pasa la expresion regular y JavaScript la corre en silencio a
+    // `2026-03-02`. Una fecha corrida dos dias es peor que un error.
+    invariante: 'un instante con forma valida y fecha inexistente no entra',
+    archivo: 'src/dinero/momento.ts',
+    de: '  if (d.toISOString() !== valor) {',
+    a: '  if (false) {',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Una bolsa sin vencimiento es legitima; una con un vencimiento mal escrito no.
+    invariante: 'instanteOpcional no deja pasar cualquier cosa por ser opcional',
+    archivo: 'src/dinero/momento.ts',
+    de: '  return instante(valor)',
+    a: '  return valor as Instante',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // La revision vive en la puerta por la que pasan las cinco operaciones. Un
+    // lugar, no cinco — la sexta no se lo puede olvidar.
+    invariante: 'ninguna operacion entra con un momento mal escrito',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  instante(op.momento)',
+    a: '',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'el vencimiento de una acreditacion se revisa al entrar',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    vence_en: instanteOpcional(entrada.vence_en),',
+    a: '    vence_en: (entrada.vence_en ?? null) as string | null,',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'el vencimiento de una reserva se revisa al entrar',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  instante(entrada.vence_en)\n',
+    a: '',
+    oraculo: ORACULO_NUCLEO,
+  },
+
+  // --- Las reservas, el consumo parcial y la alarma -------------------------
+  {
+    // EL DEFECTO NACIDO DEL ARREGLO, y es el peor de la segunda vuelta. El
+    // try/catch que impide que una reserva rota se lleve puesto al publicador dejo
+    // a la alarma sin freno: la reserva sigue vencida y abierta, `reprogramarAlarma`
+    // la vuelve a ver, y programa para AHORA. Medido: ~185 disparos por segundo,
+    // sostenidos, sin un solo error visible. Con el contador, la espera crece.
+    invariante: 'una liberacion que falla no deja la alarma girando',
+    archivo: 'src/index.ts',
+    de: '        this.liberacionesFallidas.set(reserva_id, previos + 1)',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Y la otra mitad: que el exito lo limpie. Sin esto, una reserva que fallo una
+    // vez arrastra su backoff para siempre y las siguientes llegan tarde.
+    invariante: 'una liberacion que funciona limpia su contador',
+    archivo: 'src/index.ts',
+    de: '        this.liberacionesFallidas.delete(reserva_id)',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'el vencimiento vuelve a intentarse mas tarde, no en bucle',
+    archivo: 'src/billetera/alarma.ts',
+    de: '    motivos.push(m.ahora + retrasoPorIntentos(m.intentosDeLasVencidas))',
+    a: '    motivos.push(m.ahora)',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // El estado cerrado tiene que LLEGAR al nucleo, si no el rechazo del reuso no
+    // tiene que mirar. Las dos lineas de las que cuelga, una por mutacion.
+    invariante: 'el DO le pasa al nucleo la reserva que la operacion nombra',
+    archivo: 'src/index.ts',
+    de: '    return this.operar(op, entrada.reserva_id, (e) => reservar(e, op, entrada))',
+    a: '    return this.operar(op, undefined, (e) => reservar(e, op, entrada))',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'se carga la reserva nombrada aunque este cerrada',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '        : "SELECT reserva_id, consumido, vence_en, estado FROM reservas WHERE estado = \'abierta\' OR reserva_id = ?",',
+    a: '        : "SELECT reserva_id, consumido, vence_en, estado FROM reservas WHERE estado = \'abierta\' OR (reserva_id = ? AND 0)",',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // EL BUCLE QUE NADIE PROBABA. Una auditoria lo midio: con esta mutacion, las
+    // 73 pruebas del nucleo y las 48 del runtime pasaban enteras, porque todas
+    // consumian un monto que entraba en la PRIMERA toma. Si el bucle se corta,
+    // `consumido` dice que se gasto X y las bolsas retenidas todavia tienen parte
+    // de X: la misma plata contada dos veces.
+    invariante: 'el consumo que cruza una toma sigue en la siguiente',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    porConsumir -= saca',
+    a: '    porConsumir = 0',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'el consumo no saca mas de lo que la bolsa tiene',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    const saca = Math.min(porConsumir, b.monto)',
+    a: '    const saca = porConsumir',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Un reserva_id se usa UNA vez. La version anterior rechazaba solo si estaba
+    // ABIERTA, y el reuso de un id ya cerrado dejaba las tomas viejas (PK
+    // `(reserva_id, orden)` con `INSERT OR IGNORE`), el vencimiento viejo, y la
+    // alarma en bucle con la clave `vencimiento:<reserva_id>` ya marcada.
+    invariante: 'un reserva_id no se reusa, ni siquiera despues de cerrado',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  if (estado.reservas.has(entrada.reserva_id)) {',
+    a: "  if (estado.reservas.get(entrada.reserva_id)?.estado === 'abierta') {",
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // El invariante 2 recorre la UNION de los dos lados. Iterando solo `totales`,
+    // una bolsa de un tipo que nunca tuvo asiento es invisible: plata inventada
+    // que el oraculo del camino caliente aprueba.
+    invariante: 'el invariante del ledger mira tambien las bolsas sin historia',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  for (const tipo of new Set([...estado.totales.keys(), ...enBolsas.keys()])) {',
+    a: '  for (const tipo of estado.totales.keys()) {',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // LA COTA que estuvo declarada desde la Fase 0 sin nada que la hiciera
+    // cumplir. Sin ella el remanente que vuelve al usuario sale negativo.
+    invariante: 'no se puede consumir mas de lo que la reserva tiene',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  if (entrada.monto > disponible) {',
+    a: '  if (false) {',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'consumirReserva incrementa consumido de verdad',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  reservas.set(r.reserva_id, { ...r, consumido: guaranies(r.consumido + entrada.monto) })',
+    a: '  reservas.set(r.reserva_id, { ...r, consumido: r.consumido })',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // El invariante 4 tuvo que aprender a restar `consumido`. Con la version
+    // anterior, toda reserva consumida a medias quedaba acusada de descuadre.
+    // Las tres de acá arriba atacan codigo PURO y estaban declaradas con el
+    // oraculo del runtime, que es el caro. Lo noto una auditoria: `consumirReserva`
+    // no depende de Cloudflare, asi que su lugar es `tests/`, que es lo que la
+    // mutacion corre decenas de veces.
+    invariante: 'retenido cuadra con lo que las reservas abiertas NO gastaron',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    .reduce((total, r) => total + r.tomas.reduce((s, t) => s + t.monto, 0) - r.consumido, 0)',
+    a: '    .reduce((total, r) => total + r.tomas.reduce((s, t) => s + t.monto, 0), 0)',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Una reserva que nace vencida —reloj corrido, reintento demorado, campaña de
+    // un minuto— dejaba el objeto sin alarma y la plata retenida para siempre.
+    // Lo encontro una prueba, no una auditoria.
+    // Las cuatro ramas de la decision viven en `billetera/alarma.ts`, puras, y por
+    // eso su oraculo es el nucleo y no el runtime. Estaban adentro del Durable
+    // Object y ESTA mutacion sobrevivio a cuarenta y ocho pruebas del runtime: el
+    // estado donde la rama manda —algo vencido Y el outbox vacio— solo se observa
+    // desde afuera del objeto ganandole una carrera a la alarma que se dispara
+    // sola. Se movio la decision, no se agrego una prueba mas.
+    invariante: 'una reserva ya vencida igual queda con alarma',
+    archivo: 'src/billetera/alarma.ts',
+    de: '  if (m.intentosDeLasVencidas !== null) {',
+    a: '  if (false) {',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'la alarma queda programada para el vencimiento de la reserva',
+    archivo: 'src/billetera/alarma.ts',
+    de: '  } else if (m.proximoVencimiento !== null) {\n    motivos.push(Date.parse(m.proximoVencimiento))',
+    a: '  } else if (false) {\n    motivos.push(Date.parse(m.proximoVencimiento))',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'el outbox pendiente es un motivo para despertar',
+    archivo: 'src/billetera/alarma.ts',
+    de: '  if (m.intentosDeLaCabeza !== null) {',
+    a: '  if (false) {',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'sin ningun motivo no queda alarma',
+    archivo: 'src/billetera/alarma.ts',
+    de: '  if (motivos.length === 0) return null',
+    a: '  if (motivos.length === 0) return m.ahora',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'entre los motivos de la alarma gana el mas cercano (decision pura)',
+    archivo: 'src/billetera/alarma.ts',
+    de: '  return Math.min(...motivos)',
+    a: '  return Math.max(...motivos)',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Una alarma que sobrevive a la reserva que la justificaba despierta el objeto
+    // para nada, para siempre.
+    invariante: 'sin reservas abiertas la alarma se borra',
+    archivo: 'src/index.ts',
+    de: '    if (cuando === null) await this.ctx.storage.deleteAlarm()',
+    a: '    if (false) await this.ctx.storage.deleteAlarm()',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Si la alarma liberara todo lo que encuentra, una campaña en curso se
+    // cancelaria sola. Es el defecto mas caro que puede tener este mecanismo.
+    invariante: 'la alarma solo libera lo que YA vencio',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '  const vencidas = abiertas.filter((r) => r.vence_en <= momento).map((r) => r.reserva_id)',
+    a: '  const vencidas = abiertas.map((r) => r.reserva_id)',
+    oraculo: ORACULO_RUNTIME,
+  },
   // --- Mutar tambien el arnes ---------------------------------------------
   // Un arnes que no puede fallar hace que todo pase. Si estas sobreviven, las
   // pruebas no estan probando la caida: estan probando nada.
@@ -573,7 +1199,7 @@ function comprobarLineaBase() {
   for (const [nombre, cmd] of oraculos) {
     const [ejecutable, ...args] = cmd
     try {
-      execFileSync(ejecutable, args, { stdio: 'pipe', cwd: RAIZ })
+      execFileSync(ejecutable, args, { stdio: 'pipe', cwd: RAIZ, env: entornoParaOraculo(process.env) })
       console.log(`  ✓  ${nombre}`)
     } catch {
       console.log(`  ✗  ${nombre}`)
@@ -662,7 +1288,12 @@ for (const m of MUTACIONES) {
   try {
     // `timeout` porque un oraculo del runtime que se cuelgue dejaba el arbol
     // mutado indefinidamente, con el codigo del dinero escrito en disco.
-    execFileSync(cmd, args, { stdio: 'pipe', cwd: RAIZ, timeout: 300_000 })
+    execFileSync(cmd, args, {
+      stdio: 'pipe',
+      cwd: RAIZ,
+      timeout: 300_000,
+      env: entornoParaOraculo(process.env),
+    })
   } catch {
     murio = true // el oraculo fallo: la mutacion murio, que es lo que queremos
   } finally {

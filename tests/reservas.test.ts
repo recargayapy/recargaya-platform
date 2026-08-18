@@ -23,13 +23,14 @@ import {
   billeteraVacia,
   acreditar,
   reservar,
+  consumirReserva,
   liberarReserva,
   verificarInvariantes,
 } from '../src/billetera/nucleo.js'
 
-const AHORA = '2026-08-14T12:00:00Z'
-const VENCE_CREDITO = '2026-12-31T00:00:00Z'
-const VENCE_RESERVA = '2026-08-21T00:00:00Z'
+const AHORA = '2026-08-14T12:00:00.000Z'
+const VENCE_CREDITO = '2026-12-31T00:00:00.000Z'
+const VENCE_RESERVA = '2026-08-21T00:00:00.000Z'
 
 function op(clave: string): { clave_idem: string; correlacion_id: string; momento: string } {
   return { clave_idem: clave, correlacion_id: 'c1', momento: AHORA }
@@ -122,7 +123,7 @@ describe('acreditar() rechaza retenido: solo se entra por reservar()', () => {
   })
 })
 
-describe('reservar() rechaza un reserva_id con reserva abierta existente', () => {
+describe('reservar() rechaza un reserva_id ya usado', () => {
   it('caso medido del issue: dos reservas legitimas con el mismo reserva_id no pisan la primera', () => {
     const inicial = acreditar(billeteraVacia('b1'), op('semilla'), {
       monto: guaranies(100_000),
@@ -141,7 +142,7 @@ describe('reservar() rechaza un reserva_id con reserva abierta existente', () =>
     // y los 30.000 de la primera reserva quedaban huerfanos.
     expect(() =>
       reservar(conR1, op('res-2'), { reserva_id: 'R1', monto: guaranies(20_000), vence_en: VENCE_RESERVA }),
-    ).toThrow(/ya existe una reserva abierta/)
+    ).toThrow(/ya se uso/)
 
     // La primera reserva sigue entera: nada se perdio.
     expect(conR1.reservas.get('R1')?.tomas.reduce((a, t) => a + t.monto, 0)).toBe(30_000)
@@ -175,7 +176,24 @@ describe('reservar() rechaza un reserva_id con reserva abierta existente', () =>
     expect(segunda.valor).toEqual(primera.valor)
   })
 
-  it('un reserva_id ya liberado se puede volver a usar', () => {
+  it('un reserva_id ya liberado TAMPOCO se puede volver a usar', () => {
+    // Esta prueba afirmaba lo contrario, y una auditoria adversarial la volteo
+    // midiendo tres daños distintos del mismo reuso sobre workerd. El peor:
+    // `tomas` tiene PK `(reserva_id, orden)` y se escribe con `INSERT OR IGNORE`,
+    // asi que con el id reusado las tomas NUEVAS se descartan en silencio y quedan
+    // las de la reserva vieja. Medido: retenido 50.000 en bolsas contra 20.000 en
+    // reservas, y de ahi en adelante TODA operacion sobre esa billetera tira por
+    // el invariante 3 — incluida `liberarReserva`. La plata queda adentro sin
+    // camino de salida.
+    //
+    // Los otros dos: el upsert de `reservas` no toca `vence_en` (la reserva nueva
+    // hereda el vencimiento de la vieja), y la clave del vencimiento es
+    // `vencimiento:<reserva_id>`, asi que la segunda expiracion sale por
+    // `aplicadas` como repetida mientras la alarma se reprograma para «ahora» en
+    // bucle.
+    //
+    // Se podia arreglar cada uno. Se arreglo la categoria: el reserva_id ES la
+    // identidad del ciclo de vida. Otra reserva, otro id.
     const inicial = acreditar(billeteraVacia('b1'), op('semilla'), {
       monto: guaranies(100_000),
       bolsa: 'disponible',
@@ -185,9 +203,16 @@ describe('reservar() rechaza un reserva_id con reserva abierta existente', () =>
 
     const conR1 = reservar(inicial, op('res-1'), { reserva_id: 'R1', monto: guaranies(30_000), vence_en: VENCE_RESERVA }).estado
     const liberado = liberarReserva(conR1, op('lib-1'), { reserva_id: 'R1' }).estado
+    expect(liberado.reservas.get('R1')?.estado).toBe('cancelada')
 
     expect(() =>
       reservar(liberado, op('res-2'), { reserva_id: 'R1', monto: guaranies(10_000), vence_en: VENCE_RESERVA }),
+    ).toThrow(/ya se uso \(quedo cancelada\)/)
+
+    // Y un id distinto sobre el mismo estado si anda: lo que se rechaza es el
+    // reuso, no reservar de nuevo.
+    expect(() =>
+      reservar(liberado, op('res-3'), { reserva_id: 'R2', monto: guaranies(10_000), vence_en: VENCE_RESERVA }),
     ).not.toThrow()
   })
 })
@@ -227,5 +252,177 @@ describe('liberarReserva() — la regla anticajero por el camino real', () => {
     const totalBolsas = (e: EstadoBilletera): number => e.bolsas.reduce((a, b) => a + b.monto, 0)
     expect(totalBolsas(segunda.estado)).toBe(totalBolsas(primera.estado))
     expect(() => verificarInvariantes(segunda.estado)).not.toThrow()
+  })
+})
+
+describe('consumirReserva() — el consumo que cruza mas de una bolsa retenida', () => {
+  // ESTAS PRUEBAS EXISTEN PORQUE FALTABAN, y lo midio una auditoria adversarial:
+  // `consumirReserva` no aparecia en un solo archivo de `tests/`, y las cinco
+  // llamadas del runtime consumian siempre un monto que entraba entero en la
+  // PRIMERA toma. Con `porConsumir -= saca` reemplazado por `porConsumir = 0`
+  // —o sea, consumir solo de la primera bolsa y nunca seguir— las dos suites
+  // completas pasaban: 73 del nucleo y 48 sobre workerd.
+  //
+  // Es la funcion nueva de la entrega y la que mas plata mueve por rama. Y sus
+  // mutaciones estaban declaradas con el oraculo del runtime, que es el caro:
+  // la funcion es pura y no toca Cloudflare, asi que su lugar es acá.
+
+  /** 30.000 de credito que vence antes + 70.000 de disponible. La precedencia
+   *  toma primero el credito, asi que una reserva de 50.000 sale de DOS bolsas:
+   *  30.000 del credito y 20.000 del disponible. Ese es el estado que hace falta
+   *  para que el bucle del reparto tenga algo que repartir. */
+  function conReservaDeDosTomas(): EstadoBilletera {
+    const conCredito = acreditar(billeteraVacia('b1'), op('sem-cred'), {
+      monto: guaranies(30_000),
+      bolsa: 'credito_promocion',
+      concepto: 'premio',
+      origen: 'promo-agosto',
+      vence_en: VENCE_CREDITO,
+    }).estado
+    const conDisponible = acreditar(conCredito, op('sem-disp'), {
+      monto: guaranies(70_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'semilla',
+    }).estado
+    const r = reservar(conDisponible, op('res-1'), {
+      reserva_id: 'r1',
+      monto: guaranies(50_000),
+      vence_en: VENCE_RESERVA,
+    }).estado
+
+    // La premisa de todo este describe. Si algun dia la precedencia cambia y la
+    // reserva sale de una sola bolsa, estas pruebas dejan de probar lo que dicen
+    // — y esta linea lo grita en vez de dejarlas pasar en verde.
+    expect(r.reservas.get('r1')?.tomas.length).toBe(2)
+    return r
+  }
+
+  const retenidoDe = (e: EstadoBilletera) =>
+    e.bolsas.filter((b) => b.tipo === 'retenido').reduce((a, b) => a + b.monto, 0)
+
+  it('un consumo que entra en la primera toma no toca la segunda', () => {
+    const estado = conReservaDeDosTomas()
+    const { estado: despues, valor } = consumirReserva(estado, op('u1'), {
+      reserva_id: 'r1',
+      monto: guaranies(10_000),
+    })
+
+    expect(valor.consumido).toBe(10_000)
+    expect(valor.disponible).toBe(40_000)
+    expect(retenidoDe(despues)).toBe(40_000)
+    // Quedan las dos bolsas: la primera mordida, la segunda intacta.
+    const retenidas = despues.bolsas.filter((b) => b.tipo === 'retenido')
+    expect(retenidas.map((b) => b.monto)).toEqual([20_000, 20_000])
+    expect(() => verificarInvariantes(despues)).not.toThrow()
+  })
+
+  it('un consumo que CRUZA la primera toma sigue en la segunda', () => {
+    // 40.000 sobre tomas de 30.000 + 20.000: se vacia la primera y se muerden
+    // 10.000 de la segunda. Es el caso que ninguna prueba ejercitaba.
+    const estado = conReservaDeDosTomas()
+    const { estado: despues, valor } = consumirReserva(estado, op('u1'), {
+      reserva_id: 'r1',
+      monto: guaranies(40_000),
+    })
+
+    expect(valor.consumido).toBe(40_000)
+    expect(valor.disponible).toBe(10_000)
+    // LA asercion: si el bucle se cortara en la primera bolsa, acá quedarian
+    // 20.000 en vez de 10.000 — o sea 10.000 retenidos que `consumido` ya dio
+    // por gastados. Plata contada dos veces.
+    expect(retenidoDe(despues)).toBe(10_000)
+    expect(despues.bolsas.filter((b) => b.tipo === 'retenido').map((b) => b.monto)).toEqual([10_000])
+    expect(() => verificarInvariantes(despues)).not.toThrow()
+  })
+
+  it('consumir la reserva ENTERA vacia las dos bolsas retenidas', () => {
+    const estado = conReservaDeDosTomas()
+    const { estado: despues, valor } = consumirReserva(estado, op('u1'), {
+      reserva_id: 'r1',
+      monto: guaranies(50_000),
+    })
+
+    expect(valor.consumido).toBe(50_000)
+    expect(valor.disponible).toBe(0)
+    expect(despues.bolsas.filter((b) => b.tipo === 'retenido')).toEqual([])
+    expect(() => verificarInvariantes(despues)).not.toThrow()
+  })
+
+  it('dos consumos sucesivos cruzan el limite igual que uno solo', () => {
+    // El estado intermedio existe de verdad —se persiste entre una llamada y la
+    // otra— asi que el segundo consumo arranca de bolsas ya mordidas.
+    const estado = conReservaDeDosTomas()
+    const uno = consumirReserva(estado, op('u1'), { reserva_id: 'r1', monto: guaranies(25_000) }).estado
+    const dos = consumirReserva(uno, op('u2'), { reserva_id: 'r1', monto: guaranies(15_000) })
+
+    expect(dos.valor.consumido).toBe(40_000)
+    expect(retenidoDe(dos.estado)).toBe(10_000)
+    expect(() => verificarInvariantes(dos.estado)).not.toThrow()
+  })
+
+  it('lo consumido NO vuelve: liberar despues devuelve solo el remanente', () => {
+    // El otro lado de la ley 11. Lo que se gasto salio de la billetera; lo que
+    // queda vuelve A SU BOLSA DE ORIGEN, y `devolver()` entrega en orden inverso
+    // —desde la ultima toma hacia atras— asi que lo que vuelve es el disponible y
+    // no el credito que estaba por vencer.
+    const estado = conReservaDeDosTomas()
+    const consumido = consumirReserva(estado, op('u1'), {
+      reserva_id: 'r1',
+      monto: guaranies(40_000),
+    }).estado
+
+    const { estado: libre, valor } = liberarReserva(consumido, op('lib-1'), { reserva_id: 'r1' })
+    expect(valor.devuelto).toBe(10_000)
+    expect(libre.bolsas.filter((b) => b.tipo === 'retenido')).toEqual([])
+    // 100.000 - 40.000 gastados.
+    expect(libre.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(60_000)
+    expect(() => verificarInvariantes(libre)).not.toThrow()
+  })
+
+  it('no se puede consumir mas de lo que queda, ni por un guarani', () => {
+    const estado = conReservaDeDosTomas()
+    const uno = consumirReserva(estado, op('u1'), { reserva_id: 'r1', monto: guaranies(20_000) }).estado
+
+    expect(() =>
+      consumirReserva(uno, op('u2'), { reserva_id: 'r1', monto: guaranies(30_001) }),
+    ).toThrow(/quedan 30000/)
+    expect(() =>
+      consumirReserva(uno, op('u3'), { reserva_id: 'r1', monto: guaranies(30_000) }),
+    ).not.toThrow()
+  })
+
+  it('una reserva que no esta abierta no se consume', () => {
+    const estado = conReservaDeDosTomas()
+    const libre = liberarReserva(estado, op('lib-1'), { reserva_id: 'r1' }).estado
+
+    expect(() =>
+      consumirReserva(libre, op('u1'), { reserva_id: 'r1', monto: guaranies(1_000) }),
+    ).toThrow(/no esta abierta/)
+    expect(() =>
+      consumirReserva(libre, op('u2'), { reserva_id: 'no-existe', monto: guaranies(1_000) }),
+    ).toThrow(/reserva desconocida/)
+  })
+
+  it('consumir cero o negativo no es consumir', () => {
+    const estado = conReservaDeDosTomas()
+    for (const monto of [0, -1]) {
+      expect(() =>
+        consumirReserva(estado, op('u1'), { reserva_id: 'r1', monto: guaranies(monto) }),
+      ).toThrow(/monto positivo/)
+    }
+  })
+
+  it('el mismo consumo con la misma clave no gasta dos veces', () => {
+    const estado = conReservaDeDosTomas()
+    const primera = consumirReserva(estado, op('u1'), { reserva_id: 'r1', monto: guaranies(40_000) })
+    const segunda = consumirReserva(primera.estado, op('u1'), {
+      reserva_id: 'r1',
+      monto: guaranies(40_000),
+    })
+
+    expect(segunda.repetida).toBe(true)
+    expect(segunda.valor).toEqual(primera.valor)
+    expect(retenidoDe(segunda.estado)).toBe(retenidoDe(primera.estado))
   })
 })

@@ -16,7 +16,7 @@ function ventaDePrueba(monto: number, conVendedor = true): Venta {
   return {
     pedido_id: 'RY-2026-000001',
     correlacion_id: 'corr-1',
-    momento: '2026-08-14T12:00:00Z',
+    momento: '2026-08-14T12:00:00.000Z',
     monto: guaranies(monto),
     comprador_id: 'persona-comprador',
     creador_id: 'persona-creador',

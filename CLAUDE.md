@@ -118,14 +118,22 @@ sería un doble más permisivo que el original, y probaría el doble.
 npm run probar:runtime    # sólo las del runtime, mientras se trabaja
 ```
 
-**Una prueba de `pruebas-runtime/` no vale por estar ahí.** Una auditoría midió
-que, de las que hay hoy, sólo dos están ancladas a código de `src/`; unas pocas
-más cubren una convención de este árbol, y el resto son **sondas de la
-plataforma**: verifican que Cloudflare se comporta como suponemos, no que nuestro
-código lo use. Medido: si el `BilleteraDO` escribiera el asiento y el evento del
-outbox en dos `exec` sueltos, sin transacción, todas pasarían igual — **la ley 5
-todavía no tiene oráculo.** El encabezado de `pruebas-runtime/runtime.test.ts`
-lleva el reparto exacto.
+**Una prueba de `pruebas-runtime/` no vale por estar ahí.** La mayoría están
+ancladas a código de `src/` y tienen una mutación que las mata; unas pocas cubren
+una convención de este árbol, y tres son **sondas de la plataforma**: verifican
+que Cloudflare se comporta como suponemos, no que nuestro código lo use. El
+encabezado de `pruebas-runtime/runtime.test.ts` lleva el reparto exacto y es el
+único lugar donde vive ese número — este párrafo ya quedó viejo una vez.
+
+**La ley 5 ya tiene oráculo contra el método público.** Lo tuvo pendiente un
+tramo entero: las pruebas llamaban a `ctx.storage.transaction()` directo, o sea
+comprobaban que Cloudflare implementa transacciones, no que nuestro código las
+use — medido entonces, si el `BilleteraDO` escribía el asiento y el evento en dos
+`exec` sueltos, todas pasaban igual. Hoy la transacción vive en
+`src/billetera/transaccion.ts`, la prueba llama a `acreditar()` del DO con una
+colisión de PRIMARY KEY sembrada —o sea con la caída ocurriendo *después* de que
+las bolsas se reescribieron— y la mutación que le saca `enUnaTransaccion` muere
+ahí. La otra mitad, sacar el evento del outbox hacia D1, la cierra el publicador.
 
 De ahí la regla para las que vengan:
 

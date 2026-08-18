@@ -17,6 +17,12 @@
  *     aprueban un archivo que las pruebas no usan. Medido: con un
  *     `configPath: './otro-wrangler.jsonc'` de fecha 2023, el oraculo firmaba
  *     2026-08-01 y las pruebas corrian con 2023.
+ *   · `migrationsDir` — de ahi salen las migraciones de D1 que el arnes aplica a
+ *     la base local antes de correr las pruebas del publicador. Si apuntara a
+ *     otro lado, las pruebas correrian contra un esquema de D1 que no es el que
+ *     se despliega: el caso de la tabla de juguete, con otro disfraz. Que sea el
+ *     MISMO que declara `wrangler.jsonc` lo comprueba `check-runtime.mjs`; acá
+ *     solo se valida que este y sea texto.
  */
 
 import { readFileSync } from 'node:fs'
@@ -44,8 +50,11 @@ export function leerArnes(texto) {
       `${RUTA} declara configPath "${d.configPath}" y tiene que ser "${CONFIG_ESPERADO}": si el arnes lee otra configuracion, los oraculos aprueban un archivo que las pruebas no usan`,
     )
   }
+  if (typeof d.migrationsDir !== 'string' || d.migrationsDir === '') {
+    throw new Error(`${RUTA} no declara un \`migrationsDir\` que sea texto`)
+  }
 
-  return { environment: d.environment, configPath: d.configPath }
+  return { environment: d.environment, configPath: d.configPath, migrationsDir: d.migrationsDir }
 }
 
 /** Lee el archivo desde la raiz que se le pase. Separado de `leerArnes` para que

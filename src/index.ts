@@ -14,11 +14,32 @@
 import { DurableObject } from 'cloudflare:workers'
 import {
   type EstadoBilletera,
-  billeteraVacia,
+  type Operacion,
+  type Resultado,
   acreditar,
   debitar,
+  reservar,
+  liberarReserva,
+  consumirReserva,
   verificarInvariantes,
+  verificarDelta,
 } from './billetera/nucleo.js'
+import { ESQUEMA } from './billetera/esquema.js'
+import { enUnaTransaccion } from './billetera/transaccion.js'
+import {
+  type Sql,
+  cabezaDelOutbox,
+  cargarEstado,
+  contarIntento,
+  guardarDelta,
+  marcarPublicadas,
+  outboxPendiente,
+  reconciliar,
+  reservasVencidas,
+  resumenDelOutbox,
+} from './billetera/repositorio.js'
+import { LOTE, PASADAS_MAXIMAS, sentencias } from './billetera/publicador.js'
+import { cuandoDespertar } from './billetera/alarma.js'
 import { guaranies } from './dinero/monto.js'
 
 export interface Entorno {
@@ -32,73 +53,381 @@ export interface Entorno {
 /**
  * Una billetera por usuario. Serializa TODO movimiento de plata de esa cuenta.
  *
- * Es una cascara delgada a proposito: persiste y delega. La logica vive en
- * `billetera/nucleo.ts`, que es puro y por lo tanto probable sin runtime.
- * Si la logica viviera aca, la mutacion seria impracticable.
+ * Sigue siendo una cascara delgada: persiste y delega. La logica del dinero vive
+ * en `billetera/nucleo.ts`, que es puro y por lo tanto probable sin runtime; la
+ * traduccion a tablas vive en `billetera/repositorio.ts`. Este archivo es el
+ * unico que sabe de las dos cosas a la vez, y por eso es corto a proposito.
+ *
+ * QUE CAMBIO RESPECTO DE LA VERSION ANTERIOR, y por que
+ *
+ * Guardaba el estado entero como un JSON en la clave `estado`. Medido: 244 bytes
+ * por asiento contra un tope de 128 KiB por valor de Durable Object, o sea una
+ * billetera INESCRIBIBLE a los ~534 movimientos. Ademas reescribia el historial
+ * completo en cada operacion, y el mapa de idempotencia crecia para siempre.
+ *
+ * Ahora el estado vive en el SQLite del propio objeto, que es lo que el plan
+ * maestro pedia desde el principio y lo que la ley 5 necesita: el asiento y el
+ * evento del outbox se escriben en la MISMA transaccion.
  */
 export class BilleteraDO extends DurableObject<Entorno> {
-  private estado: EstadoBilletera | null = null
-
-  private async cargar(): Promise<EstadoBilletera> {
-    if (this.estado !== null) return this.estado
-    const guardado = await this.ctx.storage.get<string>('estado')
-    this.estado =
-      guardado === undefined
-        ? billeteraVacia(this.ctx.id.toString())
-        : (rehidratar(guardado))
-    return this.estado
+  constructor(ctx: DurableObjectState, env: Entorno) {
+    super(ctx, env)
+    // El esquema se crea antes de atender nada. `blockConcurrencyWhile` es lo que
+    // garantiza que ninguna peticion vea el objeto a medio inicializar — sin el,
+    // la primera operacion podria correr contra tablas que todavia no existen.
+    // El DDL es idempotente (`IF NOT EXISTS`), asi que corre en cada instancia.
+    ctx.blockConcurrencyWhile(async () => {
+      for (const sentencia of ESQUEMA) ctx.storage.sql.exec(sentencia)
+    })
   }
 
-  private async guardar(nuevo: EstadoBilletera): Promise<void> {
-    // El invariante se comprueba ANTES de persistir. Un estado descuadrado no
-    // llega al disco: falla la operacion, no la contabilidad.
-    verificarInvariantes(nuevo)
-    this.estado = nuevo
-    await this.ctx.storage.put('estado', deshidratar(nuevo))
+  private get sql() {
+    return this.ctx.storage.sql as unknown as Sql
   }
 
-  async acreditar(op: Parameters<typeof acreditar>[1], entrada: Parameters<typeof acreditar>[2]) {
-    const r = acreditar(await this.cargar(), op, entrada)
-    if (!r.repetida) await this.guardar(r.estado)
-    return { valor: r.valor, repetida: r.repetida }
+  /**
+   * reserva_id → veces seguidas que su liberacion por vencimiento fallo.
+   *
+   * EN MEMORIA a proposito, y no en una columna. Lo unico que tiene que evitar es
+   * el bucle de alarmas DENTRO de la vida de esta instancia, que es donde el bucle
+   * ocurre: mientras la alarma se dispara, el objeto no se apaga. Si el objeto se
+   * reinicia, el contador arranca de cero, reintenta una vez y vuelve a frenar —
+   * que es el comportamiento correcto para un fallo que podria haberse arreglado
+   * solo.
+   *
+   * Una columna nueva en `reservas` habria pedido un ALTER sobre tablas que ya
+   * existen en objetos desplegados, y SQLite no tiene `ADD COLUMN IF NOT EXISTS`:
+   * seria un mecanismo de migracion entero para un contador que no hace falta que
+   * sobreviva a nada.
+   */
+  private liberacionesFallidas = new Map<string, number>()
+
+  /**
+   * El camino que recorre toda operacion de plata. Uno solo, a proposito.
+   *
+   * Cargar → llamar al nucleo → comprobar los invariantes → escribir TODO junto.
+   *
+   * Los invariantes se comprueban ANTES de persistir: un estado descuadrado no
+   * llega al disco, falla la operacion y no la contabilidad. Y la escritura va
+   * adentro de `enUnaTransaccion` porque la ley 5 lo pide — si el asiento y el
+   * evento se escribieran sueltos, una caida en el medio dejaria plata movida sin
+   * el evento que la anuncia, o al reves.
+   */
+  private aplicar<T>(
+    op: { clave_idem: string; correlacion_id: string; momento: string },
+    reserva_id: string | undefined,
+    operar: (estado: EstadoBilletera) => Resultado<T>,
+  ): { valor: T; repetida: boolean } {
+    return enUnaTransaccion(this.ctx, () => {
+      const estado = cargarEstado(this.sql, this.ctx.id.toString(), op.clave_idem, reserva_id)
+      const r = operar(estado)
+      if (r.repetida) return { valor: r.valor, repetida: true }
+
+      verificarDelta(r.asientos)
+      verificarInvariantes(r.estado)
+      guardarDelta(this.sql, r.estado, r.asientos, r.eventos, op.clave_idem, r.valor, op.momento)
+
+      return { valor: r.valor, repetida: false }
+    })
   }
 
-  async debitar(op: Parameters<typeof debitar>[1], entrada: Parameters<typeof debitar>[2]) {
-    const r = debitar(await this.cargar(), op, entrada)
-    if (!r.repetida) await this.guardar(r.estado)
-    return { valor: r.valor, repetida: r.repetida }
+  /**
+   * `aplicar` mas la reprogramacion de la alarma, que es lo que toda operacion
+   * necesita sin excepcion.
+   *
+   * Existe porque la version anterior dejaba esa segunda mitad a criterio de cada
+   * metodo: `reservar` y `liberarReserva` reprogramaban, `acreditar`, `debitar` y
+   * `consumirReserva` no. Con la alarma ocupandose solo de los vencimientos eso
+   * alcanzaba; desde que tambien dispara al publicador, un `acreditar` que no
+   * reprograma es un evento que se queda en el outbox hasta que alguien mas toque
+   * esta billetera. Podrian ser meses.
+   *
+   * Se arregla la categoria: ya no hay dos caminos que puedan divergir, hay uno.
+   */
+  private async operar<T>(
+    op: { clave_idem: string; correlacion_id: string; momento: string },
+    reserva_id: string | undefined,
+    operar: (estado: EstadoBilletera) => Resultado<T>,
+  ): Promise<{ valor: T; repetida: boolean }> {
+    const r = this.aplicar(op, reserva_id, operar)
+    await this.reprogramarAlarma()
+    return r
   }
 
+  async acreditar(op: Operacion, entrada: Parameters<typeof acreditar>[2]) {
+    return this.operar(op, undefined, (e) => acreditar(e, op, entrada))
+  }
+
+  async debitar(op: Operacion, entrada: Parameters<typeof debitar>[2]) {
+    return this.operar(op, undefined, (e) => debitar(e, op, entrada))
+  }
+
+  async reservar(op: Operacion, entrada: Parameters<typeof reservar>[2]) {
+    return this.operar(op, entrada.reserva_id, (e) => reservar(e, op, entrada))
+  }
+
+  async liberarReserva(op: Operacion, entrada: Parameters<typeof liberarReserva>[2]) {
+    return this.operar(op, entrada.reserva_id, (e) => liberarReserva(e, op, entrada))
+  }
+
+  async consumirReserva(op: Operacion, entrada: Parameters<typeof consumirReserva>[2]) {
+    return this.operar(op, entrada.reserva_id, (e) => consumirReserva(e, op, entrada))
+  }
+
+  /**
+   * Saca del outbox lo que todavia no llego a D1. Ley 5, la mitad que faltaba.
+   *
+   * POR QUE NO SE PUBLICA ADENTRO DE LA OPERACION
+   *
+   * Seria una linea menos y esta mal, por dos motivos.
+   *
+   * El primero es que no se ganaria atomicidad: no se puede hacer adentro de
+   * `enUnaTransaccion` porque `transactionSync` no envuelve un `await`, que es
+   * justamente por lo que se eligio.
+   *
+   * El segundo es lo que pasa durante ese `await`, y la version anterior de este
+   * parrafo lo tenia AL REVES. Decia «un `await` mantiene el input gate cerrado:
+   * toda operacion de esa billetera esperaria a la latencia de D1». Una auditoria
+   * lo volteo contra la documentacion de Cloudflare: los input gates protegen solo
+   * durante operaciones de STORAGE. Un `await` a D1 abre la compuerta y deja
+   * entrar otras peticiones. O sea que no habria una espera: habria intercalado, y
+   * la plata se movería en medio de una publicacion en curso.
+   *
+   * Se publica desde la alarma, con el objeto libre entre pasada y pasada.
+   *
+   * Se publica desde la alarma, que el objeto programa para "ahora" apenas queda
+   * algo pendiente. La copia llega en milisegundos y el que movio la plata no
+   * espera a D1.
+   *
+   * QUE PASA CUANDO D1 NO CONTESTA, dicho entero
+   *
+   * No se relanza el error. Si `alarm()` tirara, Cloudflare reintentaria con SU
+   * backoff y despues de unos intentos dejaria de reintentar: el outbox quedaria
+   * pendiente sin nadie que lo despierte. En lugar de eso se cuenta el intento y
+   * se deja que `reprogramarAlarma` ponga la proxima pasada, cada vez mas lejos y
+   * con techo de cinco minutos. Un outbox atascado reintenta para siempre, que es
+   * lo correcto para un evento de plata, y `diagnostico()` lo dice.
+   *
+   * LO QUE FALTA: no hay cola de descarte. Una fila que no se pueda publicar nunca
+   * —un cuerpo malformado por un cambio de codigo, por ejemplo— traba la cabeza de
+   * la cola y bloquea a las que vienen atras. Se ve en `intentos` y en el log, no
+   * se resuelve solo. Es trabajo de una entrega posterior.
+   */
+  async publicar(): Promise<{ publicados: number; pendientes: number }> {
+    // Una sola publicacion por vez. Hace falta porque el `await` a D1 de mas abajo
+    // ABRE la compuerta de entrada del objeto (ver el parrafo de arriba): la alarma
+    // puede dispararse mientras un `publicar()` por RPC espera a D1, y las dos
+    // pasadas leerian el MISMO lote y lo mandarian dos veces.
+    //
+    // Hoy D1 lo absorbe —para eso estan las claves primarias de 0002— pero el
+    // contador de intentos se sumaria dos veces por un solo fallo, y la espera
+    // entre reintentos saldria del doble de lo que corresponde. Una bandera alcanza
+    // porque el JavaScript de un Durable Object es de un solo hilo: entre el `if` y
+    // la asignacion no hay await, asi que nadie se cuela en el medio.
+    if (this.publicando) return { publicados: 0, pendientes: resumenDelOutbox(this.sql).pendientes }
+    this.publicando = true
+    try {
+      return await this.publicarLote()
+    } finally {
+      this.publicando = false
+    }
+  }
+
+  private publicando = false
+
+  private async publicarLote(): Promise<{ publicados: number; pendientes: number }> {
+    let publicados = 0
+
+    for (let pasada = 0; pasada < PASADAS_MAXIMAS; pasada += 1) {
+      const filas = outboxPendiente(this.sql, LOTE)
+      if (filas.length === 0) break
+
+      const ids = filas.map((f) => f.id)
+      const momento = new Date().toISOString()
+
+      try {
+        const lote = sentencias(this.ctx.id.toString(), filas, momento)
+        await this.env.CORE.batch(lote.map((s) => this.env.CORE.prepare(s.sql).bind(...s.valores)))
+      } catch (e) {
+        // El contador va en su propia transaccion: es lo unico que se escribe y
+        // tiene que quedar aunque el lote no haya salido.
+        enUnaTransaccion(this.ctx, () => contarIntento(this.sql, ids))
+        console.error(
+          `billetera ${this.ctx.id.toString()}: no se pudo publicar el outbox (${ids.length} filas desde la ${ids[0]})`,
+          e,
+        )
+        break
+      }
+
+      enUnaTransaccion(this.ctx, () => marcarPublicadas(this.sql, ids, momento))
+      publicados += filas.length
+    }
+
+    return { publicados, pendientes: resumenDelOutbox(this.sql).pendientes }
+  }
+
+  /** Lo que hace falta para saber si esta billetera esta al dia, sin abrir la
+   *  base. El `pendientes` que no baja y el `intentos_maximos` que sube son la
+   *  forma que toma un outbox atascado. */
+  async diagnostico() {
+    return {
+      outbox: resumenDelOutbox(this.sql),
+      alarma: await this.ctx.storage.getAlarm(),
+      // Una liberacion que falla ya no tira ni corta la alarma, asi que si no
+      // saliera por acá no saldria por ningun lado. Es la contracara del try/catch.
+      liberaciones_fallidas: [...this.liberacionesFallidas.entries()].map(
+        ([reserva_id, intentos]) => ({ reserva_id, intentos }),
+      ),
+    }
+  }
+
+  /**
+   * Deja la alarma apuntando a lo PRIMERO que haya que hacer, o la borra si no hay
+   * nada.
+   *
+   * Hay UNA sola alarma por Durable Object, no una cola: programar la de una
+   * reserva pisa la de la anterior. Por eso no se programa "al reservar" sino que
+   * se recalcula entera despues de cada operacion, y por eso esta funcion tiene que
+   * mirar TODOS los motivos que existen para despertar al objeto. Hoy son dos:
+   *
+   *   · una reserva que vence — hay que devolver la plata
+   *   · una fila del outbox que no llego a D1 — hay que publicarla
+   *
+   * Gana el mas cercano. Que los dos compartan la alarma es seguro porque `alarm()`
+   * hace las dos cosas en cada disparo, sin fijarse cual la programo: si la que
+   * manda es la del outbox y hay una reserva vencida, la reserva se libera igual.
+   *
+   * Lo que eso si cuesta, y queda dicho: mientras D1 no conteste, el reintento del
+   * outbox se aleja hasta cinco minutos, y un vencimiento que caiga en el medio
+   * puede atenderse hasta cinco minutos tarde. Sobre un plazo de treinta minutos es
+   * un error del 16 %, en un caso que ademas requiere que D1 este caida.
+   *
+   * Va afuera de la transaccion a proposito: `setAlarm` es asincrono y
+   * `transactionSync` no puede envolver un `await` — que es justamente la razon
+   * por la que se eligio la version sincrona. Si el objeto muriera entre la
+   * escritura y esta linea, la reserva queda en la base sin alarma; la red que lo
+   * cubre es que toda operacion siguiente sobre este objeto vuelve a
+   * reprogramar. No es una garantia fuerte y queda dicho: el barrido de reservas
+   * huerfanas es trabajo de una entrega posterior.
+   */
+  private async reprogramarAlarma(): Promise<void> {
+    const ahora = Date.now()
+    const { vencidas, proximoVencimiento } = reservasVencidas(this.sql, new Date(ahora).toISOString())
+    const cabeza = cabezaDelOutbox(this.sql)
+
+    // La decision de CUANDO vive en `billetera/alarma.ts`, pura y con sus pruebas.
+    // Acá quedan las tres cosas que necesitan el objeto: leer el estado, leer el
+    // reloj y llamar a la storage. Esa separacion la pidio el arnes de mutacion —
+    // con las ramas escritas acá, una de ellas no se podia matar sin ganarle una
+    // carrera a la alarma que se dispara sola.
+    // El contador de la vencida que MAS fallo. Con varias vencidas alcanza con la
+    // peor: es la que decide cuanto esperar, y las demas se atienden en el mismo
+    // disparo.
+    const intentosDeLasVencidas =
+      vencidas.length === 0
+        ? null
+        : Math.max(...vencidas.map((id) => this.liberacionesFallidas.get(id) ?? 0))
+
+    const cuando = cuandoDespertar({
+      ahora,
+      intentosDeLasVencidas,
+      proximoVencimiento,
+      intentosDeLaCabeza: cabeza === null ? null : cabeza.intentos,
+    })
+
+    if (cuando === null) await this.ctx.storage.deleteAlarm()
+    else await this.ctx.storage.setAlarm(cuando)
+  }
+
+  /**
+   * Una reserva sin confirmar vence sola. Sin cron y sin barrido: la alarma del
+   * propio objeto, que es lo que el plan maestro pide.
+   *
+   * Este es el UNICO lugar que decide MOVIMIENTOS DE PLATA leyendo el reloj. En
+   * todos los demas el instante entra por parametro, para que el vencimiento se
+   * pueda probar sin esperar tres meses. Acá no hay quien lo pase: el que llama es
+   * Cloudflare. (`publicar()` y `reprogramarAlarma()` tambien miran la hora, pero
+   * para sellar una copia y para programar un despertador: ninguna de las dos
+   * decide de quien es un guarani.)
+   *
+   * QUE IMPIDE QUE UNA SEGUNDA PASADA LIBERE DE NUEVO, con precision:
+   *
+   * Lo hace el filtro `estado = 'abierta'` de `reservasVencidas`. Despues de la
+   * primera pasada la reserva queda `cancelada`, asi que la segunda ni siquiera la
+   * ve. Eso esta probado: hay una prueba que corre el handler dos veces y verifica
+   * que el saldo y la cantidad de asientos no se mueven.
+   *
+   * La clave de idempotencia —`vencimiento:<reserva_id>`, derivada y estable— es
+   * una SEGUNDA capa, para el caso de dos pasadas que se pisen antes de que la
+   * primera escriba. Cloudflare reintenta las alarmas que fallan, asi que entregar
+   * doble no es una hipotesis.
+   *
+   * Y esto ultimo hay que decirlo entero: esa segunda capa NO esta cubierta por
+   * ninguna prueba de este arnes. Lo dijo la mutacion —cambiar la clave por una
+   * aleatoria SOBREVIVIO, porque el filtro de estado ya alcanza para el caso que
+   * las pruebas ejercitan—. La mutacion se saco en vez de dejarla mintiendo, y
+   * queda escrito acá que la garantia probada es una sola.
+   */
+  override async alarm(): Promise<void> {
+    const momento = new Date().toISOString()
+    const { vencidas } = reservasVencidas(this.sql, momento)
+
+    for (const reserva_id of vencidas) {
+      const op = {
+        clave_idem: `vencimiento:${reserva_id}`,
+        correlacion_id: `vencimiento:${reserva_id}`,
+        momento,
+      }
+      // Cada liberacion, por separado, y una que falle no arrastra a las demas ni
+      // al publicador. Lo pidio una auditoria: sin este try, un solo descuadre en
+      // UNA reserva hacia tirar a `alarm()` entero, y ese es exactamente el modo de
+      // falla que `publicar()` documenta y evita a proposito — Cloudflare reintenta
+      // la alarma unas cuantas veces y despues deja de hacerlo, con el outbox
+      // pendiente y sin nadie que lo despierte.
+      //
+      // La transaccion de `aplicar` ya garantiza que la que falla no deja nada a
+      // medias. Lo unico que agrega esto es seguir de largo.
+      try {
+        this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))
+        this.liberacionesFallidas.delete(reserva_id)
+      } catch (e) {
+        // Contar el fracaso NO es contabilidad: es lo que hace que la proxima
+        // alarma llegue mas tarde. Sin esto, la reserva sigue vencida y abierta,
+        // `reprogramarAlarma` la vuelve a ver, pone la alarma para ahora, y el
+        // objeto gira a ~185 disparos por segundo para siempre — medido.
+        const previos = this.liberacionesFallidas.get(reserva_id) ?? 0
+        this.liberacionesFallidas.set(reserva_id, previos + 1)
+        console.error(
+          `billetera ${this.ctx.id.toString()}: no se pudo liberar la reserva vencida ${reserva_id} (intento ${previos + 1})`,
+          e,
+        )
+      }
+    }
+
+    // Publicar va DESPUES de liberar, no antes: liberar produce eventos, y si se
+    // publicara primero esos eventos esperarian a la proxima vuelta de la alarma.
+    await this.publicar()
+
+    await this.reprogramarAlarma()
+  }
+
+  /** Lo que hay, para consulta. No toca nada. */
   async saldo() {
-    const e = await this.cargar()
-    return { bolsas: e.bolsas, asientos: e.asientos.length }
+    const estado = cargarEstado(this.sql, this.ctx.id.toString(), '')
+    const asientos = [...this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM asientos')][0]
+    return { bolsas: estado.bolsas, asientos: asientos?.n ?? 0 }
   }
-}
 
-function deshidratar(e: EstadoBilletera): string {
-  return JSON.stringify({
-    billetera_id: e.billetera_id,
-    bolsas: e.bolsas,
-    asientos: e.asientos,
-    reservas: [...e.reservas.entries()],
-    aplicadas: [...e.aplicadas.entries()],
-  })
-}
-
-function rehidratar(s: string): EstadoBilletera {
-  const d = JSON.parse(s) as {
-    billetera_id: string
-    bolsas: EstadoBilletera['bolsas']
-    asientos: EstadoBilletera['asientos']
-    reservas: [string, never][]
-    aplicadas: [string, string][]
-  }
-  return {
-    billetera_id: d.billetera_id,
-    bolsas: d.bolsas,
-    asientos: d.asientos,
-    reservas: new Map(d.reservas),
-    aplicadas: new Map(d.aplicadas),
+  /**
+   * La reconciliacion exhaustiva. No corre en el camino caliente a proposito:
+   * recorre la tabla de asientos entera.
+   *
+   * `verificarInvariantes` compara las bolsas contra `totales_ledger`, que es un
+   * cache mantenido en la misma transaccion que los asientos. Esto es lo unico
+   * que puede notar que ese cache se corrompio por su cuenta.
+   */
+  async reconciliar() {
+    return reconciliar(this.sql)
   }
 }
 

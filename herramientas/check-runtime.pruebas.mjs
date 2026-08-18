@@ -112,34 +112,38 @@ assert.equal(configReal.env.produccion.workers_dev, false)
 // archivo REAL diga lo que el resto de la entrega supone, y que cada forma
 // invalida falle con un mensaje en vez de resolver a `undefined`.
 
-assert.deepEqual(leerArnes(readFileSync(`${RAIZ}pruebas-runtime/arnes-del-runtime.json`, 'utf8')), {
-  environment: 'staging',
-  configPath: './wrangler.jsonc',
-})
+const COMPLETO = { environment: 'staging', configPath: './wrangler.jsonc', migrationsDir: 'migraciones/core' }
+const conArnes = (extra) => JSON.stringify({ ...COMPLETO, ...extra })
 
-assert.deepEqual(leerArnes('{ "environment": "produccion", "configPath": "./wrangler.jsonc" }'), {
+assert.deepEqual(
+  leerArnes(readFileSync(`${RAIZ}pruebas-runtime/arnes-del-runtime.json`, 'utf8')),
+  COMPLETO,
+)
+
+assert.deepEqual(leerArnes(conArnes({ environment: 'produccion' })), {
+  ...COMPLETO,
   environment: 'produccion',
-  configPath: './wrangler.jsonc',
 })
 
-assert.throws(() => leerArnes('{ "configPath": "./wrangler.jsonc" }'), /no declara un `environment`/)
-assert.throws(
-  () => leerArnes('{ "environment": "", "configPath": "./wrangler.jsonc" }'),
-  /no declara un `environment`/,
-)
-assert.throws(
-  () => leerArnes('{ "environment": 3, "configPath": "./wrangler.jsonc" }'),
-  /no declara un `environment`/,
-)
+assert.throws(() => leerArnes(conArnes({ environment: undefined })), /no declara un `environment`/)
+assert.throws(() => leerArnes(conArnes({ environment: '' })), /no declara un `environment`/)
+assert.throws(() => leerArnes(conArnes({ environment: 3 })), /no declara un `environment`/)
 assert.throws(() => leerArnes('no soy json'), /no es JSON valido/)
+
+// Y el migrationsDir. De ahi salen las migraciones de D1 que el arnes aplica a la
+// base local antes de correr las pruebas del publicador: sin el, `readD1Migrations`
+// leeria una carpeta `undefined` y el error saldria a kilometros de acá.
+assert.throws(() => leerArnes(conArnes({ migrationsDir: undefined })), /no declara un `migrationsDir`/)
+assert.throws(() => leerArnes(conArnes({ migrationsDir: '' })), /no declara un `migrationsDir`/)
+assert.throws(() => leerArnes(conArnes({ migrationsDir: 3 })), /no declara un `migrationsDir`/)
 
 // El configPath tiene que ser el wrangler.jsonc del proyecto. Era el agujero
 // grande de esta familia: con el arnes apuntado a otra configuracion, los oraculos
 // aprobaban un archivo que las pruebas no leian. Medido antes del arreglo: con un
 // `configPath` a una copia de fecha 2023, el oraculo firmaba 2026-08-01.
-assert.throws(() => leerArnes('{ "environment": "staging" }'), /configPath "undefined"/)
+assert.throws(() => leerArnes(conArnes({ configPath: undefined })), /configPath "undefined"/)
 assert.throws(
-  () => leerArnes('{ "environment": "staging", "configPath": "./otro.jsonc" }'),
+  () => leerArnes(conArnes({ configPath: './otro.jsonc' })),
   /tiene que ser "\.\/wrangler\.jsonc"/,
 )
 
@@ -262,7 +266,7 @@ const { spawnSync } = await import('node:child_process')
  *  otra cosa. */
 function correrOraculoCon({
   wrangler,
-  entorno = '{ "environment": "staging", "configPath": "./wrangler.jsonc" }',
+  entorno = ARNES_JSON_OK,
   arnes = ARNES_OK,
 }) {
   const dir = mkdtempSync(join(tmpdir(), 'check-runtime-'))
@@ -287,7 +291,16 @@ function correrOraculoCon({
 
 const ARNES_OK = "cloudflareTest({ wrangler: { configPath: arnes.configPath, environment: arnes.environment } })"
 
-const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": { "name": "x" } } }'
+/** El arnes de datos completo. Toda configuracion de este proyecto declara una D1
+ *  con `migrations_dir`, asi que los arboles de juguete tambien: un fixture que no
+ *  se parece a lo real prueba el fixture. */
+const ARNES_JSON_OK =
+  '{ "environment": "staging", "configPath": "./wrangler.jsonc", "migrationsDir": "migraciones/core" }'
+
+const D1_OK =
+  '"d1_databases": [{ "binding": "CORE", "database_name": "core-staging", "migrations_dir": "migraciones/core" }]'
+
+const CON_STAGING = `{ "compatibility_date": "2026-08-01", "env": { "staging": { "name": "x", ${D1_OK} } } }`
 
 // Camino sano.
 {
@@ -300,7 +313,7 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
 
 // Sin fecha en ningun lado: el caso del reloj del sistema.
 {
-  const r = correrOraculoCon({ wrangler: '{ "name": "x", "env": { "staging": {} } }' })
+  const r = correrOraculoCon({ wrangler: `{ "name": "x", "env": { "staging": { ${D1_OK} } } }` })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /NO HAY compatibility_date/)
 }
@@ -309,8 +322,7 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
 // viejo la tomaba como valida y decia OK.
 {
   const r = correrOraculoCon({
-    wrangler:
-      '{\n  /* antes: "compatibility_date": "2026-08-01" */\n  "name": "x",\n  "env": { "staging": {} }\n}',
+    wrangler: `{\n  /* antes: "compatibility_date": "2026-08-01" */\n  "name": "x",\n  "env": { "staging": { ${D1_OK} } }\n}`,
   })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /NO HAY compatibility_date/)
@@ -319,7 +331,7 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
 // La fecha del entorno gana, y con eso alcanza aunque la raiz no tenga ninguna.
 {
   const r = correrOraculoCon({
-    wrangler: '{ "env": { "staging": { "compatibility_date": "2026-08-10" } } }',
+    wrangler: `{ "env": { "staging": { "compatibility_date": "2026-08-10", ${D1_OK} } } }`,
   })
   assert.equal(r.codigo, 0, `esperaba 0 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /2026-08-10/)
@@ -329,7 +341,7 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
 // Fecha que no existe.
 {
   const r = correrOraculoCon({
-    wrangler: '{ "compatibility_date": "2026-02-30", "env": { "staging": {} } }',
+    wrangler: `{ "compatibility_date": "2026-02-30", "env": { "staging": { ${D1_OK} } } }`,
   })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /NO ES UNA FECHA REAL/)
@@ -339,7 +351,7 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
 {
   const r = correrOraculoCon({ wrangler: CON_STAGING, entorno: '{}' })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
-  assert.match(r.salida, /NO SE PUDO DETERMINAR/)
+  assert.match(r.salida, /NO ESTA BIEN DECLARADO/)
 }
 
 // El arnes apunta a OTRA configuracion: los oraculos aprobarian un archivo que las
@@ -347,7 +359,7 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
 {
   const r = correrOraculoCon({
     wrangler: CON_STAGING,
-    entorno: '{ "environment": "staging", "configPath": "./otro-wrangler.jsonc" }',
+    entorno: '{ "environment": "staging", "configPath": "./otro-wrangler.jsonc", "migrationsDir": "migraciones/core" }',
   })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /configPath/)
@@ -378,7 +390,7 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
 {
   const r = correrOraculoCon({ wrangler: '{ "compatibility_date": }' })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
-  assert.match(r.salida, /NO SE PUDO DETERMINAR/)
+  assert.match(r.salida, /NO ESTA BIEN DECLARADO/)
   assert.doesNotMatch(r.salida, /at main \(/)
 }
 
@@ -388,10 +400,62 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
 {
   const r = correrOraculoCon({
     wrangler: '{ "compatibility_date": "2026-08-01", "env": { "staging": {} } }',
-    entorno: '{ "environment": "inventado", "configPath": "./wrangler.jsonc" }',
+    entorno: '{ "environment": "inventado", "configPath": "./wrangler.jsonc", "migrationsDir": "migraciones/core" }',
   })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /no declara el entorno "inventado"/)
+}
+
+// La D1 del entorno no declara `migrations_dir`. El arnes no tendria de donde
+// sacar las migraciones que aplica a la base local, y `readD1Migrations` fallaria
+// mucho despues y con otro nombre.
+{
+  const r = correrOraculoCon({
+    wrangler:
+      '{ "compatibility_date": "2026-08-01", "env": { "staging": { "d1_databases": [{ "binding": "CORE" }] } } }',
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /ninguna base D1 .* declara `migrations_dir`/)
+}
+
+// Y LA DERIVA, que es la que este agregado existe para cerrar: el arnes aplica las
+// migraciones de una carpeta y wrangler despliega las de otra. Las pruebas del
+// publicador correrian contra un esquema de D1 que nadie va a tener nunca — la
+// misma categoria que la tabla de juguete que motivo sacar el DDL del Durable
+// Object a `src/`, y sin ningun sintoma: todo en verde.
+{
+  const r = correrOraculoCon({
+    wrangler: CON_STAGING,
+    entorno:
+      '{ "environment": "staging", "configPath": "./wrangler.jsonc", "migrationsDir": "migraciones/de-juguete" }',
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /migraciones\/de-juguete/)
+  assert.match(r.salida, /no es el que se despliega/)
+}
+
+// Dos bases D1 con carpetas distintas: el arnes aplica UNA sola, asi que elegir en
+// silencio seria aprobar un esquema al azar. La version anterior de
+// `migracionesDeclaradas` devolvia la primera que encontraba y este caso pasaba en
+// verde; lo pidio una auditoria.
+{
+  const r = correrOraculoCon({
+    wrangler:
+      '{ "compatibility_date": "2026-08-01", "env": { "staging": { "d1_databases": [{ "binding": "CORE", "migrations_dir": "migraciones/core" }, { "binding": "OTRA", "migrations_dir": "migraciones/otra" }] } } }',
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /mas de una carpeta de migraciones/)
+}
+
+// Pero DOS bases que declaran la MISMA carpeta no son una ambiguedad: no hay nada
+// que elegir. Sin este caso, la comprobacion de arriba se podria "arreglar"
+// prohibiendo tener dos bases, que es otra cosa.
+{
+  const r = correrOraculoCon({
+    wrangler:
+      '{ "compatibility_date": "2026-08-01", "env": { "staging": { "d1_databases": [{ "binding": "CORE", "migrations_dir": "migraciones/core" }, { "binding": "OTRA", "migrations_dir": "migraciones/core" }] } } }',
+  })
+  assert.equal(r.codigo, 0, `esperaba 0 y salio ${r.codigo}: ${r.salida}`)
 }
 
 // Invocado por DIRECTORIO, con un package.json que declara `main`. Es el unico
@@ -409,7 +473,7 @@ const CON_STAGING = '{ "compatibility_date": "2026-08-01", "env": { "staging": {
     mkdirSync(join(dir, 'pruebas-runtime'), { recursive: true })
     writeFileSync(
       join(dir, 'pruebas-runtime', 'arnes-del-runtime.json'),
-      '{ "environment": "staging", "configPath": "./wrangler.jsonc" }',
+      ARNES_JSON_OK,
     )
     writeFileSync(
       join(dir, 'oraculo', 'package.json'),

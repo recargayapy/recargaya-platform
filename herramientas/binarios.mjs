@@ -100,3 +100,32 @@ export const ORACULO_RUNTIME = comando(
   '--silent',
 )
 export const ORACULO_TIPOS = comando('tsc', '--noEmit')
+
+/**
+ * El entorno con el que se lanza un oraculo de mutacion.
+ *
+ * EL DEFECTO QUE ESTO CIERRA, visto en el resumen de un despliegue que salio bien:
+ *
+ * vitest agrega solo el reporter `github-actions` cuando ve `GITHUB_ACTIONS=true`,
+ * y ese reporter escribe en el resumen del job. `mutar.mjs` corre vitest una vez
+ * por mutacion —hoy son decenas— asi que el resumen de un job EXITOSO quedaba con
+ * cuarenta bloques «Vitest Test Report», casi todos en rojo.
+ *
+ * Y en rojo por la razon correcta: una mutacion muerta ES una prueba que falla.
+ * Pero el que abre esa pagina ve una pared de cruces rojas abajo de un tilde verde
+ * y concluye lo contrario de lo que paso. Un reporte que dice lo opuesto al hecho
+ * que reporta es la misma categoria que un comentario que miente.
+ *
+ * Se saca la variable en vez de elegir otro reporter: el nombre de los reporters
+ * cambia entre versiones de vitest —`basic` ya no existe en la 4— y quedariamos
+ * atados a eso. Lo que se quiere decir es «esta corrida no es el reporte del CI,
+ * es una sonda interna», y sacar la variable lo dice exactamente.
+ *
+ * El CI sigue viendo su reporte: `npm run probar` y `npm run probar:runtime` corren
+ * con el entorno intacto. Lo unico que se silencia son las corridas de la mutacion.
+ */
+export function entornoParaOraculo(entorno) {
+  const copia = { ...entorno }
+  delete copia.GITHUB_ACTIONS
+  return copia
+}

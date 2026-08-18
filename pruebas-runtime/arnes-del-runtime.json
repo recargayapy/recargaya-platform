@@ -1,5 +1,6 @@
 {
-  "//": "La configuracion compartida del arnes del runtime. Vive en un archivo de datos porque la leen TRES lados: vitest.runtime.config.ts, que se la pasa al pool; check-runtime.mjs, que resuelve la compatibility_date efectiva del entorno; y check-entorno.mjs, que genera los tipos de los bindings de ese entorno. Un literal repartido en tres archivos deriva; un archivo de datos no puede.",
+  "//": "La configuracion compartida del arnes del runtime. Vive en un archivo de datos porque la leen TRES lados: vitest.runtime.config.ts, que se la pasa al pool; check-runtime.mjs, que resuelve la compatibility_date efectiva del entorno y comprueba que migrationsDir sea el mismo que declara wrangler.jsonc; y check-entorno.mjs, que genera los tipos de los bindings de ese entorno. Un literal repartido en tres archivos deriva; un archivo de datos no puede.",
   "configPath": "./wrangler.jsonc",
-  "environment": "staging"
+  "environment": "staging",
+  "migrationsDir": "migraciones/core"
 }
