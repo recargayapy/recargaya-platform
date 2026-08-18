@@ -32,11 +32,12 @@
 -- trigger de DELETE de mas abajo, que aborta. Es a proposito — el que escriba
 -- REPLACE acá se entera con un error y no con una fila pisada en silencio.
 --
--- Los asientos NO vienen a esta tabla: van a `ledger_copia`, que ya existe desde
--- 0001 y ya tiene su clave primaria por `asiento_id`, que cumple exactamente el
--- mismo papel. El ledger es el ledger y los eventos son los eventos.
+-- Los asientos NO vienen a esta tabla: van a `ledger_copia`, que existe desde 0001
+-- y cuya clave primaria cumple exactamente el mismo papel — despues de que la
+-- segunda mitad de esta migracion se la arregle, porque venia mal. El ledger es el
+-- ledger y los eventos son los eventos.
 
-CREATE TABLE eventos_billetera (
+CREATE TABLE IF NOT EXISTS eventos_billetera (
   billetera_id   TEXT NOT NULL,
   evento_id      INTEGER NOT NULL,          -- el id del outbox del DO de origen
   tipo           TEXT NOT NULL,
@@ -49,19 +50,19 @@ CREATE TABLE eventos_billetera (
 
 -- Lo que un consumidor pregunta de verdad: "que paso desde tal momento" y "que
 -- paso con tal pedido". El indice por billetera ya lo da la clave primaria.
-CREATE INDEX idx_eventos_billetera_creado      ON eventos_billetera (creado_en);
-CREATE INDEX idx_eventos_billetera_correlacion ON eventos_billetera (correlacion_id);
+CREATE INDEX IF NOT EXISTS idx_eventos_billetera_creado      ON eventos_billetera (creado_en);
+CREATE INDEX IF NOT EXISTS idx_eventos_billetera_correlacion ON eventos_billetera (correlacion_id);
 
 -- Un registro de lo que paso que se puede editar despues no es un registro de lo
 -- que paso. Misma decision que en `ledger_copia` y por la misma razon: el trigger
 -- lo hace imposible, no prohibido.
-CREATE TRIGGER eventos_billetera_sin_update
+CREATE TRIGGER IF NOT EXISTS eventos_billetera_sin_update
 BEFORE UPDATE ON eventos_billetera
 BEGIN
   SELECT RAISE(ABORT, 'un evento ya ocurrido no se edita');
 END;
 
-CREATE TRIGGER eventos_billetera_sin_delete
+CREATE TRIGGER IF NOT EXISTS eventos_billetera_sin_delete
 BEFORE DELETE ON eventos_billetera
 BEGIN
   SELECT RAISE(ABORT, 'un evento ya ocurrido no se borra');
@@ -109,11 +110,31 @@ END;
 -- Los triggers se sacan primero: un `DROP TABLE` no dispara el de DELETE, pero
 -- dejarlos apuntando a una tabla que esta por desaparecer es confiar en ese
 -- detalle. Se recrean al final, sobre la tabla nueva.
+--
+-- CADA SENTENCIA LLEVA `IF EXISTS` / `IF NOT EXISTS`, y no es adorno. D1 no
+-- soporta transacciones explicitas: una migracion que falla en el medio deja la
+-- base a mitad de camino Y sin registrar como aplicada. Sin las guardas, el
+-- reintento moria en la primera linea (`DROP TRIGGER` sobre un trigger que ya no
+-- esta) y la unica salida era manual, en produccion, a mano.
+--
+-- Lo pidio una auditoria adversarial y tenia razon en el argumento: este mismo
+-- encabezado se toma tres parrafos para justificar copiar filas de una tabla vacia
+-- «porque una migracion que borra datos cuando se la corre en un entorno que no se
+-- previo es una migracion que un dia borra datos», y despues no aplicaba el mismo
+-- razonamiento al reintento.
+--
+-- LO QUE SIGUE SIN SER REANUDABLE, dicho entero: si el corte cae DESPUES del
+-- `DROP TABLE ledger_copia` y ANTES del `RENAME`, el reintento encuentra
+-- `ledger_copia_nueva` con los datos y `ledger_copia` inexistente. El
+-- `INSERT ... SELECT FROM ledger_copia` no puede saltearse solo —SQLite no tiene
+-- «si la tabla existe»— asi que ese tramo pide una mano. Es una ventana de dos
+-- sentencias sobre una tabla que hoy esta vacia en los dos entornos, y queda
+-- escrito acá en vez de descubrirse en el medio.
 
-DROP TRIGGER ledger_copia_sin_update;
-DROP TRIGGER ledger_copia_sin_delete;
+DROP TRIGGER IF EXISTS ledger_copia_sin_update;
+DROP TRIGGER IF EXISTS ledger_copia_sin_delete;
 
-CREATE TABLE ledger_copia_nueva (
+CREATE TABLE IF NOT EXISTS ledger_copia_nueva (
   billetera_id   TEXT NOT NULL,
   asiento_id     TEXT NOT NULL,
   concepto       TEXT NOT NULL,
@@ -126,11 +147,11 @@ CREATE TABLE ledger_copia_nueva (
   PRIMARY KEY (billetera_id, asiento_id)
 ) STRICT;
 
-INSERT INTO ledger_copia_nueva (billetera_id, asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en, copiado_en)
+INSERT OR IGNORE INTO ledger_copia_nueva (billetera_id, asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en, copiado_en)
 SELECT billetera_id, asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en, copiado_en
 FROM ledger_copia;
 
-DROP TABLE ledger_copia;
+DROP TABLE IF EXISTS ledger_copia;
 
 ALTER TABLE ledger_copia_nueva RENAME TO ledger_copia;
 
@@ -138,16 +159,16 @@ ALTER TABLE ledger_copia_nueva RENAME TO ledger_copia;
 -- `asiento_id` adentro de cada billetera, y `asiento_id` no tiene orden temporal
 -- —arranca con la clave de idempotencia, que es `{pedido_id}:{paso}`—. "El
 -- extracto de esta billetera, del mas nuevo al mas viejo" lo contesta este.
-CREATE INDEX idx_ledger_billetera_fecha ON ledger_copia (billetera_id, asentado_en DESC);
-CREATE INDEX idx_ledger_correlacion     ON ledger_copia (correlacion_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_billetera_fecha ON ledger_copia (billetera_id, asentado_en DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_correlacion     ON ledger_copia (correlacion_id);
 
-CREATE TRIGGER ledger_copia_sin_update
+CREATE TRIGGER IF NOT EXISTS ledger_copia_sin_update
 BEFORE UPDATE ON ledger_copia
 BEGIN
   SELECT RAISE(ABORT, 'un asiento no se edita: se compensa con otro asiento');
 END;
 
-CREATE TRIGGER ledger_copia_sin_delete
+CREATE TRIGGER IF NOT EXISTS ledger_copia_sin_delete
 BEFORE DELETE ON ledger_copia
 BEGIN
   SELECT RAISE(ABORT, 'un asiento no se borra: se compensa con otro asiento');

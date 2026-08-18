@@ -110,3 +110,83 @@ describe('el oraculo detecta lo que tiene que detectar', () => {
     expect(() => verificarInvariantes(roto)).toThrow(/descuadre en retenido/)
   })
 })
+
+describe('los dos descuadres que ninguna otra prueba distinguia', () => {
+  // Los dos los pidio el arnes de mutacion despues de una auditoria, y los dos son
+  // la misma leccion: cuando dos comprobaciones se superponen, la que se rompe
+  // primero tapa a la otra. Para que cada una tenga oraculo hay que construir el
+  // estado que SOLO ella rechaza.
+
+  const bolsa = (tipo: 'disponible' | 'ganancia_creador' | 'retenido', monto: number, origen = 'x') => ({
+    tipo,
+    monto: guaranies(monto),
+    vence_en: null,
+    origen,
+    restringida_a: null,
+  })
+
+  it('una bolsa de un tipo que NUNCA tuvo asiento tambien tiene que descuadrar', () => {
+    // El invariante 2 recorria `estado.totales`, o sea solo los tipos con historia
+    // en el ledger. Una bolsa de un tipo ausente era invisible: plata inventada que
+    // el oraculo del camino caliente aprobaba. Medido por una auditoria, con estos
+    // numeros exactos.
+    const estado: EstadoBilletera = {
+      billetera_id: 'b1',
+      bolsas: [bolsa('ganancia_creador', 999_999)],
+      totales: new Map([['disponible', 0]]),
+      reservas: new Map(),
+      aplicadas: new Map(),
+    }
+
+    expect(() => verificarInvariantes(estado)).toThrow(/descuadre en ganancia_creador/)
+  })
+
+  it('el retenido descuadra aunque el ledger cuadre con las bolsas', () => {
+    // ESTE es el estado que solo el invariante 3 puede rechazar: el acumulado del
+    // ledger y las bolsas dicen lo mismo —50.000 en retenido— y sin embargo no hay
+    // ninguna reserva abierta que reclame esa plata.
+    //
+    // Es la forma que toma una reserva que se pierde del mapa, o algo que toca
+    // `retenido` por fuera de reservar/consumir/liberar. Sin esta prueba, la
+    // mutacion que le saca el `throw` al invariante 3 sobrevivia: las otras la
+    // mataban por el invariante 2, que en ese estado no tiene nada que decir.
+    const estado: EstadoBilletera = {
+      billetera_id: 'b1',
+      bolsas: [bolsa('retenido', 50_000, 'promo-1')],
+      totales: new Map([['retenido', 50_000]]),
+      reservas: new Map(),
+      aplicadas: new Map(),
+    }
+
+    expect(() => verificarInvariantes(estado)).toThrow(/descuadre en retenido/)
+
+    // Control positivo: con la reserva en su lugar, el MISMO estado pasa. Sin esto,
+    // la prueba de arriba la cumpliria un oraculo que rechaza todo.
+    const conLaReserva: EstadoBilletera = {
+      ...estado,
+      reservas: new Map([
+        [
+          'promo-1',
+          {
+            reserva_id: 'promo-1',
+            tomas: [{ bolsa: bolsa('disponible', 50_000), monto: guaranies(50_000) }],
+            consumido: guaranies(0),
+            vence_en: '2026-12-31T00:00:00Z',
+            estado: 'abierta' as const,
+          },
+        ],
+      ]),
+    }
+    expect(() => verificarInvariantes(conLaReserva)).not.toThrow()
+
+    // Y con la reserva consumida a medias, el retenido tiene que valer lo que NO se
+    // gasto. Con 20.000 consumidos y 50.000 todavia en la bolsa, descuadra.
+    const consumidaAMedias: EstadoBilletera = {
+      ...conLaReserva,
+      reservas: new Map([
+        ['promo-1', { ...conLaReserva.reservas.get('promo-1')!, consumido: guaranies(20_000) }],
+      ]),
+    }
+    expect(() => verificarInvariantes(consumidaAMedias)).toThrow(/descuadre en retenido/)
+  })
+})

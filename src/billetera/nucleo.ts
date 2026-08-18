@@ -11,6 +11,7 @@
  */
 
 import { type Guaranies, guaranies, CERO } from '../dinero/monto.js'
+import { instante, instanteOpcional } from '../dinero/momento.js'
 import { type Bolsa, type Toma, decidirConsumo, devolver, saldoRetirable } from '../dinero/bolsas.js'
 
 export interface Asiento {
@@ -130,15 +131,31 @@ export interface Resultado<T> {
 }
 
 /**
- * La clave de idempotencia identifica la INTENCION, no el momento.
+ * La puerta de entrada de TODA operacion. Hace dos cosas y las dos tienen que
+ * pasar antes que cualquier otra: revisa la operacion, y contesta si ya se aplico.
+ *
+ * LA CLAVE DE IDEMPOTENCIA IDENTIFICA LA INTENCION, NO EL MOMENTO.
  *
  * Este es el defecto que en el sistema anterior bloqueo toda renovacion en
- * silencio: la clave incluia algo que cambiaba entre intentos legitimos. Acá
- * la clave la arma quien llama, y la billetera solo se acuerda de haberla
- * visto. Es responsabilidad del llamador que dos intentos del MISMO acto
- * compartan clave, y que dos actos distintos no la compartan.
+ * silencio: la clave incluia algo que cambiaba entre intentos legitimos. Acá la
+ * clave la arma quien llama, y la billetera solo se acuerda de haberla visto. Es
+ * responsabilidad del llamador que dos intentos del MISMO acto compartan clave, y
+ * que dos actos distintos no la compartan.
+ *
+ * Que la revision del instante viva ACA y no en cada funcion es a proposito. Las
+ * cinco operaciones llaman a esto como primera linea, asi que es el unico lugar
+ * por el que pasan todas — y una revision repetida en cinco lugares es una
+ * revision que la sexta operacion se va a olvidar de copiar.
+ *
+ * Revisa incluso cuando la operacion resulta repetida: un `momento` mal escrito
+ * es un error del llamador aunque esta vez no se escriba nada.
  */
-function yaAplicada<T>(estado: EstadoBilletera, op: Operacion): Resultado<T> | null {
+function puertaDeEntrada<T>(estado: EstadoBilletera, op: Operacion): Resultado<T> | null {
+  // El instante ordena plata: `decidirConsumo` compara `vence_en <= momento` como
+  // TEXTO. Con un huso distinto de `Z`, ese `<=` deja de coincidir con el reloj y
+  // una bolsa vencida se consume, o una vigente se descarta. Ver `dinero/momento.ts`.
+  instante(op.momento)
+
   const previo = estado.aplicadas.get(op.clave_idem)
   if (previo === undefined) return null
   return { estado, asientos: [], eventos: [], valor: JSON.parse(previo) as T, repetida: true }
@@ -194,7 +211,7 @@ export function acreditar(
     readonly restringida_a?: string | null
   },
 ): Resultado<{ saldo_retirable: Guaranies }> {
-  const previo = yaAplicada<{ saldo_retirable: Guaranies }>(estado, op)
+  const previo = puertaDeEntrada<{ saldo_retirable: Guaranies }>(estado, op)
   if (previo !== null) return previo
 
   if (entrada.monto <= 0) throw new Error('acreditar exige un monto positivo')
@@ -216,7 +233,10 @@ export function acreditar(
   const nueva: Bolsa = {
     tipo: entrada.bolsa,
     monto: entrada.monto,
-    vence_en: entrada.vence_en ?? null,
+    // Uno de los dos unicos lugares por los que un vencimiento entra desde afuera
+    // (el otro es `reservar`). De acá para adentro todo `vence_en` sale de una
+    // bolsa que ya paso por esta linea, o de la base, donde entro por esta linea.
+    vence_en: instanteOpcional(entrada.vence_en),
     origen: entrada.origen,
     restringida_a: entrada.restringida_a ?? null,
   }
@@ -282,7 +302,7 @@ export function debitar(
     readonly omitirDisponible?: boolean
   },
 ): Resultado<{ tomas: readonly Toma[]; faltante: Guaranies }> {
-  const previo = yaAplicada<{ tomas: readonly Toma[]; faltante: Guaranies }>(estado, op)
+  const previo = puertaDeEntrada<{ tomas: readonly Toma[]; faltante: Guaranies }>(estado, op)
   if (previo !== null) return previo
 
   if (entrada.monto <= 0) throw new Error('debitar exige un monto positivo')
@@ -331,16 +351,42 @@ export function reservar(
   op: Operacion,
   entrada: { readonly reserva_id: string; readonly monto: Guaranies; readonly vence_en: string },
 ): Resultado<{ reserva_id: string }> {
-  const previo = yaAplicada<{ reserva_id: string }>(estado, op)
+  const previo = puertaDeEntrada<{ reserva_id: string }>(estado, op)
   if (previo !== null) return previo
 
-  // Dos reservas legitimas con el mismo reserva_id (dos claves de idempotencia
-  // distintas, no un reintento) pisarian la entrada anterior en el Map: la
-  // plata de la primera saldria de su bolsa y quedaria sin ningun rastro que
-  // la reclame. Es un error del llamador — reusar un identificador que
-  // todavia esta abierto — no un caso que reservar() deba absorber.
-  if (estado.reservas.get(entrada.reserva_id)?.estado === 'abierta') {
-    throw new Error(`ya existe una reserva abierta con reserva_id: ${entrada.reserva_id}`)
+  // UN reserva_id se usa UNA vez. No «una vez a la vez»: una vez y nunca mas.
+  //
+  // La version anterior rechazaba solo si la reserva estaba ABIERTA, y una
+  // auditoria adversarial la volteo midiendo tres daños distintos del mismo
+  // reuso, todos sobre workerd:
+  //
+  //   · Las tomas quedan viejas. `tomas` tiene PK `(reserva_id, orden)` y se
+  //     escribe con `INSERT OR IGNORE` —porque describen de que bolsa salio cada
+  //     parte y eso no cambia nunca—. Con el id reusado, las tomas de la reserva
+  //     NUEVA se descartan en silencio y quedan las de la vieja. Medido: retenido
+  //     50.000 en bolsas contra 20.000 en reservas, y a partir de ahi TODA
+  //     operacion sobre esa billetera tira por el invariante 3, incluida
+  //     `liberarReserva`. La plata queda adentro sin camino de salida.
+  //   · El vencimiento queda viejo. El upsert de `reservas` no toca `vence_en`.
+  //   · La alarma entra en bucle. La clave del vencimiento es
+  //     `vencimiento:<reserva_id>`, derivada del id: la segunda expiracion sale
+  //     por `aplicadas` como repetida y no libera nada, mientras
+  //     `reprogramarAlarma` sigue viendo algo vencido y vuelve a poner la alarma
+  //     para ahora.
+  //
+  // Se podria arreglar cada uno de los tres. Se arregla la categoria: el
+  // reserva_id ES la identidad del ciclo de vida, y `cargarReservas` carga
+  // siempre la reserva nombrada aunque este cerrada justamente para que esta
+  // linea pueda verla. Un llamador que necesite reservar de nuevo usa un id
+  // nuevo — que es lo que tiene que hacer, porque es otra reserva.
+  // El otro lugar por el que entra un vencimiento de afuera.
+  instante(entrada.vence_en)
+
+  if (estado.reservas.has(entrada.reserva_id)) {
+    const previa = estado.reservas.get(entrada.reserva_id)
+    throw new Error(
+      `el reserva_id ${entrada.reserva_id} ya se uso (quedo ${previa?.estado}): un reserva_id no se reusa`,
+    )
   }
 
   const consumo = decidirConsumo(estado.bolsas, entrada.monto, op.momento, {})
@@ -422,7 +468,7 @@ export function consumirReserva(
   op: Operacion,
   entrada: { readonly reserva_id: string; readonly monto: Guaranies },
 ): Resultado<{ consumido: Guaranies; disponible: Guaranies }> {
-  const previo = yaAplicada<{ consumido: Guaranies; disponible: Guaranies }>(estado, op)
+  const previo = puertaDeEntrada<{ consumido: Guaranies; disponible: Guaranies }>(estado, op)
   if (previo !== null) return previo
 
   if (entrada.monto <= 0) throw new Error('consumirReserva exige un monto positivo')
@@ -511,7 +557,7 @@ export function liberarReserva(
   op: Operacion,
   entrada: { readonly reserva_id: string },
 ): Resultado<{ devuelto: Guaranies }> {
-  const previo = yaAplicada<{ devuelto: Guaranies }>(estado, op)
+  const previo = puertaDeEntrada<{ devuelto: Guaranies }>(estado, op)
   if (previo !== null) return previo
 
   const r = estado.reservas.get(entrada.reserva_id)
@@ -526,9 +572,15 @@ export function liberarReserva(
   const vueltas = devolver(r.tomas, remanente)
 
   // Saca de RETENIDO exactamente lo que esta reserva puso ahi: `reservar()`
-  // marco cada bolsa retenida con el reserva_id en su `origen`. Como el
-  // consumo parcial no existe todavia (fuera de alcance), `remanente` es
-  // siempre el total y esto vacia el retenido de esta reserva por completo.
+  // marco cada bolsa retenida con el reserva_id en su `origen`. Se vacia ENTERO
+  // —no solo el remanente— porque lo que ya se consumio salio de la billetera al
+  // consumirse, no acá.
+  //
+  // (El comentario anterior decia «como el consumo parcial no existe todavia,
+  // `remanente` es siempre el total». Lo escribio la entrega que lo agrego, dos
+  // funciones mas arriba. Un comentario que promete lo que el codigo no hace es
+  // la causa raiz declarada del proyecto, y este invitaba a simplificar la resta
+  // de `r.consumido` que es justamente la que hace falta.)
   const bolsasSinRetenido = estado.bolsas.filter(
     (b) => !(b.tipo === 'retenido' && b.origen === r.reserva_id),
   )
@@ -597,12 +649,23 @@ export function verificarInvariantes(estado: EstadoBilletera): void {
   //    porque ahi el acumulado y las bolsas podrian mentir igual. Para eso esta
   //    la reconciliacion contra la suma exhaustiva de la tabla `asientos`, que
   //    corre fuera del camino caliente.
-  const porBolsa = estado.totales
-
+  //    Se recorre la UNION de los dos lados y no solo los tipos que tienen fila
+  //    en `totales`. La version anterior iteraba `estado.totales`, y una auditoria
+  //    adversarial la volteo con el caso mas simple posible: una bolsa de un tipo
+  //    que NUNCA tuvo un asiento es invisible para ese bucle. Medido — con
+  //    `totales = {disponible: 0}` y una bolsa de `ganancia_creador` por 999.999,
+  //    esta funcion no decia nada. O sea que el caso que el parrafo de arriba
+  //    promete agarrar —bolsas escritas sin sus asientos— quedaba cubierto solo
+  //    cuando el tipo ya venia con historia.
+  //
+  //    El patron correcto ya estaba escrito en la funcion de al lado:
+  //    `reconciliar()` recorre `new Set([...sumado.keys(), ...cache.keys()])`.
+  //    Un lugar arreglado y el otro no es como se pierde una categoria.
   const enBolsas = new Map<string, number>()
   for (const b of estado.bolsas) enBolsas.set(b.tipo, (enBolsas.get(b.tipo) ?? 0) + b.monto)
 
-  for (const [tipo, delLedger] of porBolsa) {
+  for (const tipo of new Set([...estado.totales.keys(), ...enBolsas.keys()])) {
+    const delLedger = estado.totales.get(tipo as Bolsa['tipo']) ?? 0
     const enBolsa = enBolsas.get(tipo) ?? 0
     if (delLedger !== enBolsa) {
       throw new Error(`descuadre en ${tipo}: ledger ${delLedger} vs bolsas ${enBolsa}`)

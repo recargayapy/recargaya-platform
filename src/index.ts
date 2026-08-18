@@ -162,12 +162,21 @@ export class BilleteraDO extends DurableObject<Entorno> {
    *
    * POR QUE NO SE PUBLICA ADENTRO DE LA OPERACION
    *
-   * Seria una linea menos y esta mal. Escribir en D1 es un `await` a otro sistema,
-   * y adentro de un Durable Object un `await` mantiene el input gate cerrado: toda
-   * operacion de esa billetera esperaria a la latencia de D1. Peor todavia, no se
-   * podria hacer adentro de `enUnaTransaccion` —`transactionSync` no envuelve un
-   * `await`, que es justamente por lo que se eligio— asi que tampoco se ganaria
-   * atomicidad. Se pagaria la demora sin comprar nada.
+   * Seria una linea menos y esta mal, por dos motivos.
+   *
+   * El primero es que no se ganaria atomicidad: no se puede hacer adentro de
+   * `enUnaTransaccion` porque `transactionSync` no envuelve un `await`, que es
+   * justamente por lo que se eligio.
+   *
+   * El segundo es lo que pasa durante ese `await`, y la version anterior de este
+   * parrafo lo tenia AL REVES. Decia «un `await` mantiene el input gate cerrado:
+   * toda operacion de esa billetera esperaria a la latencia de D1». Una auditoria
+   * lo volteo contra la documentacion de Cloudflare: los input gates protegen solo
+   * durante operaciones de STORAGE. Un `await` a D1 abre la compuerta y deja
+   * entrar otras peticiones. O sea que no habria una espera: habria intercalado, y
+   * la plata se movería en medio de una publicacion en curso.
+   *
+   * Se publica desde la alarma, con el objeto libre entre pasada y pasada.
    *
    * Se publica desde la alarma, que el objeto programa para "ahora" apenas queda
    * algo pendiente. La copia llega en milisegundos y el que movio la plata no
@@ -188,6 +197,28 @@ export class BilleteraDO extends DurableObject<Entorno> {
    * se resuelve solo. Es trabajo de una entrega posterior.
    */
   async publicar(): Promise<{ publicados: number; pendientes: number }> {
+    // Una sola publicacion por vez. Hace falta porque el `await` a D1 de mas abajo
+    // ABRE la compuerta de entrada del objeto (ver el parrafo de arriba): la alarma
+    // puede dispararse mientras un `publicar()` por RPC espera a D1, y las dos
+    // pasadas leerian el MISMO lote y lo mandarian dos veces.
+    //
+    // Hoy D1 lo absorbe —para eso estan las claves primarias de 0002— pero el
+    // contador de intentos se sumaria dos veces por un solo fallo, y la espera
+    // entre reintentos saldria del doble de lo que corresponde. Una bandera alcanza
+    // porque el JavaScript de un Durable Object es de un solo hilo: entre el `if` y
+    // la asignacion no hay await, asi que nadie se cuela en el medio.
+    if (this.publicando) return { publicados: 0, pendientes: resumenDelOutbox(this.sql).pendientes }
+    this.publicando = true
+    try {
+      return await this.publicarLote()
+    } finally {
+      this.publicando = false
+    }
+  }
+
+  private publicando = false
+
+  private async publicarLote(): Promise<{ publicados: number; pendientes: number }> {
     let publicados = 0
 
     for (let pasada = 0; pasada < PASADAS_MAXIMAS; pasada += 1) {
@@ -317,7 +348,23 @@ export class BilleteraDO extends DurableObject<Entorno> {
         correlacion_id: `vencimiento:${reserva_id}`,
         momento,
       }
-      this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))
+      // Cada liberacion, por separado, y una que falle no arrastra a las demas ni
+      // al publicador. Lo pidio una auditoria: sin este try, un solo descuadre en
+      // UNA reserva hacia tirar a `alarm()` entero, y ese es exactamente el modo de
+      // falla que `publicar()` documenta y evita a proposito — Cloudflare reintenta
+      // la alarma unas cuantas veces y despues deja de hacerlo, con el outbox
+      // pendiente y sin nadie que lo despierte.
+      //
+      // La transaccion de `aplicar` ya garantiza que la que falla no deja nada a
+      // medias. Lo unico que agrega esto es seguir de largo.
+      try {
+        this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))
+      } catch (e) {
+        console.error(
+          `billetera ${this.ctx.id.toString()}: no se pudo liberar la reserva vencida ${reserva_id}`,
+          e,
+        )
+      }
     }
 
     // Publicar va DESPUES de liberar, no antes: liberar produce eventos, y si se

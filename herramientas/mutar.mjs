@@ -157,12 +157,6 @@ const MUTACIONES = [
     a: '  const bolsas = bolsasSinTomas',
   },
   {
-    invariante: 'reservar() rechaza un reserva_id con reserva abierta existente',
-    archivo: 'src/billetera/nucleo.ts',
-    de: "  if (estado.reservas.get(entrada.reserva_id)?.estado === 'abierta') {\n    throw new Error(`ya existe una reserva abierta con reserva_id: ${entrada.reserva_id}`)\n  }",
-    a: '',
-  },
-  {
     invariante: 'liberarReserva() vacia retenido de la reserva que libera',
     archivo: 'src/billetera/nucleo.ts',
     de: '  const bolsas = [...bolsasSinRetenido, ...vueltas]',
@@ -533,6 +527,26 @@ const MUTACIONES = [
     oraculo: ORACULO_RUNTIME,
   },
   {
+    // Una sola publicacion por vez. El `await` a D1 ABRE la compuerta de entrada
+    // del objeto —input gates protegen solo durante storage— asi que la alarma
+    // puede dispararse mientras un `publicar()` por RPC espera a D1.
+    invariante: 'dos publicaciones no se solapan',
+    archivo: 'src/index.ts',
+    de: '    if (this.publicando) return { publicados: 0, pendientes: resumenDelOutbox(this.sql).pendientes }',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Una reserva descuadrada no puede tapar el outbox: si `alarm()` tirara,
+    // Cloudflare reintenta unas veces y despues deja de hacerlo, con el outbox
+    // pendiente y sin nadie que lo despierte.
+    invariante: 'una liberacion que falla no arrastra al publicador',
+    archivo: 'src/index.ts',
+    de: '      try {\n        this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n      } catch (e) {',
+    a: '      this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n      try {\n      } catch (e) {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
     // El oraculo de la carpeta de migraciones. La version anterior de
     // `check-esquema.mjs` leia SOLO `0001_cimientos.sql` con la ruta escrita a
     // mano, y 0002 reconstruye `ledger_copia`: el oraculo habria seguido aprobando
@@ -559,7 +573,7 @@ const MUTACIONES = [
     // va a tener nunca, con todo en verde.
     invariante: 'el arnes no puede migrar una carpeta distinta de la que se despliega',
     archivo: 'herramientas/check-runtime.mjs',
-    de: '    if (deWrangler !== declarado.migrationsDir) {',
+    de: '    if (deWrangler[0] !== declarado.migrationsDir) {',
     a: '    if (false) {',
     oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
   },
@@ -788,7 +802,108 @@ const MUTACIONES = [
     oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
   },
 
+  // --- El instante, la otra magnitud que ordena plata -----------------------
+  // El vencimiento compara TEXTO (`vence_en <= momento`) y la alarma compara
+  // RELOJ (`Date.parse`). Con un huso distinto de `Z` los dos dejan de coincidir,
+  // y nada falla: la plata se cuenta mal. Lo encontro una auditoria adversarial.
+  {
+    invariante: 'un instante con otro huso no entra',
+    archivo: 'src/dinero/momento.ts',
+    de: '  if (!FORMA.test(valor)) {',
+    a: '  if (false) {',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // `2026-02-30` pasa la expresion regular y JavaScript la corre en silencio a
+    // `2026-03-02`. Una fecha corrida dos dias es peor que un error.
+    invariante: 'un instante con forma valida y fecha inexistente no entra',
+    archivo: 'src/dinero/momento.ts',
+    de: '  if (d.toISOString() !== conMilis) {',
+    a: '  if (false) {',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // La forma corta (sin milisegundos) es la que escribe una persona, y la larga
+    // la que produce `toISOString()`. Las dos tienen que entrar.
+    invariante: 'la forma sin milisegundos tambien es un instante valido',
+    archivo: 'src/dinero/momento.ts',
+    de: "  const conMilis = valor.includes('.') ? valor : `${valor.slice(0, -1)}.000Z`",
+    a: '  const conMilis = valor',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Una bolsa sin vencimiento es legitima; una con un vencimiento mal escrito no.
+    invariante: 'instanteOpcional no deja pasar cualquier cosa por ser opcional',
+    archivo: 'src/dinero/momento.ts',
+    de: '  return instante(valor)',
+    a: '  return valor as Instante',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // La revision vive en la puerta por la que pasan las cinco operaciones. Un
+    // lugar, no cinco — la sexta no se lo puede olvidar.
+    invariante: 'ninguna operacion entra con un momento mal escrito',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  instante(op.momento)',
+    a: '',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'el vencimiento de una acreditacion se revisa al entrar',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    vence_en: instanteOpcional(entrada.vence_en),',
+    a: '    vence_en: (entrada.vence_en ?? null) as string | null,',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'el vencimiento de una reserva se revisa al entrar',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  instante(entrada.vence_en)\n',
+    a: '',
+    oraculo: ORACULO_NUCLEO,
+  },
+
   // --- Las reservas, el consumo parcial y la alarma -------------------------
+  {
+    // EL BUCLE QUE NADIE PROBABA. Una auditoria lo midio: con esta mutacion, las
+    // 73 pruebas del nucleo y las 48 del runtime pasaban enteras, porque todas
+    // consumian un monto que entraba en la PRIMERA toma. Si el bucle se corta,
+    // `consumido` dice que se gasto X y las bolsas retenidas todavia tienen parte
+    // de X: la misma plata contada dos veces.
+    invariante: 'el consumo que cruza una toma sigue en la siguiente',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    porConsumir -= saca',
+    a: '    porConsumir = 0',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'el consumo no saca mas de lo que la bolsa tiene',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '    const saca = Math.min(porConsumir, b.monto)',
+    a: '    const saca = porConsumir',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Un reserva_id se usa UNA vez. La version anterior rechazaba solo si estaba
+    // ABIERTA, y el reuso de un id ya cerrado dejaba las tomas viejas (PK
+    // `(reserva_id, orden)` con `INSERT OR IGNORE`), el vencimiento viejo, y la
+    // alarma en bucle con la clave `vencimiento:<reserva_id>` ya marcada.
+    invariante: 'un reserva_id no se reusa, ni siquiera despues de cerrado',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  if (estado.reservas.has(entrada.reserva_id)) {',
+    a: "  if (estado.reservas.get(entrada.reserva_id)?.estado === 'abierta') {",
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // El invariante 2 recorre la UNION de los dos lados. Iterando solo `totales`,
+    // una bolsa de un tipo que nunca tuvo asiento es invisible: plata inventada
+    // que el oraculo del camino caliente aprueba.
+    invariante: 'el invariante del ledger mira tambien las bolsas sin historia',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  for (const tipo of new Set([...estado.totales.keys(), ...enBolsas.keys()])) {',
+    a: '  for (const tipo of estado.totales.keys()) {',
+    oraculo: ORACULO_NUCLEO,
+  },
   {
     // LA COTA que estuvo declarada desde la Fase 0 sin nada que la hiciera
     // cumplir. Sin ella el remanente que vuelve al usuario sale negativo.
@@ -796,23 +911,27 @@ const MUTACIONES = [
     archivo: 'src/billetera/nucleo.ts',
     de: '  if (entrada.monto > disponible) {',
     a: '  if (false) {',
-    oraculo: ORACULO_RUNTIME,
+    oraculo: ORACULO_NUCLEO,
   },
   {
     invariante: 'consumirReserva incrementa consumido de verdad',
     archivo: 'src/billetera/nucleo.ts',
     de: '  reservas.set(r.reserva_id, { ...r, consumido: guaranies(r.consumido + entrada.monto) })',
     a: '  reservas.set(r.reserva_id, { ...r, consumido: r.consumido })',
-    oraculo: ORACULO_RUNTIME,
+    oraculo: ORACULO_NUCLEO,
   },
   {
     // El invariante 4 tuvo que aprender a restar `consumido`. Con la version
     // anterior, toda reserva consumida a medias quedaba acusada de descuadre.
+    // Las tres de acá arriba atacan codigo PURO y estaban declaradas con el
+    // oraculo del runtime, que es el caro. Lo noto una auditoria: `consumirReserva`
+    // no depende de Cloudflare, asi que su lugar es `tests/`, que es lo que la
+    // mutacion corre decenas de veces.
     invariante: 'retenido cuadra con lo que las reservas abiertas NO gastaron',
     archivo: 'src/billetera/nucleo.ts',
     de: '    .reduce((total, r) => total + r.tomas.reduce((s, t) => s + t.monto, 0) - r.consumido, 0)',
     a: '    .reduce((total, r) => total + r.tomas.reduce((s, t) => s + t.monto, 0), 0)',
-    oraculo: ORACULO_RUNTIME,
+    oraculo: ORACULO_NUCLEO,
   },
   {
     // Una reserva que nace vencida —reloj corrido, reintento demorado, campaña de

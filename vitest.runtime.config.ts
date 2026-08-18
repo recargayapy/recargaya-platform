@@ -4,7 +4,7 @@
  * Van aparte de `vitest.config.ts` a proposito. Las pruebas de `tests/` son del
  * nucleo puro: corren en Node, en milisegundos, y son las que la mutacion ataca
  * decenas de veces. Las de `pruebas-runtime/` levantan workerd. Mezclarlas haria
- * que cada mutacion pague el arranque del runtime, y la mutacion ya se corre 84
+ * que cada mutacion pague el arranque del runtime, y la mutacion ya se corre 117
  * veces y va a crecer.
  *
  * Lo que esta separacion NO significa: que las pruebas del runtime sean

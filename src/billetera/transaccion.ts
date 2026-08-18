@@ -23,11 +23,19 @@
  *
  *   `transactionSync` no puede envolver un `await`.
  *
- * Eso, que suena a limitacion, es la garantia. Una transaccion que abarca I/O
- * externo —una llamada a un proveedor, un fetch— queda abierta mientras espera, con
- * el input gate del objeto cerrado: la billetera entera se bloquea a la velocidad
- * de la red de un tercero. Con la version sincrona eso no se puede escribir aunque
- * alguien quiera.
+ * Eso, que suena a limitacion, es la garantia. Y el motivo NO es el que decia la
+ * version anterior de este parrafo —«queda abierta con el input gate del objeto
+ * cerrado»—: eso es falso, y lo volteo una auditoria contra la documentacion de
+ * Cloudflare. Los input gates protegen SOLO durante operaciones de storage; un
+ * `await` a `fetch()`, a D1 o a R2 ABRE la compuerta y deja entrar otras
+ * peticiones. La cita, de «Rules of Durable Objects»: «Input gates only protect
+ * during storage operations. Non-storage I/O like fetch() or writing to R2 allows
+ * other requests to interleave, which can cause race conditions.»
+ *
+ * O sea que el peligro real es el opuesto del que estaba escrito, y peor: una
+ * transaccion que abarca I/O externo NO se queda sola. Otra operacion puede entrar
+ * mientras espera, leer un estado a medio cambiar y decidir sobre plata con el.
+ * Con la version sincrona eso no se puede escribir aunque alguien quiera.
  *
  * La regla que queda, y es corta: adentro de `enUnaTransaccion` va SQL y nada mas.
  * Lo que necesite `await` se resuelve antes o despues, nunca adentro.

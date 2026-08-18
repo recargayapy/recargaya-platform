@@ -415,7 +415,7 @@ const CON_STAGING = `{ "compatibility_date": "2026-08-01", "env": { "staging": {
       '{ "compatibility_date": "2026-08-01", "env": { "staging": { "d1_databases": [{ "binding": "CORE" }] } } }',
   })
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
-  assert.match(r.salida, /no declara `migrations_dir`/)
+  assert.match(r.salida, /ninguna base D1 .* declara `migrations_dir`/)
 }
 
 // Y LA DERIVA, que es la que este agregado existe para cerrar: el arnes aplica las
@@ -432,6 +432,30 @@ const CON_STAGING = `{ "compatibility_date": "2026-08-01", "env": { "staging": {
   assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
   assert.match(r.salida, /migraciones\/de-juguete/)
   assert.match(r.salida, /no es el que se despliega/)
+}
+
+// Dos bases D1 con carpetas distintas: el arnes aplica UNA sola, asi que elegir en
+// silencio seria aprobar un esquema al azar. La version anterior de
+// `migracionesDeclaradas` devolvia la primera que encontraba y este caso pasaba en
+// verde; lo pidio una auditoria.
+{
+  const r = correrOraculoCon({
+    wrangler:
+      '{ "compatibility_date": "2026-08-01", "env": { "staging": { "d1_databases": [{ "binding": "CORE", "migrations_dir": "migraciones/core" }, { "binding": "OTRA", "migrations_dir": "migraciones/otra" }] } } }',
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /mas de una carpeta de migraciones/)
+}
+
+// Pero DOS bases que declaran la MISMA carpeta no son una ambiguedad: no hay nada
+// que elegir. Sin este caso, la comprobacion de arriba se podria "arreglar"
+// prohibiendo tener dos bases, que es otra cosa.
+{
+  const r = correrOraculoCon({
+    wrangler:
+      '{ "compatibility_date": "2026-08-01", "env": { "staging": { "d1_databases": [{ "binding": "CORE", "migrations_dir": "migraciones/core" }, { "binding": "OTRA", "migrations_dir": "migraciones/core" }] } } }',
+  })
+  assert.equal(r.codigo, 0, `esperaba 0 y salio ${r.codigo}: ${r.salida}`)
 }
 
 // Invocado por DIRECTORIO, con un package.json que declara `main`. Es el unico

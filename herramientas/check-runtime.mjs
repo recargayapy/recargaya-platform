@@ -210,18 +210,28 @@ export function esFechaReal(fecha) {
 }
 
 /**
- * La carpeta de migraciones que declara la base D1 del entorno, tal cual la lee
- * wrangler. Devuelve `null` si el entorno no tiene una base D1 con `migrations_dir`.
+ * Las carpetas de migraciones que declaran las bases D1 del entorno, sin repetidos.
+ *
+ * Devuelve una LISTA y no la primera que encuentre, y eso es un arreglo de
+ * auditoria: la version anterior hacia `for (…) if (typeof b?.migrations_dir ===
+ * 'string') return b.migrations_dir`, o sea que ignoraba el resto. Hoy hay una sola
+ * base y acertaba; el dia que haya dos, compararia la carpeta equivocada y
+ * aprobaria en verde. Es la misma clase de defecto de «medio lado de la frontera»
+ * que este archivo ya documenta haber arreglado dos veces.
+ *
+ * Con la lista, el que decide puede exigir que haya exactamente una: el arnes
+ * aplica UNA carpeta de migraciones, asi que dos bases con carpetas distintas es un
+ * estado que no se puede probar, y hay que decirlo en vez de elegir una.
  *
  * Separada y pura para poder probarla sobre objetos, sin disco.
  */
 export function migracionesDeclaradas(config, entorno) {
   const bases = config?.env?.[entorno]?.d1_databases
-  if (!Array.isArray(bases)) return null
-  for (const b of bases) {
-    if (typeof b?.migrations_dir === 'string') return b.migrations_dir
-  }
-  return null
+  if (!Array.isArray(bases)) return []
+  const carpetas = bases
+    .map((b) => b?.migrations_dir)
+    .filter((d) => typeof d === 'string' && d !== '')
+  return [...new Set(carpetas)]
 }
 
 function main() {
@@ -247,14 +257,19 @@ function main() {
     }
 
     const deWrangler = migracionesDeclaradas(config, entorno)
-    if (deWrangler === null) {
+    if (deWrangler.length === 0) {
       throw new Error(
-        `la base D1 de env.${entorno} no declara \`migrations_dir\`, y el arnes necesita saber que migraciones aplicar a la base local`,
+        `ninguna base D1 de env.${entorno} declara \`migrations_dir\`, y el arnes necesita saber que migraciones aplicar a la base local`,
       )
     }
-    if (deWrangler !== declarado.migrationsDir) {
+    if (deWrangler.length > 1) {
       throw new Error(
-        `el arnes aplica las migraciones de "${declarado.migrationsDir}" y env.${entorno} despliega las de "${deWrangler}": las pruebas correrian contra un esquema de D1 que no es el que se despliega`,
+        `env.${entorno} declara mas de una carpeta de migraciones (${deWrangler.join(', ')}) y el arnes aplica una sola: elegir en silencio seria aprobar un esquema al azar`,
+      )
+    }
+    if (deWrangler[0] !== declarado.migrationsDir) {
+      throw new Error(
+        `el arnes aplica las migraciones de "${declarado.migrationsDir}" y env.${entorno} despliega las de "${deWrangler[0]}": las pruebas correrian contra un esquema de D1 que no es el que se despliega`,
       )
     }
 

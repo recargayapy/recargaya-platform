@@ -10,13 +10,14 @@
  *
  * QUE PRUEBAN Y QUE NO — leer esto antes de confiar en el numero de abajo.
  *
- * De las treinta y cinco pruebas de este archivo:
+ * De las cincuenta pruebas de este archivo:
  *
- *   · VEINTIOCHO estan ancladas a codigo de `src/` y tienen una mutacion que las
- *     mata: las siete del esquema (ejecutan la cadena que exporta
+ *   · CUARENTA Y UNA estan ancladas a codigo de `src/` y tienen una mutacion que
+ *     las mata: las siete del esquema (ejecutan la cadena que exporta
  *     `src/billetera/esquema.ts`, no una tabla de juguete), las tres de la
  *     transaccion, las siete del `BilleteraDO` por su metodo publico, las nueve de
- *     las reservas y la alarma, y las dos de `el Worker desplegado`.
+ *     las reservas y la alarma, las quince del publicador, y las dos de `el Worker
+ *     desplegado`.
  *   · CUATRO —las dos de aislamiento y las dos homonimas— prueban una convencion
  *     de este archivo y no una linea de produccion. Tres de las cuatro mueren por
  *     su propia asercion con una mutacion del arnes; la cuarta (`el estado
@@ -58,7 +59,7 @@ import {
   runDurableObjectAlarm,
 } from 'cloudflare:test'
 import { describe, it, expect, beforeAll } from 'vitest'
-import type { Entorno } from '../src/index.js'
+import type { BilleteraDO, Entorno } from '../src/index.js'
 import { ESQUEMA } from '../src/billetera/esquema.js'
 import { guaranies } from '../src/dinero/monto.js'
 import { enUnaTransaccion } from '../src/billetera/transaccion.js'
@@ -513,8 +514,10 @@ describe('la transaccion de storage', () => {
     // DO con SQLite existe `transactionSync()`. La respuesta honesta era que
     // nadie lo habia medido. Se mide: las dos deshacen. La entrega siguiente
     // elige por otro motivo (la sincrona no puede envolver un `await`, y eso es
-    // una VENTAJA: impide que una transaccion abarque I/O externo y quede abierta
-    // con el input gate cerrado), no porque el arnes le haya cerrado la puerta.
+    // una VENTAJA: impide que una transaccion abarque I/O externo — durante el
+    // cual, segun la documentacion de Cloudflare, la compuerta de entrada se ABRE
+    // y otra operacion puede entrar a leer un estado a medio cambiar), no porque
+    // el arnes le haya cerrado la puerta.
     // Usa una tabla propia con nombre propio: desde que el constructor del DO
     // crea el esquema real, una sonda que invente una tabla `asientos` choca con
     // la de verdad. Es una buena señal — significa que el esquema ya esta ahi
@@ -1045,6 +1048,11 @@ describe('las reservas, por el metodo publico del DO', () => {
     // es sobre todo disponible — pero el credito que quede tiene que volver COMO
     // credito y con su vencimiento, nunca como disponible.
     const credito = saldo.bolsas.filter((b) => b.tipo === 'credito_promocion')
+    // Sin esta linea, la prueba de la ley 11 pasaba con la ley 11 rota: si el
+    // remanente volviera TODO como `disponible` —que es la violacion exacta— el
+    // filtro queda vacio, el `for` no afirma nada y el total sigue dando. Lo
+    // encontro una auditoria adversarial.
+    expect(credito.length).toBeGreaterThan(0)
     for (const b of credito) expect(b.vence_en).toBe('2026-12-31T00:00:00Z')
 
     expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(90_000)
@@ -1471,11 +1479,16 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     // —podrian ser meses— y no falla nada: `saldo()` y `reconciliar()` dan bien,
     // porque la plata esta. Lo unico que esta mal es que nadie afuera lo sabe.
     //
-    // Se prueba con nueve intentos encima a proposito. Con cero, la alarma se
+    // Se prueba con DOCE intentos encima a proposito. Con cero, la alarma se
     // programa para AHORA y se dispara sola antes de que la prueba pueda leerla:
-    // la afirmacion seria una carrera. Con nueve, el retraso es el techo —cinco
-    // minutos— y la alarma se queda quieta, medible. De paso queda probado que el
-    // backoff llega hasta acá y no solo hasta la funcion pura que lo calcula.
+    // la afirmacion seria una carrera. Con doce el retraso esta en el techo —cinco
+    // minutos, porque `2**11 * 1000` pasa de largo `RETRASO_MAXIMO_MS`— y la alarma
+    // se queda quieta, medible.
+    //
+    // Decia NUEVE, y una auditoria lo corrigio contando: `retrasoPorIntentos(9)` es
+    // `2**8 * 1000` = 256 s = 4 min 16 s, o sea que el `Math.min` no entraba en
+    // juego y el comentario afirmaba una cobertura que no existia. El techo recien
+    // se alcanza a los diez.
     const oreja = billetera(task)
 
     await oreja.acreditar(op('k1'), {
@@ -1487,7 +1500,7 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     expect((await drenar(oreja)).alarma).toBeNull()
 
     await runInDurableObject(oreja, (_do, ctx) => {
-      ctx.storage.sql.exec('UPDATE outbox SET publicado_en = NULL, intentos = 9')
+      ctx.storage.sql.exec('UPDATE outbox SET publicado_en = NULL, intentos = 12')
     })
 
     // Una operacion REPETIDA: misma clave de idempotencia, asi que no escribe nada
@@ -1504,9 +1517,10 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     const d = await oreja.diagnostico()
     expect(d.outbox.pendientes).toBe(2)
     expect(d.alarma).not.toBeNull()
-    // Cinco minutos, con margen para lo que tarde la prueba. Sin el backoff seria
-    // "ahora": el objeto despertaria en bucle contra una D1 que no contesta.
-    expect(d.alarma!).toBeGreaterThanOrEqual(antes + 4 * 60 * 1000)
+    // Exactamente el techo: la alarma es `ahora + 300_000`, y `ahora` cayo entre
+    // `antes` y este instante. Sin el backoff seria "ahora" a secas, y el objeto
+    // despertaria en bucle contra una D1 que no contesta.
+    expect(d.alarma!).toBeGreaterThanOrEqual(antes + 5 * 60 * 1000)
     expect(d.alarma!).toBeLessThanOrEqual(Date.now() + 5 * 60 * 1000)
   })
 
@@ -1555,9 +1569,9 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     // `Math.max` SOBREVIVIO. Todas las pruebas de la alarma tenian un motivo solo, y
     // con un motivo el minimo y el maximo son el mismo numero.
     //
-    // Los nueve intentos vuelven a ser lo que hace esto medible: con el retraso en
+    // Los doce intentos vuelven a ser lo que hace esto medible: con el retraso en
     // el techo —cinco minutos— la alarma se queda quieta el tiempo suficiente para
-    // preguntarle.
+    // preguntarle. (Doce y no nueve: nueve son 256 s, no el techo.)
     const oreja = billetera(task)
     await oreja.acreditar(op('c1'), {
       monto: guaranies(100_000),
@@ -1574,7 +1588,7 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
 
     const atascar = () =>
       runInDurableObject(oreja, (_do, ctx) => {
-        ctx.storage.sql.exec('UPDATE outbox SET publicado_en = NULL, intentos = 9')
+        ctx.storage.sql.exec('UPDATE outbox SET publicado_en = NULL, intentos = 12')
       })
 
     // Una operacion repetida no escribe nada: lo unico que hace es reprogramar.
@@ -1593,7 +1607,7 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     await reprogramar()
     let alarma = (await oreja.diagnostico()).alarma
     expect(alarma).not.toBeNull()
-    expect(alarma!).toBeGreaterThanOrEqual(antes + 4 * 60 * 1000)
+    expect(alarma!).toBeGreaterThanOrEqual(antes + 5 * 60 * 1000)
     expect(alarma!).toBeLessThanOrEqual(Date.now() + 5 * 60 * 1000)
 
     // B · y al reves. La reserva pasa a vencer en un minuto, el outbox sigue
@@ -1650,6 +1664,116 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     expect((await oreja.diagnostico()).alarma).toBeNull()
   })
 
+  it('dos publicaciones a la vez no se pisan', async ({ task }) => {
+    // Hace falta porque el `await` a D1 ABRE la compuerta de entrada del Durable
+    // Object. La documentacion de Cloudflare lo dice sin vueltas: «Input gates only
+    // protect during storage operations. Non-storage I/O like fetch() … allows
+    // other requests to interleave.» O sea que la alarma puede dispararse mientras
+    // un `publicar()` por RPC espera a D1, y las dos pasadas leerian EL MISMO lote.
+    //
+    // El comentario que estaba en `publicar()` afirmaba exactamente lo contrario
+    // —que el `await` mantiene la compuerta cerrada— y lo volteo una auditoria.
+    //
+    // Que D1 lo absorba no alcanza: el contador de intentos se sumaria dos veces
+    // por un solo fallo y la espera entre reintentos saldria del doble.
+    const oreja = billetera(task)
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    expect((await drenar(oreja)).alarma).toBeNull()
+
+    await runInDurableObject(oreja, (_do, ctx) => {
+      ctx.storage.sql.exec('UPDATE outbox SET publicado_en = NULL')
+    })
+
+    // Las dos arrancan ADENTRO del objeto y sin esperar a la otra.
+    //
+    // Tiene que ser adentro, y esto se midio: con dos llamadas por RPC
+    // (`Promise.all([oreja.publicar(), oreja.publicar()])`) la mutacion que le saca
+    // el guarda SOBREVIVIA a cinco corridas seguidas — el canal de RPC las serializa,
+    // asi que la segunda arrancaba con la primera ya terminada y no habia nada que
+    // pisar. Una prueba de concurrencia donde no hay concurrencia prueba el arnes.
+    //
+    // Llamando al metodo de la instancia, las dos empiezan antes de que ninguna
+    // llegue a su `await` a D1, que es donde la compuerta de entrada se abre.
+    //
+    // La suma es la asercion: hay dos filas pendientes, asi que entre las dos
+    // llamadas tienen que publicarse DOS veces. Sin el guarda, las dos leen EL MISMO
+    // lote y da cuatro.
+    //
+    // El cast es local y documentado: `runInDurableObject` tipa la instancia como
+    // `DurableObject` a secas —el generico no sale del stub— y `publicar()` es un
+    // metodo de `BilleteraDO`. Se declara lo que se espera de el y nada mas.
+    const [a, b] = await runInDurableObject(oreja, async (instancia) => {
+      const publicar = (instancia as unknown as BilleteraDO).publicar.bind(instancia)
+      const uno = publicar()
+      const dos = publicar()
+      return Promise.all([uno, dos])
+    })
+    expect(a.publicados + b.publicados).toBe(2)
+
+    // El `pendientes` de la que rebota es una foto del momento en que rebota, y en
+    // ese momento la otra todavia no marco nada: puede dar 2 y esta bien. Lo que
+    // tiene que quedar en cero es el estado final, y eso se pregunta despues.
+    expect((await oreja.diagnostico()).outbox.pendientes).toBe(0)
+  })
+
+  it('una reserva que no se puede liberar NO tapa el outbox', async ({ task }) => {
+    // El modo de falla que `publicar()` documenta y evita a proposito, entrando por
+    // la puerta de al lado: si `alarm()` tira, Cloudflare la reintenta unas cuantas
+    // veces y despues deja de hacerlo — el outbox queda pendiente y sin nadie que
+    // lo despierte. La mitad de arriba de `alarm()` no tenia esa proteccion.
+    const oreja = billetera(task)
+    await oreja.acreditar(op('c1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: new Date(dentroDeMediaHora()).toISOString(),
+    })
+    expect((await drenar(oreja)).outbox.pendientes).toBe(0)
+
+    await runInDurableObject(oreja, (_do, ctx) => {
+      // La reserva pasa a estar vencida, sin escribir un solo evento.
+      ctx.storage.sql.exec('UPDATE reservas SET vence_en = ?', '2020-01-01T00:00:00Z')
+      // Y el acumulado del ledger queda corrupto, asi que la liberacion va a fallar
+      // por el invariante 2 ANTES de escribir nada.
+      ctx.storage.sql.exec("UPDATE totales_ledger SET total = total + 1 WHERE bolsa = 'disponible'")
+      // Con algo pendiente para publicar.
+      ctx.storage.sql.exec('UPDATE outbox SET publicado_en = NULL')
+    })
+
+    // La alarma NO tira, aunque la liberacion adentro haya fallado.
+    let error: unknown = null
+    try {
+      await runInDurableObject(oreja, async (instancia) => {
+        await instancia.alarm?.()
+      })
+    } catch (e) {
+      error = e
+    }
+    expect(error).toBeNull()
+
+    // Y el outbox salio igual, que es todo el punto.
+    expect((await oreja.diagnostico()).outbox.pendientes).toBe(0)
+
+    // La reserva sigue abierta y descuadrada: no se arreglo sola, y eso esta bien.
+    // Lo que se evito es que UNA reserva rota se lleve puesto al publicador.
+    const abiertas = await runInDurableObject(oreja, (_do, ctx) => [
+      ...ctx.storage.sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM reservas WHERE estado = 'abierta'",
+      ),
+    ])
+    expect(abiertas).toEqual([{ n: 1 }])
+  })
+
   it('D1 no deja editar ni borrar lo que ya se copio', async ({ task }) => {
     // Los triggers de 0001 y 0002. Un registro de lo que paso que se puede editar
     // despues no es un registro de lo que paso — y esta copia es la que lee el
@@ -1682,10 +1806,9 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
 
 describe('el Worker desplegado', () => {
   it('/salud contesta y valida el guarani dentro del runtime', async () => {
-    // Las 50 pruebas de `tests/` verifican `guaranies()` en Node. Esta lo
-    // verifica ADENTRO de workerd, atravesando el fetch, los vars del entorno y
-    // el binding — que es el camino que recorre una peticion de verdad. Es una
-    // de las dos pruebas de este archivo ancladas a codigo de `src/`.
+    // Las pruebas de `tests/` verifican `guaranies()` en Node. Esta lo verifica
+    // ADENTRO de workerd, atravesando el fetch, los vars del entorno y el binding
+    // — que es el camino que recorre una peticion de verdad.
     const r = await SELF.fetch('https://recargaya-staging.local/salud')
 
     expect(r.status).toBe(200)
