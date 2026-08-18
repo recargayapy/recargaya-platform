@@ -72,8 +72,8 @@ export function ordenarPorPrecedencia(bolsas: readonly Bolsa[]): Bolsa[] {
     if (r !== 0) return r
 
     // Lo que vence antes, primero. Lo que no vence, al final de su tipo.
-    const va = a.vence_en ?? '9999-12-31T23:59:59Z'
-    const vb = b.vence_en ?? '9999-12-31T23:59:59Z'
+    const va = a.vence_en ?? '9999-12-31T23:59:59.000Z'
+    const vb = b.vence_en ?? '9999-12-31T23:59:59.000Z'
     if (va !== vb) return va < vb ? -1 : 1
 
     return a.origen < b.origen ? -1 : a.origen > b.origen ? 1 : 0

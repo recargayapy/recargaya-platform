@@ -542,8 +542,8 @@ const MUTACIONES = [
     // pendiente y sin nadie que lo despierte.
     invariante: 'una liberacion que falla no arrastra al publicador',
     archivo: 'src/index.ts',
-    de: '      try {\n        this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n      } catch (e) {',
-    a: '      this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n      try {\n      } catch (e) {',
+    de: '      try {\n        this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n        this.liberacionesFallidas.delete(reserva_id)\n      } catch (e) {',
+    a: '      this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n      this.liberacionesFallidas.delete(reserva_id)\n      try {\n      } catch (e) {',
     oraculo: ORACULO_RUNTIME,
   },
   {
@@ -661,8 +661,8 @@ const MUTACIONES = [
     // Una bolsa en cero no es una bolsa: es una fila que ensucia la precedencia.
     invariante: 'una bolsa no puede quedar en cero ni en negativo',
     archivo: 'src/billetera/esquema.ts',
-    de: '    monto         INTEGER NOT NULL CHECK (monto > 0),\n    vence_en      TEXT,\n    origen        TEXT NOT NULL,\n    restringida_a TEXT\n  ) STRICT`,',
-    a: '    monto         INTEGER NOT NULL,\n    vence_en      TEXT,\n    origen        TEXT NOT NULL,\n    restringida_a TEXT\n  ) STRICT`,',
+    de: '    monto         INTEGER NOT NULL CHECK (monto > 0),\n    vence_en      TEXT ${CHECK_VENCE_EN},\n    origen        TEXT NOT NULL,\n    restringida_a TEXT\n  ) STRICT`,',
+    a: '    monto         INTEGER NOT NULL,\n    vence_en      TEXT ${CHECK_VENCE_EN},\n    origen        TEXT NOT NULL,\n    restringida_a TEXT\n  ) STRICT`,',
     oraculo: ORACULO_RUNTIME,
   },
   {
@@ -803,6 +803,46 @@ const MUTACIONES = [
   },
 
   // --- El instante, la otra magnitud que ordena plata -----------------------
+  {
+    // LA FORMA UNICA. La primera version aceptaba los milisegundos como opcionales
+    // y afirmaba que las dos formas «ordenan igual entre si». No ordenan igual:
+    // `.` es 0x2E y `Z` es 0x5A, asi que dentro del mismo segundo la larga va
+    // antes que la corta — al reves que el reloj. Medido de punta a punta: la
+    // alarma decia YA y el filtro que la justifica decia TODAVIA NO.
+    invariante: 'el instante tiene UNA sola forma, con milisegundos',
+    archivo: 'src/dinero/momento.ts',
+    de: 'const FORMA = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$/',
+    a: 'const FORMA = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{3})?Z$/',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Y que la revision corra TAMBIEN cuando la operacion resulta repetida. Es el
+    // orden de dos lineas, y una auditoria midio que nada lo sostenia.
+    invariante: 'el momento se revisa aunque la operacion sea repetida',
+    archivo: 'src/billetera/nucleo.ts',
+    de: '  instante(op.momento)\n\n  const previo = estado.aplicadas.get(op.clave_idem)\n  if (previo === undefined) return null',
+    a: '  const previo = estado.aplicadas.get(op.clave_idem)\n  if (previo === undefined) {\n    instante(op.momento)\n    return null\n  }',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // El CHECK del lado de adentro de la base. La puerta de TypeScript no cubre lo
+    // que ya esta guardado ni lo que entre por otro camino.
+    invariante: 'un vencimiento mal escrito no entra en la base',
+    archivo: 'src/billetera/esquema.ts',
+    de: "  `${col} LIKE '${FORMA_INSTANTE}' AND NOT ${col} GLOB '${ALFABETO_INSTANTE}'`",
+    a: '  `${col} IS NOT NULL`',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Y que el CHECK mire el ALFABETO y no solo el ancho: sin la clase negada,
+    // `abcd-ef-ghTij:kl:mn.opqZ` entra.
+    invariante: 'el CHECK del instante mira tambien que sean digitos',
+    archivo: 'src/billetera/esquema.ts',
+    de: "const ALFABETO_INSTANTE = '*[^0-9.:TZ-]*'",
+    a: "const ALFABETO_INSTANTE = '*[^ -~]*'",
+    oraculo: ORACULO_RUNTIME,
+  },
+
   // El vencimiento compara TEXTO (`vence_en <= momento`) y la alarma compara
   // RELOJ (`Date.parse`). Con un huso distinto de `Z` los dos dejan de coincidir,
   // y nada falla: la plata se cuenta mal. Lo encontro una auditoria adversarial.
@@ -818,17 +858,8 @@ const MUTACIONES = [
     // `2026-03-02`. Una fecha corrida dos dias es peor que un error.
     invariante: 'un instante con forma valida y fecha inexistente no entra',
     archivo: 'src/dinero/momento.ts',
-    de: '  if (d.toISOString() !== conMilis) {',
+    de: '  if (d.toISOString() !== valor) {',
     a: '  if (false) {',
-    oraculo: ORACULO_NUCLEO,
-  },
-  {
-    // La forma corta (sin milisegundos) es la que escribe una persona, y la larga
-    // la que produce `toISOString()`. Las dos tienen que entrar.
-    invariante: 'la forma sin milisegundos tambien es un instante valido',
-    archivo: 'src/dinero/momento.ts',
-    de: "  const conMilis = valor.includes('.') ? valor : `${valor.slice(0, -1)}.000Z`",
-    a: '  const conMilis = valor',
     oraculo: ORACULO_NUCLEO,
   },
   {
@@ -864,6 +895,50 @@ const MUTACIONES = [
   },
 
   // --- Las reservas, el consumo parcial y la alarma -------------------------
+  {
+    // EL DEFECTO NACIDO DEL ARREGLO, y es el peor de la segunda vuelta. El
+    // try/catch que impide que una reserva rota se lleve puesto al publicador dejo
+    // a la alarma sin freno: la reserva sigue vencida y abierta, `reprogramarAlarma`
+    // la vuelve a ver, y programa para AHORA. Medido: ~185 disparos por segundo,
+    // sostenidos, sin un solo error visible. Con el contador, la espera crece.
+    invariante: 'una liberacion que falla no deja la alarma girando',
+    archivo: 'src/index.ts',
+    de: '        this.liberacionesFallidas.set(reserva_id, previos + 1)',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Y la otra mitad: que el exito lo limpie. Sin esto, una reserva que fallo una
+    // vez arrastra su backoff para siempre y las siguientes llegan tarde.
+    invariante: 'una liberacion que funciona limpia su contador',
+    archivo: 'src/index.ts',
+    de: '        this.liberacionesFallidas.delete(reserva_id)',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'el vencimiento vuelve a intentarse mas tarde, no en bucle',
+    archivo: 'src/billetera/alarma.ts',
+    de: '    motivos.push(m.ahora + retrasoPorIntentos(m.intentosDeLasVencidas))',
+    a: '    motivos.push(m.ahora)',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // El estado cerrado tiene que LLEGAR al nucleo, si no el rechazo del reuso no
+    // tiene que mirar. Las dos lineas de las que cuelga, una por mutacion.
+    invariante: 'el DO le pasa al nucleo la reserva que la operacion nombra',
+    archivo: 'src/index.ts',
+    de: '    return this.operar(op, entrada.reserva_id, (e) => reservar(e, op, entrada))',
+    a: '    return this.operar(op, undefined, (e) => reservar(e, op, entrada))',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'se carga la reserva nombrada aunque este cerrada',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '        : "SELECT reserva_id, consumido, vence_en, estado FROM reservas WHERE estado = \'abierta\' OR reserva_id = ?",',
+    a: '        : "SELECT reserva_id, consumido, vence_en, estado FROM reservas WHERE estado = \'abierta\' OR (reserva_id = ? AND 0)",',
+    oraculo: ORACULO_RUNTIME,
+  },
   {
     // EL BUCLE QUE NADIE PROBABA. Una auditoria lo midio: con esta mutacion, las
     // 73 pruebas del nucleo y las 48 del runtime pasaban enteras, porque todas
@@ -945,15 +1020,15 @@ const MUTACIONES = [
     // sola. Se movio la decision, no se agrego una prueba mas.
     invariante: 'una reserva ya vencida igual queda con alarma',
     archivo: 'src/billetera/alarma.ts',
-    de: '  if (m.hayVencidas) motivos.push(m.ahora)',
-    a: '  if (false) motivos.push(m.ahora)',
+    de: '  if (m.intentosDeLasVencidas !== null) {',
+    a: '  if (false) {',
     oraculo: ORACULO_NUCLEO,
   },
   {
     invariante: 'la alarma queda programada para el vencimiento de la reserva',
     archivo: 'src/billetera/alarma.ts',
-    de: '  else if (m.proximoVencimiento !== null) motivos.push(Date.parse(m.proximoVencimiento))',
-    a: '',
+    de: '  } else if (m.proximoVencimiento !== null) {\n    motivos.push(Date.parse(m.proximoVencimiento))',
+    a: '  } else if (false) {\n    motivos.push(Date.parse(m.proximoVencimiento))',
     oraculo: ORACULO_NUCLEO,
   },
   {

@@ -33,10 +33,10 @@ que nadie toque el workflow.
 |---|---|
 | `npm run entorno` | que los tipos de los bindings sean lo que genera `wrangler.jsonc` |
 | `npm run tipos` | TypeScript estricto, sin emitir |
-| `npm run probar` | las 94 pruebas del núcleo puro, en Node |
+| `npm run probar` | las 98 pruebas del núcleo puro, en Node |
 | `npm run esquema` | los tipos de TypeScript contra el SQL de las migraciones |
-| `npm run runtime` | que la fecha de compatibilidad esté escrita, y 50 pruebas sobre workerd |
-| `npm run mutar` | rompe 117 invariantes a propósito y exige que todos mueran |
+| `npm run runtime` | que la fecha de compatibilidad esté escrita, y 53 pruebas sobre workerd |
+| `npm run mutar` | rompe 125 invariantes a propósito y exige que todos mueran |
 | `npm run desarrollo` | Wrangler local contra staging |
 
 Los números de esta tabla envejecen. Los que manda son los que imprime

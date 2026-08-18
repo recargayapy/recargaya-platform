@@ -72,6 +72,51 @@ export const TIPOS_DE_BOLSA = [
 const CHECK_TIPO_BOLSA = `IN ('${TIPOS_DE_BOLSA.join("', '")}')`
 
 /**
+ * La forma de un instante, del lado de adentro de la base.
+ *
+ * `dinero/momento.ts` la hace cumplir en TypeScript, y una auditoria adversarial
+ * preguntó por que ese criterio no era el mismo que el del guarani: el encabezado
+ * de este archivo dice que la restriccion «tiene que estar del lado de adentro de
+ * la unica puerta al dinero, no en el TypeScript que la llama». Tenia razon.
+ *
+ * Va sobre los `vence_en` y nada mas, a proposito: son los unicos que se COMPARAN,
+ * y compararlos es donde la forma importa. `reservasVencidas` hace
+ * `vence_en <= momento` en SQL puro, o sea texto contra texto: con anchos
+ * distintos, «vencida» y «vigente» dejan de significar lo que dicen.
+ *
+ * `asentado_en` y `creado_en` no lo llevan porque no se comparan: se leen y se
+ * muestran. Poner un CHECK ahi seria disciplina sin invariante detras.
+ *
+ * LO QUE ESTO NO ALCANZA, y hay que decirlo: el DDL corre con `IF NOT EXISTS`, asi
+ * que un Durable Object que ya tenga sus tablas creadas NO recibe el CHECK. Lo
+ * hace cumplir para todo objeto nuevo y para todo lo que se despliegue de acá en
+ * mas; lo viejo lo cubre la puerta de TypeScript, que es lo unico que las filas
+ * existentes atravesaron. Migrar el esquema de un DO ya creado es trabajo de otra
+ * entrega, y no hace falta hoy porque nada de esto llego a produccion.
+ */
+/**
+ * POR QUE `LIKE` CON GUIONES BAJOS Y NO UN GLOB DE CLASES, que seria lo obvio:
+ *
+ * `'[0-9][0-9][0-9][0-9]-[0-9][0-9]-…'` es la forma natural y SQLite la rechaza al
+ * crear la tabla — «LIKE or GLOB pattern too complex: SQLITE_ERROR». Hay un tope
+ * de clases de caracteres por patron y veinte lo pasan. Medido sobre workerd, no
+ * leido.
+ *
+ * `LIKE` con `_` fija el ancho y la posicion de cada separador, que es EXACTAMENTE
+ * el invariante que hace falta: lo que rompe el orden de texto es el ancho, no el
+ * alfabeto. Y una sola clase negada —`NOT GLOB '*[^0-9.:TZ-]*'`— alcanza para que
+ * no entre una letra donde va un digito. Dos patrones simples en lugar de uno
+ * imposible.
+ */
+const FORMA_INSTANTE = '____-__-__T__:__:__.___Z'
+const ALFABETO_INSTANTE = '*[^0-9.:TZ-]*'
+const formaDe = (col: string) =>
+  `${col} LIKE '${FORMA_INSTANTE}' AND NOT ${col} GLOB '${ALFABETO_INSTANTE}'`
+
+const CHECK_VENCE_EN = `CHECK (vence_en IS NULL OR (${formaDe('vence_en')}))`
+const CHECK_VENCE_EN_NN = `CHECK (${formaDe('vence_en')})`
+
+/**
  * El DDL completo, en el orden en que hay que ejecutarlo.
  *
  * Va como lista de sentencias y no como una cadena con `;` adentro porque
@@ -88,7 +133,7 @@ export const ESQUEMA: readonly string[] = [
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     tipo          TEXT NOT NULL CHECK (tipo ${CHECK_TIPO_BOLSA}),
     monto         INTEGER NOT NULL CHECK (monto > 0),
-    vence_en      TEXT,
+    vence_en      TEXT ${CHECK_VENCE_EN},
     origen        TEXT NOT NULL,
     restringida_a TEXT
   ) STRICT`,
@@ -150,7 +195,7 @@ export const ESQUEMA: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS reservas (
     reserva_id TEXT PRIMARY KEY,
     consumido  INTEGER NOT NULL DEFAULT 0 CHECK (consumido >= 0),
-    vence_en   TEXT NOT NULL,
+    vence_en   TEXT NOT NULL ${CHECK_VENCE_EN_NN},
     estado     TEXT NOT NULL CHECK (estado IN ('abierta', 'cerrada', 'cancelada'))
   ) STRICT`,
 
@@ -167,7 +212,7 @@ export const ESQUEMA: readonly string[] = [
     orden         INTEGER NOT NULL,
     tipo          TEXT NOT NULL CHECK (tipo ${CHECK_TIPO_BOLSA}),
     monto         INTEGER NOT NULL CHECK (monto > 0),
-    vence_en      TEXT,
+    vence_en      TEXT ${CHECK_VENCE_EN},
     origen        TEXT NOT NULL,
     restringida_a TEXT,
     PRIMARY KEY (reserva_id, orden)

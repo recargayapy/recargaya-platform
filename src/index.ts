@@ -86,6 +86,23 @@ export class BilleteraDO extends DurableObject<Entorno> {
   }
 
   /**
+   * reserva_id → veces seguidas que su liberacion por vencimiento fallo.
+   *
+   * EN MEMORIA a proposito, y no en una columna. Lo unico que tiene que evitar es
+   * el bucle de alarmas DENTRO de la vida de esta instancia, que es donde el bucle
+   * ocurre: mientras la alarma se dispara, el objeto no se apaga. Si el objeto se
+   * reinicia, el contador arranca de cero, reintenta una vez y vuelve a frenar —
+   * que es el comportamiento correcto para un fallo que podria haberse arreglado
+   * solo.
+   *
+   * Una columna nueva en `reservas` habria pedido un ALTER sobre tablas que ya
+   * existen en objetos desplegados, y SQLite no tiene `ADD COLUMN IF NOT EXISTS`:
+   * seria un mecanismo de migracion entero para un contador que no hace falta que
+   * sobreviva a nada.
+   */
+  private liberacionesFallidas = new Map<string, number>()
+
+  /**
    * El camino que recorre toda operacion de plata. Uno solo, a proposito.
    *
    * Cargar → llamar al nucleo → comprobar los invariantes → escribir TODO junto.
@@ -256,6 +273,11 @@ export class BilleteraDO extends DurableObject<Entorno> {
     return {
       outbox: resumenDelOutbox(this.sql),
       alarma: await this.ctx.storage.getAlarm(),
+      // Una liberacion que falla ya no tira ni corta la alarma, asi que si no
+      // saliera por acá no saldria por ningun lado. Es la contracara del try/catch.
+      liberaciones_fallidas: [...this.liberacionesFallidas.entries()].map(
+        ([reserva_id, intentos]) => ({ reserva_id, intentos }),
+      ),
     }
   }
 
@@ -298,9 +320,17 @@ export class BilleteraDO extends DurableObject<Entorno> {
     // reloj y llamar a la storage. Esa separacion la pidio el arnes de mutacion —
     // con las ramas escritas acá, una de ellas no se podia matar sin ganarle una
     // carrera a la alarma que se dispara sola.
+    // El contador de la vencida que MAS fallo. Con varias vencidas alcanza con la
+    // peor: es la que decide cuanto esperar, y las demas se atienden en el mismo
+    // disparo.
+    const intentosDeLasVencidas =
+      vencidas.length === 0
+        ? null
+        : Math.max(...vencidas.map((id) => this.liberacionesFallidas.get(id) ?? 0))
+
     const cuando = cuandoDespertar({
       ahora,
-      hayVencidas: vencidas.length > 0,
+      intentosDeLasVencidas,
       proximoVencimiento,
       intentosDeLaCabeza: cabeza === null ? null : cabeza.intentos,
     })
@@ -359,9 +389,16 @@ export class BilleteraDO extends DurableObject<Entorno> {
       // medias. Lo unico que agrega esto es seguir de largo.
       try {
         this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))
+        this.liberacionesFallidas.delete(reserva_id)
       } catch (e) {
+        // Contar el fracaso NO es contabilidad: es lo que hace que la proxima
+        // alarma llegue mas tarde. Sin esto, la reserva sigue vencida y abierta,
+        // `reprogramarAlarma` la vuelve a ver, pone la alarma para ahora, y el
+        // objeto gira a ~185 disparos por segundo para siempre — medido.
+        const previos = this.liberacionesFallidas.get(reserva_id) ?? 0
+        this.liberacionesFallidas.set(reserva_id, previos + 1)
         console.error(
-          `billetera ${this.ctx.id.toString()}: no se pudo liberar la reserva vencida ${reserva_id}`,
+          `billetera ${this.ctx.id.toString()}: no se pudo liberar la reserva vencida ${reserva_id} (intento ${previos + 1})`,
           e,
         )
       }

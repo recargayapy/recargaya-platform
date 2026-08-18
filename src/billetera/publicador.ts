@@ -200,7 +200,12 @@ export function sentencias(
  * "ahora" y publica ni bien la operacion suelta el objeto.
  *
  * A partir del primer fallo se duplica: 1s, 2s, 4s… con techo. Sin el techo, diez
- * fallos serian ocho minutos y veinte serian doce dias.
+ * fallos serian ocho minutos y medio (512 s) y veinte serian seis dias (524.288 s).
+ *
+ * (Decia «doce dias», y lo corrigio la segunda vuelta de auditoria contando. Lo que
+ * hace que valga la pena anotarlo: la primera vuelta habia auditado los numeros de
+ * esta misma funcion y corregido los de las pruebas, dejando el del encabezado. Se
+ * arreglo el caso y no la categoria, adentro del arreglo que trataba de esto.)
  *
  * SOBRE EL DESBORDE, porque la version anterior de este comentario mentia:
  *

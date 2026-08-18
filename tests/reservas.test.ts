@@ -28,9 +28,9 @@ import {
   verificarInvariantes,
 } from '../src/billetera/nucleo.js'
 
-const AHORA = '2026-08-14T12:00:00Z'
-const VENCE_CREDITO = '2026-12-31T00:00:00Z'
-const VENCE_RESERVA = '2026-08-21T00:00:00Z'
+const AHORA = '2026-08-14T12:00:00.000Z'
+const VENCE_CREDITO = '2026-12-31T00:00:00.000Z'
+const VENCE_RESERVA = '2026-08-21T00:00:00.000Z'
 
 function op(clave: string): { clave_idem: string; correlacion_id: string; momento: string } {
   return { clave_idem: clave, correlacion_id: 'c1', momento: AHORA }

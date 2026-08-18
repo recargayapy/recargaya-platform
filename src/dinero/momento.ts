@@ -42,8 +42,8 @@
  * rechaza, con un mensaje que dice como se escribe.
  */
 
-/** Un instante en UTC, ISO-8601. Marca de tipo: no se puede fabricar sin pasar
- *  por `instante()`. */
+/** Un instante en UTC, ISO-8601 con milisegundos. Marca de tipo: no se puede
+ *  fabricar sin pasar por `instante()`. */
 export type Instante = string & { readonly __marca: 'Instante' }
 
 export class InstanteInvalido extends Error {
@@ -57,16 +57,32 @@ export class InstanteInvalido extends Error {
 }
 
 /**
- * La UNICA forma aceptada: `YYYY-MM-DDTHH:MM:SS` con milisegundos opcionales y
- * `Z` obligatoria.
+ * La UNICA forma aceptada: `YYYY-MM-DDTHH:MM:SS.mmmZ`. Ancho fijo, milisegundos
+ * OBLIGATORIOS, `Z` obligatoria. Es exactamente lo que produce
+ * `new Date().toISOString()`.
  *
- * La `Z` no es cosmetica: es lo que hace que comparar texto y comparar reloj den
- * lo mismo. Los milisegundos son opcionales porque `new Date().toISOString()`
- * siempre los pone y un instante escrito a mano casi nunca — y las dos formas
- * ordenan igual entre si, porque el punto viene despues de los segundos y antes
- * de la `Z`.
+ * POR QUE LOS MILISEGUNDOS NO SON OPCIONALES, y esto lo corrigio la segunda vuelta
+ * de auditoria sobre esta misma funcion:
+ *
+ * La primera version los aceptaba opcionales, y justificaba la decision diciendo
+ * que «las dos formas ordenan igual entre si, porque el punto viene despues de los
+ * segundos y antes de la Z». El razonamiento estaba AL REVES. `'.'` es 0x2E y `'Z'`
+ * es 0x5A, asi que dentro del mismo segundo la forma larga ordena ANTES que la
+ * corta, y por reloj es al reves:
+ *
+ *     A = '2026-08-17T12:00:00Z'      B = '2026-08-17T12:00:00.500Z'
+ *     A <= B  como texto : false      como reloj : true
+ *
+ * Medido de punta a punta sobre workerd: con un `vence_en` en la forma corta, en
+ * su instante de vencimiento `reservasVencidas` (que compara texto) decia TODAVIA
+ * NO mientras `cuandoDespertar` (que compara reloj) decia YA — la alarma giraba en
+ * vacio hasta que el reloj cruzaba al segundo siguiente.
+ *
+ * O sea: era exactamente el defecto que este archivo existe para cerrar, adentro
+ * del archivo que lo cierra. Con ancho fijo, orden de texto y orden de reloj son
+ * la misma cosa, y eso deja de ser una promesa.
  */
-const FORMA = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/
+const FORMA = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
 
 /**
  * Comprueba que un texto sea un instante UTC ISO-8601 y lo devuelve marcado.
@@ -88,7 +104,7 @@ export function instante(valor: unknown): Instante {
   if (!FORMA.test(valor)) {
     throw new InstanteInvalido(
       valor,
-      'se espera UTC ISO-8601 con Z, por ejemplo 2026-08-17T12:00:00Z o 2026-08-17T12:00:00.000Z',
+      'se espera UTC ISO-8601 con milisegundos y Z, exactamente como 2026-08-17T12:00:00.000Z (que es lo que devuelve toISOString)',
     )
   }
 
@@ -96,11 +112,10 @@ export function instante(valor: unknown): Instante {
   const t = d.getTime()
   if (Number.isNaN(t)) throw new InstanteInvalido(valor, 'no es una fecha real')
 
-  // La vuelta completa: si `toISOString()` no reproduce lo que entro, la fecha se
-  // corrio. Se compara con milisegundos de los dos lados para que la forma corta
-  // tambien pase.
-  const conMilis = valor.includes('.') ? valor : `${valor.slice(0, -1)}.000Z`
-  if (d.toISOString() !== conMilis) {
+  // La vuelta completa: si `toISOString()` no reproduce EXACTAMENTE lo que entro,
+  // la fecha se corrio. Con una sola forma aceptada, esta comparacion no necesita
+  // normalizar nada — que es la otra cosa que gana el ancho fijo.
+  if (d.toISOString() !== valor) {
     throw new InstanteInvalido(valor, `no es una fecha real: JavaScript la corre a ${d.toISOString()}`)
   }
 

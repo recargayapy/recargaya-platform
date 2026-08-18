@@ -28,7 +28,7 @@ const asiento = {
   bolsa: 'disponible',
   clave_idem: 'k1',
   correlacion_id: 'c1',
-  asentado_en: '2026-08-17T12:00:00Z',
+  asentado_en: '2026-08-17T12:00:00.000Z',
 }
 
 function filaDeAsiento(id: number): FilaDelOutbox {
@@ -47,7 +47,7 @@ function filaDeEvento(id: number, tipo = 'billetera.acreditada'): FilaDelOutbox 
     tipo,
     cuerpo: JSON.stringify({ billetera_id: 'b1', monto: 100_000 }),
     correlacion_id: 'c1',
-    creado_en: '2026-08-17T12:00:00Z',
+    creado_en: '2026-08-17T12:00:00.000Z',
   }
 }
 
@@ -64,7 +64,7 @@ describe('a que tabla de D1 va cada fila', () => {
 
 describe('las sentencias para D1', () => {
   it('un asiento entra en ledger_copia con la billetera y el momento de copia', () => {
-    const [s] = sentencias('b1', [filaDeAsiento(7)], '2026-08-17T12:00:05Z')
+    const [s] = sentencias('b1', [filaDeAsiento(7)], '2026-08-17T12:00:05.000Z')
 
     expect(s?.sql).toContain('INSERT OR IGNORE INTO ledger_copia')
     // El orden importa: son parametros posicionales.
@@ -76,8 +76,8 @@ describe('las sentencias para D1', () => {
       'disponible',
       'k1',
       'c1',
-      '2026-08-17T12:00:00Z',
-      '2026-08-17T12:00:05Z',
+      '2026-08-17T12:00:00.000Z',
+      '2026-08-17T12:00:05.000Z',
     ])
     // Tantos `?` como valores. Un desfasaje acá pone el monto en la columna de la
     // bolsa, y D1 lo acepta si los tipos coinciden por casualidad.
@@ -85,7 +85,7 @@ describe('las sentencias para D1', () => {
   })
 
   it('un evento entra en eventos_billetera con el id del outbox como clave', () => {
-    const [s] = sentencias('b1', [filaDeEvento(9)], '2026-08-17T12:00:05Z')
+    const [s] = sentencias('b1', [filaDeEvento(9)], '2026-08-17T12:00:05.000Z')
 
     expect(s?.sql).toContain('INSERT OR IGNORE INTO eventos_billetera')
     expect(s?.valores).toEqual([
@@ -96,8 +96,8 @@ describe('las sentencias para D1', () => {
       'billetera.acreditada',
       JSON.stringify({ billetera_id: 'b1', monto: 100_000 }),
       'c1',
-      '2026-08-17T12:00:00Z',
-      '2026-08-17T12:00:05Z',
+      '2026-08-17T12:00:00.000Z',
+      '2026-08-17T12:00:05.000Z',
     ])
     expect((s?.sql ?? '').split('?').length - 1).toBe(s?.valores.length)
   })

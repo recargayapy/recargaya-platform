@@ -10,14 +10,18 @@
  *
  * QUE PRUEBAN Y QUE NO — leer esto antes de confiar en el numero de abajo.
  *
- * De las cincuenta pruebas de este archivo:
+ * De las cincuenta y tres pruebas de este archivo:
  *
- *   · CUARENTA Y UNA estan ancladas a codigo de `src/` y tienen una mutacion que
- *     las mata: las siete del esquema (ejecutan la cadena que exporta
+ *   · CUARENTA Y SEIS estan ancladas a codigo de `src/` y tienen una mutacion que
+ *     las mata: las ocho del esquema (ejecutan la cadena que exporta
  *     `src/billetera/esquema.ts`, no una tabla de juguete), las tres de la
- *     transaccion, las siete del `BilleteraDO` por su metodo publico, las nueve de
+ *     transaccion, las siete del `BilleteraDO` por su metodo publico, las once de
  *     las reservas y la alarma, las quince del publicador, y las dos de `el Worker
  *     desplegado`.
+ *
+ *     (Este renglon quedo viejo tres veces seguidas, y `CLAUDE.md` lo declara la
+ *     fuente. La cuenta que hay que hacer es la de los `it` por `describe`, no la
+ *     suma de lo que uno se acuerda de haber agregado.)
  *   · CUATRO —las dos de aislamiento y las dos homonimas— prueban una convencion
  *     de este archivo y no una linea de produccion. Tres de las cuatro mueren por
  *     su propia asercion con una mutacion del arnes; la cuarta (`el estado
@@ -181,7 +185,7 @@ beforeAll(async () => {
  * Un instante futuro para programar una alarma.
  *
  * Esto NO puede ser una fecha absoluta cableada, y la leccion salio caro: la
- * version anterior usaba `Date.parse('2026-08-17T15:00:00Z')`. Paso a las 13:53
+ * version anterior usaba `Date.parse('2026-08-17T15:00:00.000Z')`. Paso a las 13:53
  * UTC del 17 de agosto y fallo a las 15:11 UTC del mismo dia, porque a partir de
  * las 15:00 esa fecha quedo en el PASADO y workerd normaliza una alarma vencida
  * al instante actual. El mismo commit, la misma maquina, dos veredictos segun la
@@ -334,12 +338,76 @@ describe('el esquema real del Durable Object', () => {
     expect(errores.positiva).toBeNull()
   })
 
+  it('un vencimiento mal escrito no entra en la base', async ({ task }) => {
+    // La contracara de `dinero/momento.ts`, del lado de adentro. Una auditoria
+    // pregunto por que el instante se revisaba solo en TypeScript cuando el
+    // encabezado de este esquema dice que la restriccion «tiene que estar del lado
+    // de adentro de la unica puerta al dinero».
+    //
+    // Importa porque `reservasVencidas` compara `vence_en <= momento` en SQL puro,
+    // texto contra texto: con anchos distintos, «vencida» y «vigente» dejan de
+    // significar lo que dicen.
+    const r = await runInDurableObject(billetera(task), (_do, ctx) => {
+      crearEsquema(ctx)
+      const intentar = (sql: string, ...v: unknown[]) => {
+        try {
+          ctx.storage.sql.exec(sql, ...v)
+          return null
+        } catch (e) {
+          return (e as Error).message
+        }
+      }
+      const bolsa = (vence: string | null) =>
+        intentar(
+          'INSERT INTO bolsas (tipo, monto, vence_en, origen, restringida_a) VALUES (?, ?, ?, ?, ?)',
+          'credito_promocion',
+          1_000,
+          vence,
+          'promo',
+          null,
+        )
+
+      return {
+        // La forma buena entra.
+        buena: bolsa('2026-12-31T00:00:00.000Z'),
+        // Sin vencimiento tambien: una bolsa eterna es legitima.
+        sinVencimiento: bolsa(null),
+        // La forma corta NO, que es el caso que la segunda vuelta midio.
+        corta: bolsa('2026-12-31T00:00:00Z'),
+        // Ni el huso.
+        conHuso: bolsa('2026-12-31T00:00:00.000-03:00'),
+        // Ni cualquier cosa.
+        basura: bolsa('cuando sea'),
+        // Y esta es la que el ancho SOLO no agarra: veinticuatro caracteres, cada
+        // separador en su lugar, y letras donde van los digitos. La pidio el arnes
+        // de mutacion — sin la clase negada del CHECK, entraba.
+        letras: bolsa('abcd-ef-ghTij:kl:mn.opqZ'),
+        // Y en `reservas`, que es la que se compara en SQL.
+        reserva: intentar(
+          'INSERT INTO reservas (reserva_id, consumido, vence_en, estado) VALUES (?, ?, ?, ?)',
+          'r1',
+          0,
+          '2026-12-31T00:00:00Z',
+          'abierta',
+        ),
+      }
+    })
+
+    expect(r.buena).toBeNull()
+    expect(r.sinVencimiento).toBeNull()
+    expect(r.corta).toMatch(/CHECK/i)
+    expect(r.conHuso).toMatch(/CHECK/i)
+    expect(r.basura).toMatch(/CHECK/i)
+    expect(r.letras).toMatch(/CHECK/i)
+    expect(r.reserva).toMatch(/CHECK/i)
+  })
+
   it('un asiento no se edita ni se borra: ley 2, hecha cumplir', async ({ task }) => {
     const r = await runInDurableObject(billetera(task), (_do, ctx) => {
       crearEsquema(ctx)
       ctx.storage.sql.exec(
         `INSERT INTO asientos (asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en)
-         VALUES ('a1', 'compra', -50000, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00Z')`,
+         VALUES ('a1', 'compra', -50000, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00.000Z')`,
       )
 
       const intentar = (sql: string) => {
@@ -370,7 +438,7 @@ describe('el esquema real del Durable Object', () => {
         try {
           ctx.storage.sql.exec(
             `INSERT INTO asientos (asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en)
-             VALUES ('a1', 'compra', -1, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00Z')`,
+             VALUES ('a1', 'compra', -1, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00.000Z')`,
           )
           return null
         } catch (e) {
@@ -392,7 +460,7 @@ describe('el esquema real del Durable Object', () => {
       crearEsquema(ctx)
       ctx.storage.sql.exec(
         `INSERT INTO reservas (reserva_id, consumido, vence_en, estado)
-         VALUES ('r1', 0, '2026-08-17T00:30:00Z', 'abierta')`,
+         VALUES ('r1', 0, '2026-08-17T00:30:00.000Z', 'abierta')`,
       )
       ctx.storage.sql.exec(
         `INSERT INTO tomas (reserva_id, orden, tipo, monto, origen)
@@ -442,7 +510,7 @@ describe('la transaccion de storage', () => {
         enUnaTransaccion(ctx, () => {
           ctx.storage.sql.exec(
             `INSERT INTO asientos (asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en)
-             VALUES ('a1', 'compra', -1, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00Z')`,
+             VALUES ('a1', 'compra', -1, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00.000Z')`,
           )
           throw new Error('caida inyectada entre el asiento y el evento')
         })
@@ -470,11 +538,11 @@ describe('la transaccion de storage', () => {
       enUnaTransaccion(ctx, () => {
         ctx.storage.sql.exec(
           `INSERT INTO asientos (asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en)
-           VALUES ('a1', 'compra', -1, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00Z')`,
+           VALUES ('a1', 'compra', -1, 'disponible', 'k1', 'c1', '2026-08-17T00:00:00.000Z')`,
         )
         ctx.storage.sql.exec(
           `INSERT INTO outbox (tipo, cuerpo, correlacion_id, creado_en)
-           VALUES ('billetera.debitada', '{}', 'c1', '2026-08-17T00:00:00Z')`,
+           VALUES ('billetera.debitada', '{}', 'c1', '2026-08-17T00:00:00.000Z')`,
         )
       })
 
@@ -688,7 +756,7 @@ describe('el BilleteraDO, por su metodo publico', () => {
   const op = (clave: string) => ({
     clave_idem: clave,
     correlacion_id: 'c1',
-    momento: '2026-08-17T12:00:00Z',
+    momento: '2026-08-17T12:00:00.000Z',
   })
 
   it('acreditar deja el asiento, la bolsa y el evento del outbox', async ({ task }) => {
@@ -826,7 +894,7 @@ describe('el BilleteraDO, por su metodo publico', () => {
     await runInDurableObject(oreja, (_do, ctx) => {
       ctx.storage.sql.exec(
         `INSERT INTO asientos (asiento_id, concepto, monto, bolsa, clave_idem, correlacion_id, asentado_en)
-         VALUES ('k9:cr', 'sembrado', 1, 'disponible', 'otra', 'c0', '2026-08-17T00:00:00Z')`,
+         VALUES ('k9:cr', 'sembrado', 1, 'disponible', 'otra', 'c0', '2026-08-17T00:00:00.000Z')`,
       )
     })
 
@@ -927,7 +995,7 @@ describe('las reservas, por el metodo publico del DO', () => {
   const op = (clave: string) => ({
     clave_idem: clave,
     correlacion_id: 'c1',
-    momento: '2026-08-17T12:00:00Z',
+    momento: '2026-08-17T12:00:00.000Z',
   })
 
   /** Una billetera con credito de promocion y disponible, para que la precedencia
@@ -938,7 +1006,7 @@ describe('las reservas, por el metodo publico del DO', () => {
       bolsa: 'credito_promocion',
       concepto: 'premio',
       origen: 'campania',
-      vence_en: '2026-12-31T00:00:00Z',
+      vence_en: '2026-12-31T00:00:00.000Z',
     })
     await oreja.acreditar(op('c2'), {
       monto: guaranies(70_000),
@@ -1053,10 +1121,104 @@ describe('las reservas, por el metodo publico del DO', () => {
     // filtro queda vacio, el `for` no afirma nada y el total sigue dando. Lo
     // encontro una auditoria adversarial.
     expect(credito.length).toBeGreaterThan(0)
-    for (const b of credito) expect(b.vence_en).toBe('2026-12-31T00:00:00Z')
+    for (const b of credito) expect(b.vence_en).toBe('2026-12-31T00:00:00.000Z')
 
     expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(90_000)
     expect(await oreja.reconciliar()).toEqual({ ok: true, diferencias: [] })
+  })
+
+  it('un reserva_id ya cerrado NO se puede reusar, POR EL METODO PUBLICO', async ({ task }) => {
+    // Esta prueba la pidio la segunda vuelta de auditoria, y el motivo es exacto:
+    // el arreglo de «un reserva_id se usa una vez» vive en el nucleo
+    // (`estado.reservas.has(...)`) y solo funciona si el estado TRAE la reserva
+    // cerrada. Eso depende de dos lineas que ninguna prueba tocaba —
+    // `this.operar(op, entrada.reserva_id, …)` en el DO, y el `OR reserva_id = ?`
+    // de `cargarReservas`— y las dos mutaciones sobrevivian a las dos suites
+    // enteras.
+    //
+    // Con la segunda mutacion puesta, la auditoria reprodujo el daño completo por
+    // este mismo camino: el reuso entraba, las tomas nuevas se descartaban por el
+    // `INSERT OR IGNORE`, y la operacion siguiente moria con «descuadre en
+    // retenido: bolsas 20000 vs reservas abiertas 50000» — plata retenida sin
+    // camino de salida.
+    const oreja = billetera(task)
+    await oreja.acreditar(op('c1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: new Date(dentroDeMediaHora()).toISOString(),
+    })
+    await oreja.liberarReserva(op('l1'), { reserva_id: 'promo-1' })
+
+    let error: unknown = null
+    try {
+      await oreja.reservar(op('r2'), {
+        reserva_id: 'promo-1',
+        monto: guaranies(20_000),
+        vence_en: new Date(dentroDeMediaHora()).toISOString(),
+      })
+    } catch (e) {
+      error = e
+    }
+    expect(String(error)).toMatch(/ya se uso \(quedo cancelada\)/)
+
+    // Y la billetera sigue sana: el rechazo no dejo nada a medias.
+    const saldo = await oreja.saldo()
+    expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(100_000)
+    expect(saldo.bolsas.filter((b) => b.tipo === 'retenido')).toEqual([])
+    expect(await oreja.reconciliar()).toEqual({ ok: true, diferencias: [] })
+
+    // Un id distinto SI entra: lo que se rechaza es el reuso, no reservar de nuevo.
+    const otra = await oreja.reservar(op('r3'), {
+      reserva_id: 'promo-2',
+      monto: guaranies(20_000),
+      vence_en: new Date(dentroDeMediaHora()).toISOString(),
+    })
+    expect(otra.repetida).toBe(false)
+  })
+
+  it('liberar dos veces distingue "ya se libero" de "no existe"', async ({ task }) => {
+    // La otra promesa que colgaba de la misma linea de `cargarReservas`, y que la
+    // auditoria midio sin oraculo: su encabezado dice que sin el `OR reserva_id = ?`
+    // no se podrian distinguir estos dos casos. Ahora hay quien lo diga.
+    const oreja = billetera(task)
+    await oreja.acreditar(op('c1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: new Date(dentroDeMediaHora()).toISOString(),
+    })
+
+    const primera = await oreja.liberarReserva(op('l1'), { reserva_id: 'promo-1' })
+    expect(primera.valor.devuelto).toBe(50_000)
+
+    // Ya liberada, con OTRA clave de idempotencia: no es un error, y no devuelve
+    // nada. Si la reserva cerrada no se cargara, esto diria «reserva desconocida».
+    const segunda = await oreja.liberarReserva(op('l2'), { reserva_id: 'promo-1' })
+    expect(segunda.repetida).toBe(true)
+    expect(segunda.valor.devuelto).toBe(0)
+
+    // Y una que nunca existio SI es un error.
+    let error: unknown = null
+    try {
+      await oreja.liberarReserva(op('l3'), { reserva_id: 'jamas-existio' })
+    } catch (e) {
+      error = e
+    }
+    expect(String(error)).toMatch(/reserva desconocida/)
+
+    const saldo = await oreja.saldo()
+    expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(100_000)
   })
 
   it('reservar deja la alarma programada para el vencimiento', async ({ task }) => {
@@ -1197,7 +1359,7 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
   const op = (clave: string) => ({
     clave_idem: clave,
     correlacion_id: 'c1',
-    momento: '2026-08-17T12:00:00Z',
+    momento: '2026-08-17T12:00:00.000Z',
   })
 
   /** Lo que quedo en D1 para UNA billetera. El filtro por billetera importa: la D1
@@ -1464,7 +1626,7 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     expect(atascado.outbox).toEqual({
       pendientes: 2,
       intentos_maximos: 4,
-      mas_viejo: '2026-08-17T12:00:00Z',
+      mas_viejo: '2026-08-17T12:00:00.000Z',
     })
 
     // Y cuando D1 vuelve, se destraba solo y el diagnostico queda limpio.
@@ -1547,7 +1709,7 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
         TIPO_ASIENTO,
         'esto no es un asiento',
         'c9',
-        '2026-08-17T13:00:00Z',
+        '2026-08-17T13:00:00.000Z',
       )
     })
 
@@ -1742,7 +1904,7 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
 
     await runInDurableObject(oreja, (_do, ctx) => {
       // La reserva pasa a estar vencida, sin escribir un solo evento.
-      ctx.storage.sql.exec('UPDATE reservas SET vence_en = ?', '2020-01-01T00:00:00Z')
+      ctx.storage.sql.exec('UPDATE reservas SET vence_en = ?', '2020-01-01T00:00:00.000Z')
       // Y el acumulado del ledger queda corrupto, asi que la liberacion va a fallar
       // por el invariante 2 ANTES de escribir nada.
       ctx.storage.sql.exec("UPDATE totales_ledger SET total = total + 1 WHERE bolsa = 'disponible'")
@@ -1772,6 +1934,48 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
       ),
     ])
     expect(abiertas).toEqual([{ n: 1 }])
+
+    // Y NO queda girando. Esta es la segunda mitad, y la pidio la segunda vuelta de
+    // auditoria despues de medir que el try/catch de arriba, solo, producia ~185
+    // disparos por segundo sostenidos: el `catch` seguia de largo, la reserva
+    // seguia vencida y abierta, y la alarma se reprogramaba para AHORA.
+    //
+    // Con el fracaso contado, la proxima alarma se aleja. Se afirma sobre el
+    // numero programado y no esperando: una prueba que espera por reloj falla sola
+    // algun martes.
+    const d = await oreja.diagnostico()
+    expect(d.liberaciones_fallidas).toEqual([{ reserva_id: 'promo-1', intentos: 1 }])
+    expect(d.alarma).not.toBeNull()
+    // Un fracaso → un segundo. Sin backoff seria "ahora", o sea <= el instante en
+    // que la prueba pregunta.
+    expect(d.alarma!).toBeGreaterThan(Date.now())
+
+    // Y el segundo fracaso se aleja MAS que el primero, que es lo que impide el
+    // bucle cuando la reserva no se puede arreglar nunca.
+    await runInDurableObject(oreja, async (instancia) => {
+      await instancia.alarm?.()
+    })
+    const segunda = await oreja.diagnostico()
+    expect(segunda.liberaciones_fallidas).toEqual([{ reserva_id: 'promo-1', intentos: 2 }])
+    expect(segunda.alarma!).toBeGreaterThan(d.alarma!)
+
+    // Y cuando el descuadre se arregla, el contador se LIMPIA. Sin esto, una
+    // reserva que fallo una vez arrastraria su espera para siempre y los
+    // vencimientos siguientes de esta billetera llegarian tarde.
+    await runInDurableObject(oreja, (_do, ctx) => {
+      ctx.storage.sql.exec("UPDATE totales_ledger SET total = total - 1 WHERE bolsa = 'disponible'")
+    })
+    await runInDurableObject(oreja, async (instancia) => {
+      await instancia.alarm?.()
+    })
+
+    const sana = await oreja.diagnostico()
+    expect(sana.liberaciones_fallidas).toEqual([])
+    expect(await oreja.reconciliar()).toEqual({ ok: true, diferencias: [] })
+    // Y la plata volvio, que es de lo que se trataba todo esto.
+    const saldo = await oreja.saldo()
+    expect(saldo.bolsas.filter((b) => b.tipo === 'retenido')).toEqual([])
+    expect(saldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(100_000)
   })
 
   it('D1 no deja editar ni borrar lo que ya se copio', async ({ task }) => {

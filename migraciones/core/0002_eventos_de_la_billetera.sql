@@ -111,11 +111,16 @@ END;
 -- dejarlos apuntando a una tabla que esta por desaparecer es confiar en ese
 -- detalle. Se recrean al final, sobre la tabla nueva.
 --
--- CADA SENTENCIA LLEVA `IF EXISTS` / `IF NOT EXISTS`, y no es adorno. D1 no
--- soporta transacciones explicitas: una migracion que falla en el medio deja la
--- base a mitad de camino Y sin registrar como aplicada. Sin las guardas, el
+-- CASI TODAS LAS SENTENCIAS LLEVAN `IF EXISTS` / `IF NOT EXISTS`, y no es adorno.
+-- D1 no soporta transacciones explicitas: una migracion que falla en el medio deja
+-- la base a mitad de camino Y sin registrar como aplicada. Sin las guardas, el
 -- reintento moria en la primera linea (`DROP TRIGGER` sobre un trigger que ya no
 -- esta) y la unica salida era manual, en produccion, a mano.
+--
+-- Las dos que NO las llevan son las dos que no pueden: el `INSERT … SELECT FROM
+-- ledger_copia` y el `ALTER … RENAME`. SQLite no tiene «si la tabla existe» para
+-- ninguna de las dos. (El encabezado decia «CADA SENTENCIA», y era falso por esas
+-- dos: lo corrigio la segunda vuelta de auditoria.)
 --
 -- Lo pidio una auditoria adversarial y tenia razon en el argumento: este mismo
 -- encabezado se toma tres parrafos para justificar copiar filas de una tabla vacia

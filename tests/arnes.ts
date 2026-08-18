@@ -56,7 +56,7 @@ export class BancoDeBilleteras {
     const r = acreditar(this.obtener(id), {
       clave_idem: `semilla:${id}:${bolsa}`,
       correlacion_id: 'semilla',
-      momento: '2026-01-01T00:00:00Z',
+      momento: '2026-01-01T00:00:00.000Z',
     }, { monto, bolsa, concepto: 'seed', origen: 'semilla' })
     this.estados.set(id, r.estado)
   }

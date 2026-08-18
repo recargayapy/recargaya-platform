@@ -20,7 +20,7 @@ import {
   verificarDelta,
 } from '../src/billetera/nucleo.js'
 
-const OP = { clave_idem: 'k1', correlacion_id: 'c1', momento: '2026-08-14T12:00:00Z' }
+const OP = { clave_idem: 'k1', correlacion_id: 'c1', momento: '2026-08-14T12:00:00.000Z' }
 
 function conSaldo(monto: number): EstadoBilletera {
   return acreditar(billeteraVacia('b1'), OP, {
@@ -171,7 +171,7 @@ describe('los dos descuadres que ninguna otra prueba distinguia', () => {
             reserva_id: 'promo-1',
             tomas: [{ bolsa: bolsa('disponible', 50_000), monto: guaranies(50_000) }],
             consumido: guaranies(0),
-            vence_en: '2026-12-31T00:00:00Z',
+            vence_en: '2026-12-31T00:00:00.000Z',
             estado: 'abierta' as const,
           },
         ],
