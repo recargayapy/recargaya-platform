@@ -68,6 +68,7 @@ import { ESQUEMA } from '../src/billetera/esquema.js'
 import { guaranies } from '../src/dinero/monto.js'
 import { enUnaTransaccion } from '../src/billetera/transaccion.js'
 import { TIPO_ASIENTO } from '../src/billetera/publicador.js'
+import { emitirToken } from '../src/identidad/actor.js'
 
 /**
  * El `env` de las pruebas se tipa con `Cloudflare.Env`, que lo GENERA wrangler
@@ -1383,7 +1384,9 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
 
   it('el asiento llega a ledger_copia y el evento a eventos_billetera', async ({ task }) => {
     const oreja = billetera(task)
-    const id = env.BILLETERA.idFromName(task.fullName).toString()
+    // El `billetera_id` que llega a D1 es el NOMBRE del Durable Object, no su hash.
+    // Cambio de la entrega 1.2: ver `BilleteraDO.billeteraId` en `src/index.ts`.
+    const id = task.fullName
 
     await oreja.acreditar(op('k1'), {
       monto: guaranies(100_000),
@@ -1414,7 +1417,9 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     // publica de nuevo. Lo que tiene que absorber el duplicado es la clave primaria
     // de cada destino, no el cuidado del publicador.
     const oreja = billetera(task)
-    const id = env.BILLETERA.idFromName(task.fullName).toString()
+    // El `billetera_id` que llega a D1 es el NOMBRE del Durable Object, no su hash.
+    // Cambio de la entrega 1.2: ver `BilleteraDO.billeteraId` en `src/index.ts`.
+    const id = task.fullName
 
     await oreja.acreditar(op('k1'), {
       monto: guaranies(100_000),
@@ -1450,7 +1455,9 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     // segunda se perderia en silencio como si fuera un duplicado — plata acreditada
     // que los reportes nunca ven.
     const oreja = billetera(task)
-    const id = env.BILLETERA.idFromName(task.fullName).toString()
+    // El `billetera_id` que llega a D1 es el NOMBRE del Durable Object, no su hash.
+    // Cambio de la entrega 1.2: ver `BilleteraDO.billeteraId` en `src/index.ts`.
+    const id = task.fullName
 
     for (const clave of ['k1', 'k2']) {
       await oreja.acreditar(op(clave), {
@@ -1505,8 +1512,9 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     await drenar(a)
     await drenar(b)
 
-    const enA = await enD1(env.BILLETERA.idFromName(nombreA).toString())
-    const enB = await enD1(env.BILLETERA.idFromName(nombreB).toString())
+    // El `billetera_id` de D1 es el NOMBRE del objeto, no su hash (entrega 1.2).
+    const enA = await enD1(nombreA)
+    const enB = await enD1(nombreB)
 
     // Las dos partes del reparto estan. Con la clave vieja, una de las dos
     // desaparecia y la unica pista era una tabla mas corta de lo que deberia.
@@ -1518,7 +1526,9 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
 
   it('una operacion que falla no publica nada, porque no escribio nada', async ({ task }) => {
     const oreja = billetera(task)
-    const id = env.BILLETERA.idFromName(task.fullName).toString()
+    // El `billetera_id` que llega a D1 es el NOMBRE del Durable Object, no su hash.
+    // Cambio de la entrega 1.2: ver `BilleteraDO.billeteraId` en `src/index.ts`.
+    const id = task.fullName
 
     let error: unknown = null
     try {
@@ -1537,7 +1547,9 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     // El camino largo: reservar, consumir a medias, liberar. Cada paso asienta y
     // avisa, y lo que llega a D1 tiene que permitir reconstruir la historia.
     const oreja = billetera(task)
-    const id = env.BILLETERA.idFromName(task.fullName).toString()
+    // El `billetera_id` que llega a D1 es el NOMBRE del Durable Object, no su hash.
+    // Cambio de la entrega 1.2: ver `BilleteraDO.billeteraId` en `src/index.ts`.
+    const id = task.fullName
 
     await oreja.acreditar(op('c1'), {
       monto: guaranies(100_000),
@@ -1577,7 +1589,9 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     // el que nadie va a estar mirando: si el evento no saliera, el unico rastro de
     // esa devolucion viviria adentro del Durable Object.
     const oreja = billetera(task)
-    const id = env.BILLETERA.idFromName(task.fullName).toString()
+    // El `billetera_id` que llega a D1 es el NOMBRE del Durable Object, no su hash.
+    // Cambio de la entrega 1.2: ver `BilleteraDO.billeteraId` en `src/index.ts`.
+    const id = task.fullName
 
     await oreja.acreditar(op('c1'), {
       monto: guaranies(100_000),
@@ -1983,7 +1997,9 @@ describe('el publicador del outbox, contra la D1 de verdad', () => {
     // despues no es un registro de lo que paso — y esta copia es la que lee el
     // panel, o sea la version de los hechos que ve una persona.
     const oreja = billetera(task)
-    const id = env.BILLETERA.idFromName(task.fullName).toString()
+    // El `billetera_id` que llega a D1 es el NOMBRE del Durable Object, no su hash.
+    // Cambio de la entrega 1.2: ver `BilleteraDO.billeteraId` en `src/index.ts`.
+    const id = task.fullName
 
     await oreja.acreditar(op('k1'), {
       monto: guaranies(100_000),
@@ -2024,8 +2040,24 @@ describe('el Worker desplegado', () => {
     })
   })
 
-  it('una ruta que no existe da 404, no un 500', async () => {
-    const r = await SELF.fetch('https://recargaya-staging.local/no-existe')
+  it('una ruta que no existe da 404, no un 500 — con credenciales', async () => {
+    // CAMBIO DE LA ENTREGA 1.2, escrito acá para que no parezca un descuido: sin
+    // credenciales esta ruta ahora da 401 y no 404, porque el actor se identifica
+    // ANTES de enrutar. No es un efecto colateral que haya que tolerar: contestar
+    // 404 sin credenciales en lo que no existe, y 401 en lo que si, le dibuja a
+    // cualquiera el mapa de la API entera.
+    const token = await emitirToken(
+      { actor: { tipo: 'plataforma' }, emitido_en: new Date().toISOString() as never, entorno: env.ENTORNO },
+      (env as unknown as { SECRETO_SERVICIO: string }).SECRETO_SERVICIO,
+    )
+    const r = await SELF.fetch('https://recargaya-staging.local/no-existe', {
+      headers: { authorization: `Bearer ${token}` },
+    })
     expect(r.status).toBe(404)
+  })
+
+  it('y sin credenciales da 401, sin revelar si la ruta existe', async () => {
+    const r = await SELF.fetch('https://recargaya-staging.local/no-existe')
+    expect(r.status).toBe(401)
   })
 })

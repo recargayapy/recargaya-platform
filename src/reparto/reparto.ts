@@ -130,6 +130,36 @@ export function calcularReparto(venta: Venta, pesos: PesosReparto): Tajada[] {
 
 export type NombrePaso = 'debitar_comprador' | 'acreditar_creador' | 'acreditar_vendedor' | 'acreditar_plataforma' | 'marcar_repartido'
 
+/**
+ * DEUDA DECLARADA DE LA ENTREGA 1.2, y la encontro una auditoria.
+ *
+ * Los `billetera_id` de este modulo son textos que decide el llamador, y hoy
+ * `planificar()` recibe ids de persona pelados (`vendedor-9`). Desde la 1.2, el
+ * nombre de una billetera lo decide `identidad/personas.ts:derivarBilleteraId`, que
+ * antepone `billetera:`. Medido: `idFromName('p-9')` e `idFromName('billetera:p-9')`
+ * son objetos DISTINTOS.
+ *
+ * O sea que el dia que el reparto se cablee de verdad, un `acreditar_vendedor` caeria
+ * sobre un Durable Object fantasma mientras `GET /billetera/vendedor-9/saldo` muestra
+ * cero — sin un solo error, porque acreditar sobre una billetera vacia funciona. El
+ * `debitar` fallaria ruidoso; la direccion que falla en silencio es la que suma.
+ *
+ * Nada de esto se rompe hoy: `reparto.ts` no lo importa `index.ts`, solo las pruebas.
+ * Se arregla en la entrega que cablee el reparto, y son DOS decisiones, no una:
+ *
+ *   · los `billetera_id` de personas salen de `derivarBilleteraId` y de ningun otro
+ *     lado;
+ *   · la billetera de la PLATAFORMA no puede salir de ahi, porque la plataforma no
+ *     es una persona —es la decision declarada en `identidad/actor.ts`—. Hoy es el
+ *     literal `BILLETERA_PLATAFORMA = 'plataforma'` de este archivo, y ese mismo
+ *     texto es ademas el que `actorId()` emite y el que `RESERVADOS` prohibe como
+ *     `persona_id`: tres significados sobre la misma cadena. Necesita su propia
+ *     constante con prefijo, decidida en el mismo lugar que la otra.
+ *
+ * La version anterior de esta nota decia «se arregla en UN lugar» y dejaba afuera
+ * justo la billetera que cobra la comision de la plataforma. Lo midio la segunda
+ * vuelta de auditoria.
+ */
 export interface Paso {
   readonly nombre: NombrePaso
   readonly billetera_id: string
