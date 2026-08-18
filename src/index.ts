@@ -28,11 +28,18 @@ import { ESQUEMA } from './billetera/esquema.js'
 import { enUnaTransaccion } from './billetera/transaccion.js'
 import {
   type Sql,
+  cabezaDelOutbox,
   cargarEstado,
+  contarIntento,
   guardarDelta,
+  marcarPublicadas,
+  outboxPendiente,
   reconciliar,
   reservasVencidas,
+  resumenDelOutbox,
 } from './billetera/repositorio.js'
+import { LOTE, PASADAS_MAXIMAS, sentencias } from './billetera/publicador.js'
+import { cuandoDespertar } from './billetera/alarma.js'
 import { guaranies } from './dinero/monto.js'
 
 export interface Entorno {
@@ -107,37 +114,140 @@ export class BilleteraDO extends DurableObject<Entorno> {
     })
   }
 
+  /**
+   * `aplicar` mas la reprogramacion de la alarma, que es lo que toda operacion
+   * necesita sin excepcion.
+   *
+   * Existe porque la version anterior dejaba esa segunda mitad a criterio de cada
+   * metodo: `reservar` y `liberarReserva` reprogramaban, `acreditar`, `debitar` y
+   * `consumirReserva` no. Con la alarma ocupandose solo de los vencimientos eso
+   * alcanzaba; desde que tambien dispara al publicador, un `acreditar` que no
+   * reprograma es un evento que se queda en el outbox hasta que alguien mas toque
+   * esta billetera. Podrian ser meses.
+   *
+   * Se arregla la categoria: ya no hay dos caminos que puedan divergir, hay uno.
+   */
+  private async operar<T>(
+    op: { clave_idem: string; correlacion_id: string; momento: string },
+    reserva_id: string | undefined,
+    operar: (estado: EstadoBilletera) => Resultado<T>,
+  ): Promise<{ valor: T; repetida: boolean }> {
+    const r = this.aplicar(op, reserva_id, operar)
+    await this.reprogramarAlarma()
+    return r
+  }
+
   async acreditar(op: Operacion, entrada: Parameters<typeof acreditar>[2]) {
-    return this.aplicar(op, undefined, (e) => acreditar(e, op, entrada))
+    return this.operar(op, undefined, (e) => acreditar(e, op, entrada))
   }
 
   async debitar(op: Operacion, entrada: Parameters<typeof debitar>[2]) {
-    return this.aplicar(op, undefined, (e) => debitar(e, op, entrada))
+    return this.operar(op, undefined, (e) => debitar(e, op, entrada))
   }
 
   async reservar(op: Operacion, entrada: Parameters<typeof reservar>[2]) {
-    const r = this.aplicar(op, entrada.reserva_id, (e) => reservar(e, op, entrada))
-    await this.reprogramarAlarma()
-    return r
+    return this.operar(op, entrada.reserva_id, (e) => reservar(e, op, entrada))
   }
 
   async liberarReserva(op: Operacion, entrada: Parameters<typeof liberarReserva>[2]) {
-    const r = this.aplicar(op, entrada.reserva_id, (e) => liberarReserva(e, op, entrada))
-    await this.reprogramarAlarma()
-    return r
+    return this.operar(op, entrada.reserva_id, (e) => liberarReserva(e, op, entrada))
   }
 
   async consumirReserva(op: Operacion, entrada: Parameters<typeof consumirReserva>[2]) {
-    return this.aplicar(op, entrada.reserva_id, (e) => consumirReserva(e, op, entrada))
+    return this.operar(op, entrada.reserva_id, (e) => consumirReserva(e, op, entrada))
   }
 
   /**
-   * Deja la alarma apuntando al PROXIMO vencimiento pendiente, o la borra si no
-   * queda ninguno.
+   * Saca del outbox lo que todavia no llego a D1. Ley 5, la mitad que faltaba.
    *
-   * Hay UNA alarma por Durable Object, no una cola: programar la de una reserva
-   * pisa la de la anterior. Por eso se reprograma despues de cada operacion que
-   * toca reservas, en vez de programarla una vez al reservar.
+   * POR QUE NO SE PUBLICA ADENTRO DE LA OPERACION
+   *
+   * Seria una linea menos y esta mal. Escribir en D1 es un `await` a otro sistema,
+   * y adentro de un Durable Object un `await` mantiene el input gate cerrado: toda
+   * operacion de esa billetera esperaria a la latencia de D1. Peor todavia, no se
+   * podria hacer adentro de `enUnaTransaccion` —`transactionSync` no envuelve un
+   * `await`, que es justamente por lo que se eligio— asi que tampoco se ganaria
+   * atomicidad. Se pagaria la demora sin comprar nada.
+   *
+   * Se publica desde la alarma, que el objeto programa para "ahora" apenas queda
+   * algo pendiente. La copia llega en milisegundos y el que movio la plata no
+   * espera a D1.
+   *
+   * QUE PASA CUANDO D1 NO CONTESTA, dicho entero
+   *
+   * No se relanza el error. Si `alarm()` tirara, Cloudflare reintentaria con SU
+   * backoff y despues de unos intentos dejaria de reintentar: el outbox quedaria
+   * pendiente sin nadie que lo despierte. En lugar de eso se cuenta el intento y
+   * se deja que `reprogramarAlarma` ponga la proxima pasada, cada vez mas lejos y
+   * con techo de cinco minutos. Un outbox atascado reintenta para siempre, que es
+   * lo correcto para un evento de plata, y `diagnostico()` lo dice.
+   *
+   * LO QUE FALTA: no hay cola de descarte. Una fila que no se pueda publicar nunca
+   * —un cuerpo malformado por un cambio de codigo, por ejemplo— traba la cabeza de
+   * la cola y bloquea a las que vienen atras. Se ve en `intentos` y en el log, no
+   * se resuelve solo. Es trabajo de una entrega posterior.
+   */
+  async publicar(): Promise<{ publicados: number; pendientes: number }> {
+    let publicados = 0
+
+    for (let pasada = 0; pasada < PASADAS_MAXIMAS; pasada += 1) {
+      const filas = outboxPendiente(this.sql, LOTE)
+      if (filas.length === 0) break
+
+      const ids = filas.map((f) => f.id)
+      const momento = new Date().toISOString()
+
+      try {
+        const lote = sentencias(this.ctx.id.toString(), filas, momento)
+        await this.env.CORE.batch(lote.map((s) => this.env.CORE.prepare(s.sql).bind(...s.valores)))
+      } catch (e) {
+        // El contador va en su propia transaccion: es lo unico que se escribe y
+        // tiene que quedar aunque el lote no haya salido.
+        enUnaTransaccion(this.ctx, () => contarIntento(this.sql, ids))
+        console.error(
+          `billetera ${this.ctx.id.toString()}: no se pudo publicar el outbox (${ids.length} filas desde la ${ids[0]})`,
+          e,
+        )
+        break
+      }
+
+      enUnaTransaccion(this.ctx, () => marcarPublicadas(this.sql, ids, momento))
+      publicados += filas.length
+    }
+
+    return { publicados, pendientes: resumenDelOutbox(this.sql).pendientes }
+  }
+
+  /** Lo que hace falta para saber si esta billetera esta al dia, sin abrir la
+   *  base. El `pendientes` que no baja y el `intentos_maximos` que sube son la
+   *  forma que toma un outbox atascado. */
+  async diagnostico() {
+    return {
+      outbox: resumenDelOutbox(this.sql),
+      alarma: await this.ctx.storage.getAlarm(),
+    }
+  }
+
+  /**
+   * Deja la alarma apuntando a lo PRIMERO que haya que hacer, o la borra si no hay
+   * nada.
+   *
+   * Hay UNA sola alarma por Durable Object, no una cola: programar la de una
+   * reserva pisa la de la anterior. Por eso no se programa "al reservar" sino que
+   * se recalcula entera despues de cada operacion, y por eso esta funcion tiene que
+   * mirar TODOS los motivos que existen para despertar al objeto. Hoy son dos:
+   *
+   *   · una reserva que vence — hay que devolver la plata
+   *   · una fila del outbox que no llego a D1 — hay que publicarla
+   *
+   * Gana el mas cercano. Que los dos compartan la alarma es seguro porque `alarm()`
+   * hace las dos cosas en cada disparo, sin fijarse cual la programo: si la que
+   * manda es la del outbox y hay una reserva vencida, la reserva se libera igual.
+   *
+   * Lo que eso si cuesta, y queda dicho: mientras D1 no conteste, el reintento del
+   * outbox se aleja hasta cinco minutos, y un vencimiento que caiga en el medio
+   * puede atenderse hasta cinco minutos tarde. Sobre un plazo de treinta minutos es
+   * un error del 16 %, en un caso que ademas requiere que D1 este caida.
    *
    * Va afuera de la transaccion a proposito: `setAlarm` es asincrono y
    * `transactionSync` no puede envolver un `await` — que es justamente la razon
@@ -148,38 +258,36 @@ export class BilleteraDO extends DurableObject<Entorno> {
    * huerfanas es trabajo de una entrega posterior.
    */
   private async reprogramarAlarma(): Promise<void> {
-    const ahora = new Date().toISOString()
-    const { vencidas, proximoVencimiento } = reservasVencidas(this.sql, ahora)
+    const ahora = Date.now()
+    const { vencidas, proximoVencimiento } = reservasVencidas(this.sql, new Date(ahora).toISOString())
+    const cabeza = cabezaDelOutbox(this.sql)
 
-    // Si hay reservas YA vencidas, la alarma va para lo antes posible. Esta rama
-    // la encontro una prueba y no una auditoria: la primera version solo miraba el
-    // proximo vencimiento PENDIENTE, asi que una reserva creada con un vencimiento
-    // ya pasado —o que vencio entre la operacion y esta linea— dejaba el objeto
-    // sin alarma, y esa plata quedaba retenida para siempre.
-    //
-    // Que una reserva nazca vencida no es raro: alcanza con un reloj corrido, un
-    // reintento demorado, o una campaña de un minuto.
-    if (vencidas.length > 0) {
-      await this.ctx.storage.setAlarm(Date.now())
-      return
-    }
+    // La decision de CUANDO vive en `billetera/alarma.ts`, pura y con sus pruebas.
+    // Acá quedan las tres cosas que necesitan el objeto: leer el estado, leer el
+    // reloj y llamar a la storage. Esa separacion la pidio el arnes de mutacion —
+    // con las ramas escritas acá, una de ellas no se podia matar sin ganarle una
+    // carrera a la alarma que se dispara sola.
+    const cuando = cuandoDespertar({
+      ahora,
+      hayVencidas: vencidas.length > 0,
+      proximoVencimiento,
+      intentosDeLaCabeza: cabeza === null ? null : cabeza.intentos,
+    })
 
-    if (proximoVencimiento === null) {
-      await this.ctx.storage.deleteAlarm()
-      return
-    }
-
-    await this.ctx.storage.setAlarm(Date.parse(proximoVencimiento))
+    if (cuando === null) await this.ctx.storage.deleteAlarm()
+    else await this.ctx.storage.setAlarm(cuando)
   }
 
   /**
    * Una reserva sin confirmar vence sola. Sin cron y sin barrido: la alarma del
    * propio objeto, que es lo que el plan maestro pide.
    *
-   * Este es el UNICO lugar del nucleo del dinero que lee el reloj. En todos los
-   * demas el instante entra por parametro, para que el vencimiento se pueda
-   * probar sin esperar tres meses. Acá no hay quien lo pase: el que llama es
-   * Cloudflare.
+   * Este es el UNICO lugar que decide MOVIMIENTOS DE PLATA leyendo el reloj. En
+   * todos los demas el instante entra por parametro, para que el vencimiento se
+   * pueda probar sin esperar tres meses. Acá no hay quien lo pase: el que llama es
+   * Cloudflare. (`publicar()` y `reprogramarAlarma()` tambien miran la hora, pero
+   * para sellar una copia y para programar un despertador: ninguna de las dos
+   * decide de quien es un guarani.)
    *
    * QUE IMPIDE QUE UNA SEGUNDA PASADA LIBERE DE NUEVO, con precision:
    *
@@ -211,6 +319,10 @@ export class BilleteraDO extends DurableObject<Entorno> {
       }
       this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))
     }
+
+    // Publicar va DESPUES de liberar, no antes: liberar produce eventos, y si se
+    // publicara primero esos eventos esperarian a la proxima vuelta de la alarma.
+    await this.publicar()
 
     await this.reprogramarAlarma()
   }

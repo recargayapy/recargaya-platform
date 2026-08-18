@@ -168,4 +168,53 @@ const MIGRACION = ['migraciones', 'core', '0001_cimientos.sql']
   assert.match(r.salida, /DISTINTO ORDEN/)
 }
 
+// LA MISMA ROTURA, PERO EN LA ULTIMA MIGRACION Y NO EN LA PRIMERA.
+//
+// Lo pidio el arnes de mutacion: `enSql.slice(0, 1)` —o sea, mirar solo la primera
+// migracion, que era literalmente lo que hacia la version anterior de
+// `check-esquema.mjs` con la ruta a `0001_cimientos.sql` escrita a mano—
+// SOBREVIVIO. Y no es teorico: 0002 reconstruye `ledger_copia` para arreglarle la
+// clave primaria, asi que el CHECK que gobierna de verdad es el ULTIMO, no el
+// primero. El oraculo estaba aprobando la definicion de una tabla que ya no existe.
+//
+// Se perturba "la ultima" y no "0002" por nombre: cuando llegue 0003, esta prueba
+// tiene que seguir apuntando a la que manda.
+{
+  const { readdirSync } = await import('node:fs')
+  const r = correrSobreCopia((dir) => {
+    const carpeta = join(dir, 'migraciones', 'core')
+    const ultima = readdirSync(carpeta).filter((n) => n.endsWith('.sql')).sort().pop()
+    const p = join(carpeta, ultima)
+    const texto = readFileSync(p, 'utf8')
+    assert.match(texto, /CHECK \(bolsa IN/, `${ultima} no declara ningun CHECK de bolsa`)
+    writeFileSync(
+      p,
+      texto.replace(
+        "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion', 'retenido'))",
+        "CHECK (bolsa IN ('disponible', 'ganancia_creador', 'credito_promocion'))",
+      ),
+    )
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /se desincronizaron/)
+  assert.match(r.salida, /retenido/)
+}
+
+// Y si NINGUNA migracion declara el CHECK, el oraculo tiene que fallar en vez de
+// decir OK sin haber comparado nada. Es la forma que tomaria un cambio en como se
+// escribe la columna: la expresion regular deja de encontrarla, la lista queda
+// vacia, y un bucle sobre una lista vacia no se queja.
+{
+  const { readdirSync } = await import('node:fs')
+  const r = correrSobreCopia((dir) => {
+    const carpeta = join(dir, 'migraciones', 'core')
+    for (const n of readdirSync(carpeta).filter((x) => x.endsWith('.sql'))) {
+      const p = join(carpeta, n)
+      writeFileSync(p, readFileSync(p, 'utf8').replaceAll('CHECK (bolsa IN', 'CHECK (bolsita IN'))
+    }
+  })
+  assert.equal(r.codigo, 1, `esperaba 1 y salio ${r.codigo}: ${r.salida}`)
+  assert.match(r.salida, /NINGUNA migracion/)
+}
+
 console.log('  check-esquema.pruebas: OK (incluidas las de punta a punta)')

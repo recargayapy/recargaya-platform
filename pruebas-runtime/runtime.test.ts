@@ -49,12 +49,20 @@
  * mismo que «no queda nada a medias». Lo dijo el arnes de mutacion, no una
  * auditoria.
  */
-import { env, SELF, runInDurableObject, runDurableObjectAlarm } from 'cloudflare:test'
-import { describe, it, expect } from 'vitest'
+import {
+  type D1Migration,
+  env,
+  SELF,
+  applyD1Migrations,
+  runInDurableObject,
+  runDurableObjectAlarm,
+} from 'cloudflare:test'
+import { describe, it, expect, beforeAll } from 'vitest'
 import type { Entorno } from '../src/index.js'
 import { ESQUEMA } from '../src/billetera/esquema.js'
 import { guaranies } from '../src/dinero/monto.js'
 import { enUnaTransaccion } from '../src/billetera/transaccion.js'
+import { TIPO_ASIENTO } from '../src/billetera/publicador.js'
 
 /**
  * El `env` de las pruebas se tipa con `Cloudflare.Env`, que lo GENERA wrangler
@@ -140,6 +148,35 @@ function billetera(prueba: { readonly name: string; readonly fullName: string })
 }
 
 /**
+ * Las migraciones de D1 llegan como un binding de miniflare que pone
+ * `vitest.runtime.config.ts` leyendo la MISMA carpeta que despliega wrangler
+ * (`check-runtime.mjs` comprueba que sean la misma).
+ *
+ * Se lee con un cast local y no augmentando `Cloudflare.Env`, a proposito: ese
+ * tipo lo genera wrangler desde `wrangler.jsonc`, y los tres guardas de deriva de
+ * arriba comparan sus claves contra `Entorno`. Meter ahi un binding que solo existe
+ * en las pruebas obligaria a aflojar los guardas — arreglar el arnes rompiendo el
+ * oraculo, que es el patron que este proyecto ya cazo dos veces.
+ */
+const MIGRACIONES = (env as unknown as { MIGRACIONES: D1Migration[] }).MIGRACIONES
+
+/**
+ * D1 se migra una vez para todo el archivo.
+ *
+ * Sin esto, `ledger_copia` y `eventos_billetera` no existen, el publicador falla en
+ * silencio —los captura, cuenta el intento y reprograma— y las pruebas de las
+ * alarmas pasarian igual con el outbox tapado. Un arnes que aprueba con la mitad
+ * del sistema ausente es peor que uno que no existe.
+ */
+beforeAll(async () => {
+  // Que las migraciones lleguen de verdad. Si el binding faltara, `applyD1Migrations`
+  // con una lista vacia no crea nada y no se queja: el mismo silencio de arriba.
+  expect(Array.isArray(MIGRACIONES)).toBe(true)
+  expect(MIGRACIONES.length).toBeGreaterThan(0)
+  await applyD1Migrations(env.CORE, MIGRACIONES)
+})
+
+/**
  * Un instante futuro para programar una alarma.
  *
  * Esto NO puede ser una fecha absoluta cableada, y la leccion salio caro: la
@@ -156,6 +193,33 @@ function billetera(prueba: { readonly name: string; readonly fullName: string })
  */
 function dentroDeMediaHora(): number {
   return Date.now() + 30 * 60 * 1000
+}
+
+/**
+ * Vacia el outbox de una billetera y deja la alarma coherente con lo que quedo.
+ *
+ * Hace falta en cualquier prueba que mire la alarma, y la razon es un cambio real
+ * de esta entrega: desde que el publicador existe, TODA operacion deja filas
+ * pendientes y programa la alarma para "ahora". Una prueba que afirme sobre la
+ * alarma sin haber vaciado el outbox esta afirmando sobre una carrera.
+ *
+ * Se drena invocando `alarm()`, que es lo que Cloudflare va a invocar: publica,
+ * libera lo vencido y reprograma. Si se llamara a `publicar()` a secas, la alarma
+ * quedaria apuntando a donde la dejo la ultima operacion.
+ *
+ * El tope de vueltas no es cosmetico: si el publicador se atascara —una fila que
+ * no puede salir nunca— esto seria un `while (true)` y la prueba colgaria el CI en
+ * vez de fallar.
+ */
+async function drenar(oreja: ReturnType<typeof billetera>) {
+  for (let vuelta = 0; vuelta < 5; vuelta += 1) {
+    await runInDurableObject(oreja, async (instancia) => {
+      await instancia.alarm?.()
+    })
+    const d = await oreja.diagnostico()
+    if (d.outbox.pendientes === 0) return d
+  }
+  throw new Error('el outbox no se vacio en cinco vueltas de la alarma')
 }
 
 /** Crea el esquema REAL del BilleteraDO. No una tabla de juguete: la cadena que
@@ -642,8 +706,8 @@ describe('el BilleteraDO, por su metodo publico', () => {
         'SELECT COUNT(*) AS n, COALESCE(SUM(monto), 0) AS total FROM bolsas',
       )],
       asientos: [...ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM asientos')],
-      outbox: [...ctx.storage.sql.exec<{ n: number; tipo: string }>(
-        'SELECT COUNT(*) AS n, MIN(tipo) AS tipo FROM outbox',
+      outbox: [...ctx.storage.sql.exec<{ tipo: string }>(
+        'SELECT tipo FROM outbox ORDER BY id',
       )],
       totales: [...ctx.storage.sql.exec<{ bolsa: string; total: number }>(
         'SELECT bolsa, total FROM totales_ledger',
@@ -652,8 +716,10 @@ describe('el BilleteraDO, por su metodo publico', () => {
 
     expect(quedo.bolsas).toEqual([{ n: 1, total: 100_000 }])
     expect(quedo.asientos).toEqual([{ n: 1 }])
-    // Ley 5: el evento esta, y llego junto con el asiento.
-    expect(quedo.outbox).toEqual([{ n: 1, tipo: 'billetera.acreditada' }])
+    // Ley 5: el evento esta, y llego junto con el asiento. Son DOS filas y no una:
+    // el asiento tambien sale por el outbox, porque `ledger_copia` de D1 se llena
+    // por ahi y no por un segundo camino que alguien tenga que acordarse de usar.
+    expect(quedo.outbox.map((f) => f.tipo)).toEqual([TIPO_ASIENTO, 'billetera.acreditada'])
     expect(quedo.totales).toEqual([{ bolsa: 'disponible', total: 100_000 }])
   })
 
@@ -680,10 +746,10 @@ describe('el BilleteraDO, por su metodo publico', () => {
       total: [...ctx.storage.sql.exec<{ t: number }>('SELECT COALESCE(SUM(monto), 0) AS t FROM bolsas')],
     }))
 
-    // Un asiento, un evento, una vez la plata. Un segundo evento seria un
-    // consumidor cobrando dos veces (ley 6: por eso ademas es idempotente).
+    // Un asiento, su copia y su evento: una vez la plata. Un cuarto renglon acá
+    // seria un consumidor cobrando dos veces (ley 6: por eso ademas es idempotente).
     expect(quedo.asientos).toEqual([{ n: 1 }])
-    expect(quedo.outbox).toEqual([{ n: 1 }])
+    expect(quedo.outbox).toEqual([{ n: 2 }])
     expect(quedo.total).toEqual([{ t: 100_000 }])
   })
 
@@ -789,7 +855,9 @@ describe('el BilleteraDO, por su metodo publico', () => {
     // 70.000 en vez de 50.000: la plata de la carga anterior, borrada.
     expect(quedo.total).toBe(50_000)
     expect(quedo.totales).toBe(50_000)
-    expect(quedo.outbox).toBe(1)
+    // Las dos filas de la carga que SI funciono —su asiento y su evento— y ninguna
+    // de la que fallo.
+    expect(quedo.outbox).toBe(2)
   })
 
   it('la reconciliacion nota si el acumulado se corrompe por su cuenta', async ({ task }) => {
@@ -997,9 +1065,13 @@ describe('las reservas, por el metodo publico del DO', () => {
       vence_en: vence,
     })
 
-    await runInDurableObject(oreja, async (_do, ctx) => {
-      expect(await ctx.storage.getAlarm()).toBe(Date.parse(vence))
-    })
+    // Se drena primero, y esto es de esta entrega: la alarma ya no tiene un solo
+    // motivo. Con filas pendientes en el outbox apunta a "ahora" —publicar es lo
+    // primero que hay que hacer— y recien cuando la cola queda vacia vuelve a
+    // apuntar al vencimiento. Afirmar sin drenar seria afirmar sobre una carrera.
+    const d = await drenar(oreja)
+    expect(d.outbox.pendientes).toBe(0)
+    expect(d.alarma).toBe(Date.parse(vence))
   })
 
   it('la reserva abandonada se libera sola cuando vence', async ({ task }) => {
@@ -1051,9 +1123,11 @@ describe('las reservas, por el metodo publico del DO', () => {
     })
     await oreja.liberarReserva(op('l1'), { reserva_id: 'promo-1' })
 
-    await runInDurableObject(oreja, async (_do, ctx) => {
-      expect(await ctx.storage.getAlarm()).toBeNull()
-    })
+    // Con el outbox vaciado y sin reservas abiertas no queda NINGUN motivo para
+    // despertar al objeto, y entonces la alarma se borra. Que el outbox pendiente
+    // la sostenga es correcto; que la sostenga cuando ya no hay nada, no.
+    const d = await drenar(oreja)
+    expect(d.alarma).toBeNull()
   })
 
   it('la alarma que se dispara dos veces no libera dos veces', async ({ task }) => {
@@ -1103,6 +1177,506 @@ describe('las reservas, por el metodo publico del DO', () => {
     expect(saldo.bolsas.filter((b) => b.tipo === 'retenido').reduce((a, b) => a + b.monto, 0)).toBe(
       50_000,
     )
+  })
+})
+
+describe('el publicador del outbox, contra la D1 de verdad', () => {
+  // La otra mitad de la ley 5. El evento ya se escribia en la misma transaccion
+  // que el cambio; lo que faltaba era sacarlo de ahi. Estas pruebas corren contra
+  // el esquema que sale de `migraciones/core/`, aplicado por `applyD1Migrations`:
+  // no hay tabla de juguete: si 0002 estuviera mal, esto se cae.
+
+  const op = (clave: string) => ({
+    clave_idem: clave,
+    correlacion_id: 'c1',
+    momento: '2026-08-17T12:00:00Z',
+  })
+
+  /** Lo que quedo en D1 para UNA billetera. El filtro por billetera importa: la D1
+   *  local es una sola para todo el archivo, y sin el, una prueba contaria las
+   *  filas que dejo otra. */
+  async function enD1(id: string) {
+    const asientos = await env.CORE.prepare(
+      'SELECT asiento_id, concepto, monto, bolsa FROM ledger_copia WHERE billetera_id = ? ORDER BY asiento_id',
+    )
+      .bind(id)
+      .all<{ asiento_id: string; concepto: string; monto: number; bolsa: string }>()
+
+    const eventos = await env.CORE.prepare(
+      'SELECT evento_id, tipo FROM eventos_billetera WHERE billetera_id = ? ORDER BY evento_id',
+    )
+      .bind(id)
+      .all<{ evento_id: number; tipo: string }>()
+
+    return { asientos: asientos.results, eventos: eventos.results }
+  }
+
+  it('el asiento llega a ledger_copia y el evento a eventos_billetera', async ({ task }) => {
+    const oreja = billetera(task)
+    const id = env.BILLETERA.idFromName(task.fullName).toString()
+
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+
+    const d = await drenar(oreja)
+    expect(d.outbox.pendientes).toBe(0)
+
+    const copia = await enD1(id)
+    // El asiento, con su monto y su bolsa. Esta tabla es la que lee el panel
+    // (ley 1): si quedara vacia, los reportes mostrarian una billetera sin
+    // movimientos y la plata estaria igual adentro del Durable Object.
+    expect(copia.asientos).toEqual([
+      { asiento_id: 'k1:cr', concepto: 'carga', monto: 100_000, bolsa: 'disponible' },
+    ])
+    expect(copia.eventos.map((e) => e.tipo)).toEqual(['billetera.acreditada'])
+  })
+
+  it('publicar dos veces lo mismo NO duplica: ley 6, por clave primaria', async ({ task }) => {
+    // La ventana es real y no se puede cerrar: el publicador escribe en D1 y
+    // DESPUES marca la fila en el Durable Object. Si el objeto se cae en el medio,
+    // la proxima pasada manda lo mismo otra vez.
+    //
+    // Acá se reproduce esa caida exactamente: se borra la marca de publicado y se
+    // publica de nuevo. Lo que tiene que absorber el duplicado es la clave primaria
+    // de cada destino, no el cuidado del publicador.
+    const oreja = billetera(task)
+    const id = env.BILLETERA.idFromName(task.fullName).toString()
+
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    await drenar(oreja)
+    const primera = await enD1(id)
+    expect(primera.asientos.length).toBe(1)
+    expect(primera.eventos.length).toBe(1)
+
+    // La caida: D1 ya recibio todo, el DO nunca se entero.
+    await runInDurableObject(oreja, (_do, ctx) => {
+      ctx.storage.sql.exec('UPDATE outbox SET publicado_en = NULL')
+    })
+
+    const r = await oreja.publicar()
+    // Y ESTO es lo que separa "no duplico" de "no publico": si el INSERT fuera sin
+    // `OR IGNORE`, el lote entero fallaria por la clave primaria, el publicador lo
+    // atraparia y las filas quedarian pendientes para siempre. Las cuentas de abajo
+    // seguirian dando 1 y la prueba mentiria.
+    expect(r.publicados).toBe(2)
+    expect(r.pendientes).toBe(0)
+
+    const segunda = await enD1(id)
+    expect(segunda).toEqual(primera)
+  })
+
+  it('el evento se identifica por el id del outbox, no por su contenido', async ({ task }) => {
+    // Dos acreditaciones IDENTICAS salvo la clave de idempotencia son dos eventos
+    // distintos con cuerpos casi iguales. Si la identidad saliera del contenido, la
+    // segunda se perderia en silencio como si fuera un duplicado — plata acreditada
+    // que los reportes nunca ven.
+    const oreja = billetera(task)
+    const id = env.BILLETERA.idFromName(task.fullName).toString()
+
+    for (const clave of ['k1', 'k2']) {
+      await oreja.acreditar(op(clave), {
+        monto: guaranies(10_000),
+        bolsa: 'disponible',
+        concepto: 'carga',
+        origen: 'dpago',
+      })
+    }
+    await drenar(oreja)
+
+    const copia = await enD1(id)
+    expect(copia.eventos.length).toBe(2)
+    // Ids distintos y crecientes: el orden de D1 es el orden en que la plata se
+    // movio.
+    expect(copia.eventos[0]!.evento_id).toBeLessThan(copia.eventos[1]!.evento_id)
+    expect(copia.asientos.map((a) => a.asiento_id)).toEqual(['k1:cr', 'k2:cr'])
+  })
+
+  it('dos billeteras con la MISMA clave de idempotencia no se pisan en el ledger', async ({
+    task,
+  }) => {
+    // ESTA prueba nacio de un fallo del arnes, no de una idea. La primera corrida
+    // del publicador dejo `ledger_copia` vacia en cuatro pruebas, sin un solo
+    // error: `asiento_id` es `${clave_idem}:${sufijo}`, y 0001 lo habia declarado
+    // PRIMARY KEY a secas en una tabla donde conviven TODAS las billeteras. La
+    // primera prueba que escribia `k1:cr` se quedaba con la fila y el `OR IGNORE`
+    // descartaba las demas en silencio.
+    //
+    // Y no es una casualidad del arnes: es EL caso del reparto, que es la Fase 1.
+    // Un pago se reparte entre el vendedor, el creador y la plataforma — tres
+    // movimientos, el mismo acto, la misma clave `{pedido_id}:{paso}`, tres
+    // billeteras. Con la clave vieja el panel mostraba uno de los tres.
+    //
+    // 0002 reconstruye la tabla con `PRIMARY KEY (billetera_id, asiento_id)`. Esto
+    // es lo que lo sostiene.
+    const nombreA = `${task.fullName} · A`
+    const nombreB = `${task.fullName} · B`
+    const a = env.BILLETERA.get(env.BILLETERA.idFromName(nombreA))
+    const b = env.BILLETERA.get(env.BILLETERA.idFromName(nombreB))
+
+    const entrada = {
+      monto: guaranies(40_000),
+      bolsa: 'disponible' as const,
+      concepto: 'reparto',
+      origen: 'pedido',
+    }
+    // La MISMA clave para las dos, que es lo correcto: es el mismo acto.
+    await a.acreditar(op('pedido-7:reparto'), entrada)
+    await b.acreditar(op('pedido-7:reparto'), entrada)
+
+    await drenar(a)
+    await drenar(b)
+
+    const enA = await enD1(env.BILLETERA.idFromName(nombreA).toString())
+    const enB = await enD1(env.BILLETERA.idFromName(nombreB).toString())
+
+    // Las dos partes del reparto estan. Con la clave vieja, una de las dos
+    // desaparecia y la unica pista era una tabla mas corta de lo que deberia.
+    expect(enA.asientos.map((x) => x.asiento_id)).toEqual(['pedido-7:reparto:cr'])
+    expect(enB.asientos.map((x) => x.asiento_id)).toEqual(['pedido-7:reparto:cr'])
+    expect(enA.asientos[0]?.monto).toBe(40_000)
+    expect(enB.asientos[0]?.monto).toBe(40_000)
+  })
+
+  it('una operacion que falla no publica nada, porque no escribio nada', async ({ task }) => {
+    const oreja = billetera(task)
+    const id = env.BILLETERA.idFromName(task.fullName).toString()
+
+    let error: unknown = null
+    try {
+      await oreja.debitar(op('k1'), { monto: guaranies(1), concepto: 'compra' })
+    } catch (e) {
+      error = e
+    }
+    expect(String(error)).toMatch(/saldo insuficiente/)
+
+    const d = await oreja.publicar()
+    expect(d).toEqual({ publicados: 0, pendientes: 0 })
+    expect(await enD1(id)).toEqual({ asientos: [], eventos: [] })
+  })
+
+  it('la reserva completa deja su rastro entero en D1', async ({ task }) => {
+    // El camino largo: reservar, consumir a medias, liberar. Cada paso asienta y
+    // avisa, y lo que llega a D1 tiene que permitir reconstruir la historia.
+    const oreja = billetera(task)
+    const id = env.BILLETERA.idFromName(task.fullName).toString()
+
+    await oreja.acreditar(op('c1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: new Date(dentroDeMediaHora()).toISOString(),
+    })
+    await oreja.consumirReserva(op('u1'), { reserva_id: 'promo-1', monto: guaranies(20_000) })
+    await oreja.liberarReserva(op('l1'), { reserva_id: 'promo-1' })
+
+    await drenar(oreja)
+    const copia = await enD1(id)
+
+    expect(copia.eventos.map((e) => e.tipo)).toEqual([
+      'billetera.acreditada',
+      'billetera.reservada',
+      'billetera.reserva_consumida',
+      'billetera.reserva_liberada',
+    ])
+
+    // Y el ledger de D1 suma lo mismo que el saldo que quedo en la billetera. Si
+    // los dos numeros se separan, el panel miente sobre plata de verdad.
+    const saldo = await oreja.saldo()
+    expect(copia.asientos.reduce((a, x) => a + x.monto, 0)).toBe(
+      saldo.bolsas.reduce((a, b) => a + b.monto, 0),
+    )
+    expect(copia.asientos.length).toBe(saldo.asientos)
+  })
+
+  it('la reserva que vence sola tambien publica lo que hizo', async ({ task }) => {
+    // El vencimiento devuelve plata sin que nadie lo pida. Es justamente el caso en
+    // el que nadie va a estar mirando: si el evento no saliera, el unico rastro de
+    // esa devolucion viviria adentro del Durable Object.
+    const oreja = billetera(task)
+    const id = env.BILLETERA.idFromName(task.fullName).toString()
+
+    await oreja.acreditar(op('c1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: new Date(Date.now() - 1000).toISOString(),
+    })
+
+    const d = await drenar(oreja)
+    expect(d.outbox.pendientes).toBe(0)
+
+    const copia = await enD1(id)
+    expect(copia.eventos.map((e) => e.tipo)).toContain('billetera.reserva_liberada')
+  })
+
+  it('el diagnostico muestra un outbox atascado', async ({ task }) => {
+    // Un outbox que no avanza es plata movida que los reportes nunca ven, y no
+    // produce ningun error: el publicador atrapa el fallo, cuenta el intento y se
+    // reprograma cada vez mas lejos. Lo unico que lo delata es esto.
+    const oreja = billetera(task)
+
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+
+    // Se drena primero para que el objeto quede SIN alarma. Eso es lo que hace
+    // determinista lo que sigue: sin alarma no hay quien publique por atras, asi
+    // que el atasco que se fabrica abajo se queda quieto hasta que la prueba mire.
+    expect((await drenar(oreja)).alarma).toBeNull()
+
+    // El atasco: las dos filas vuelven a pendiente con cuatro intentos encima,
+    // como las dejaria una D1 que no contesta hace un rato.
+    await runInDurableObject(oreja, (_do, ctx) => {
+      ctx.storage.sql.exec('UPDATE outbox SET publicado_en = NULL, intentos = 4')
+    })
+
+    const atascado = await oreja.diagnostico()
+    expect(atascado.outbox).toEqual({
+      pendientes: 2,
+      intentos_maximos: 4,
+      mas_viejo: '2026-08-17T12:00:00Z',
+    })
+
+    // Y cuando D1 vuelve, se destraba solo y el diagnostico queda limpio.
+    expect(await oreja.publicar()).toEqual({ publicados: 2, pendientes: 0 })
+    const d = await oreja.diagnostico()
+    expect(d.outbox).toEqual({ pendientes: 0, intentos_maximos: 0, mas_viejo: null })
+  })
+
+  it('el outbox pendiente programa la alarma, y con la espera que le toca', async ({ task }) => {
+    // Esto es lo que hace que el publicador arranque solo. Sin esta linea, los
+    // eventos se quedan en el outbox hasta que alguien vuelva a tocar la billetera
+    // —podrian ser meses— y no falla nada: `saldo()` y `reconciliar()` dan bien,
+    // porque la plata esta. Lo unico que esta mal es que nadie afuera lo sabe.
+    //
+    // Se prueba con nueve intentos encima a proposito. Con cero, la alarma se
+    // programa para AHORA y se dispara sola antes de que la prueba pueda leerla:
+    // la afirmacion seria una carrera. Con nueve, el retraso es el techo —cinco
+    // minutos— y la alarma se queda quieta, medible. De paso queda probado que el
+    // backoff llega hasta acá y no solo hasta la funcion pura que lo calcula.
+    const oreja = billetera(task)
+
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    expect((await drenar(oreja)).alarma).toBeNull()
+
+    await runInDurableObject(oreja, (_do, ctx) => {
+      ctx.storage.sql.exec('UPDATE outbox SET publicado_en = NULL, intentos = 9')
+    })
+
+    // Una operacion REPETIDA: misma clave de idempotencia, asi que no escribe nada
+    // nuevo. Lo unico que puede haber programado la alarma es el outbox pendiente.
+    const antes = Date.now()
+    const r = await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    expect(r.repetida).toBe(true)
+
+    const d = await oreja.diagnostico()
+    expect(d.outbox.pendientes).toBe(2)
+    expect(d.alarma).not.toBeNull()
+    // Cinco minutos, con margen para lo que tarde la prueba. Sin el backoff seria
+    // "ahora": el objeto despertaria en bucle contra una D1 que no contesta.
+    expect(d.alarma!).toBeGreaterThanOrEqual(antes + 4 * 60 * 1000)
+    expect(d.alarma!).toBeLessThanOrEqual(Date.now() + 5 * 60 * 1000)
+  })
+
+  it('lo que no se puede publicar se cuenta, y traba la cola', async ({ task }) => {
+    // El caso de la fila envenenada, y esta prueba existe tanto para probar el
+    // contador como para dejar escrito el limite: no hay cola de descarte. Una fila
+    // que no puede salir NUNCA se queda en la cabeza y bloquea a las que vienen
+    // atras. Se ve en `intentos`, no se resuelve solo, y es trabajo de otra entrega.
+    const oreja = billetera(task)
+
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    expect((await drenar(oreja)).alarma).toBeNull()
+
+    // Una fila que dice ser un asiento y cuyo cuerpo no lo es. Es lo que dejaria un
+    // cambio de formato hecho a medias.
+    await runInDurableObject(oreja, (_do, ctx) => {
+      ctx.storage.sql.exec(
+        'INSERT INTO outbox (tipo, cuerpo, correlacion_id, creado_en) VALUES (?, ?, ?, ?)',
+        TIPO_ASIENTO,
+        'esto no es un asiento',
+        'c9',
+        '2026-08-17T13:00:00Z',
+      )
+    })
+
+    expect(await oreja.publicar()).toEqual({ publicados: 0, pendientes: 1 })
+    expect((await oreja.diagnostico()).outbox.intentos_maximos).toBe(1)
+
+    // Y el segundo intento suma, que es lo que hace que la espera crezca.
+    expect(await oreja.publicar()).toEqual({ publicados: 0, pendientes: 1 })
+    expect((await oreja.diagnostico()).outbox.intentos_maximos).toBe(2)
+  })
+
+  it('entre los dos motivos de la alarma gana el mas cercano', async ({ task }) => {
+    // Hay UNA sola alarma por Durable Object y desde esta entrega tiene dos motivos:
+    // una reserva que vence y una fila del outbox que no llego a D1. Que gane el mas
+    // lejano significa que el otro llega tarde — y si el que llega tarde es el
+    // vencimiento, es plata retenida de mas.
+    //
+    // Lo dijo el arnes de mutacion, no una auditoria: cambiar `Math.min` por
+    // `Math.max` SOBREVIVIO. Todas las pruebas de la alarma tenian un motivo solo, y
+    // con un motivo el minimo y el maximo son el mismo numero.
+    //
+    // Los nueve intentos vuelven a ser lo que hace esto medible: con el retraso en
+    // el techo —cinco minutos— la alarma se queda quieta el tiempo suficiente para
+    // preguntarle.
+    const oreja = billetera(task)
+    await oreja.acreditar(op('c1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    await oreja.reservar(op('r1'), {
+      reserva_id: 'promo-1',
+      monto: guaranies(50_000),
+      vence_en: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    })
+    await drenar(oreja)
+
+    const atascar = () =>
+      runInDurableObject(oreja, (_do, ctx) => {
+        ctx.storage.sql.exec('UPDATE outbox SET publicado_en = NULL, intentos = 9')
+      })
+
+    // Una operacion repetida no escribe nada: lo unico que hace es reprogramar.
+    const reprogramar = () =>
+      oreja.acreditar(op('c1'), {
+        monto: guaranies(100_000),
+        bolsa: 'disponible',
+        concepto: 'carga',
+        origen: 'dpago',
+      })
+
+    // A · el outbox (cinco minutos) contra un vencimiento a media hora: gana el
+    //     outbox, que es el mas cercano.
+    await atascar()
+    let antes = Date.now()
+    await reprogramar()
+    let alarma = (await oreja.diagnostico()).alarma
+    expect(alarma).not.toBeNull()
+    expect(alarma!).toBeGreaterThanOrEqual(antes + 4 * 60 * 1000)
+    expect(alarma!).toBeLessThanOrEqual(Date.now() + 5 * 60 * 1000)
+
+    // B · y al reves. La reserva pasa a vencer en un minuto, el outbox sigue
+    //     esperando cinco: ahora el mas cercano es el vencimiento.
+    const vence = new Date(Date.now() + 60 * 1000).toISOString()
+    await runInDurableObject(oreja, (_do, ctx) => {
+      ctx.storage.sql.exec('UPDATE reservas SET vence_en = ?', vence)
+    })
+    await atascar()
+    antes = Date.now()
+    await reprogramar()
+    alarma = (await oreja.diagnostico()).alarma
+    expect(alarma).toBe(Date.parse(vence))
+    expect(alarma!).toBeLessThan(antes + 2 * 60 * 1000)
+  })
+
+  it('sin ningun motivo, la alarma se BORRA y no queda colgada', async ({ task }) => {
+    // Una alarma que sobrevive al motivo que la justificaba despierta el objeto para
+    // nada, para siempre.
+    //
+    // Esta prueba existe porque la mutacion que le saca el `deleteAlarm()`
+    // SOBREVIVIO, y el motivo vale escribirlo: la otra prueba de esto afirmaba
+    // `getAlarm() === null` DESPUES de que la alarma ya se habia disparado sola.
+    // Null era la respuesta correcta por la razon equivocada — workerd borra la
+    // alarma al dispararla, asi que pasaba aunque nuestro codigo no borrara nada.
+    //
+    // Acá la alarma se pone A MANO para dentro de una hora, o sea que no se va a
+    // disparar por su cuenta. Si `reprogramarAlarma` no la borra, sigue ahi.
+    const oreja = billetera(task)
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    await drenar(oreja)
+
+    const enUnaHora = Date.now() + 60 * 60 * 1000
+    await runInDurableObject(oreja, async (_do, ctx) => {
+      await ctx.storage.setAlarm(enUnaHora)
+      expect(await ctx.storage.getAlarm()).toBe(enUnaHora)
+    })
+
+    // Sin reservas abiertas y con el outbox vacio no queda ningun motivo. La
+    // operacion es repetida: no escribe nada, solo reprograma.
+    const r = await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    expect(r.repetida).toBe(true)
+
+    expect((await oreja.diagnostico()).alarma).toBeNull()
+  })
+
+  it('D1 no deja editar ni borrar lo que ya se copio', async ({ task }) => {
+    // Los triggers de 0001 y 0002. Un registro de lo que paso que se puede editar
+    // despues no es un registro de lo que paso — y esta copia es la que lee el
+    // panel, o sea la version de los hechos que ve una persona.
+    const oreja = billetera(task)
+    const id = env.BILLETERA.idFromName(task.fullName).toString()
+
+    await oreja.acreditar(op('k1'), {
+      monto: guaranies(100_000),
+      bolsa: 'disponible',
+      concepto: 'carga',
+      origen: 'dpago',
+    })
+    await drenar(oreja)
+
+    await expect(
+      env.CORE.prepare('UPDATE ledger_copia SET monto = 1 WHERE billetera_id = ?').bind(id).run(),
+    ).rejects.toThrow(/no se edita/)
+
+    await expect(
+      env.CORE.prepare('DELETE FROM eventos_billetera WHERE billetera_id = ?').bind(id).run(),
+    ).rejects.toThrow(/no se borra/)
+
+    // Y el rechazo no dejo nada tocado.
+    const copia = await enD1(id)
+    expect(copia.asientos[0]?.monto).toBe(100_000)
+    expect(copia.eventos.length).toBe(1)
   })
 })
 

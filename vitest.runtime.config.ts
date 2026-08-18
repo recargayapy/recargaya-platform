@@ -17,8 +17,9 @@
  * del alcance de `tsc`, una opcion inventada no compila.
  */
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
-import { cloudflareTest } from '@cloudflare/vitest-pool-workers'
+import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-pool-workers'
 
 /**
  * Se lee con `readFileSync` y no con `import ... from './x.json'` a proposito.
@@ -30,7 +31,21 @@ import { cloudflareTest } from '@cloudflare/vitest-pool-workers'
  */
 const arnes = JSON.parse(
   readFileSync(new URL('./pruebas-runtime/arnes-del-runtime.json', import.meta.url), 'utf8'),
-) as { configPath: string; environment: string }
+) as { configPath: string; environment: string; migrationsDir: string }
+
+/**
+ * Las migraciones de D1 de VERDAD, leidas de la misma carpeta que despliega
+ * wrangler — `check-runtime.mjs` comprueba que sean la misma.
+ *
+ * Entran como un binding y las aplica el propio archivo de pruebas, porque el
+ * publicador escribe en `ledger_copia` y en `eventos_billetera` y sin esas tablas
+ * no hay nada que probar. La tentacion era crearlas con un `CREATE TABLE` adentro
+ * de la prueba: eso es la tabla de juguete que este proyecto ya rechazo una vez,
+ * y probaria que D1 funciona en vez de que nuestro esquema sirva.
+ */
+const migraciones = await readD1Migrations(
+  fileURLToPath(new URL(`./${arnes.migrationsDir}`, import.meta.url)),
+)
 
 export default defineConfig({
   plugins: [
@@ -56,6 +71,17 @@ export default defineConfig({
       // destino de esos segundos seria `core-produccion`. La plata no se prueba
       // contra la base de produccion ni por accidente ni por cuatro segundos.
       remoteBindings: false,
+
+      // El unico binding que las pruebas agregan, y no es un recurso de
+      // Cloudflare: es el texto de las migraciones, para que el archivo de pruebas
+      // pueda aplicarlas con `applyD1Migrations`.
+      //
+      // NO se declara en `wrangler.jsonc` ni entra en `Entorno`. Los guardas de
+      // deriva de `runtime.test.ts` comparan las claves de `Cloudflare.Env` contra
+      // las de `Entorno`, y un binding que solo existe en las pruebas los cegaria:
+      // habria que aflojar el guarda para agregarlo. Se lee con un cast local y
+      // documentado, que es el precio correcto.
+      miniflare: { bindings: { MIGRACIONES: migraciones } },
     }),
   ],
   test: {

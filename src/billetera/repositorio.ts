@@ -32,6 +32,7 @@ import {
   type Reserva,
 } from './nucleo.js'
 import { type Bolsa, type TipoBolsa, type Toma } from '../dinero/bolsas.js'
+import { type FilaDelOutbox, TIPO_ASIENTO } from './publicador.js'
 import { guaranies } from '../dinero/monto.js'
 
 /** Lo minimo que este archivo necesita del SQLite del Durable Object. */
@@ -229,6 +230,27 @@ export function guardarDelta(
     )
   }
 
+  // El asiento tambien sale por el outbox, y se escribe ACA, tres lineas abajo de
+  // donde se inserta el asiento.
+  //
+  // La alternativa era que el nucleo emitiera un evento por asiento. Se descarto:
+  // seria una linea que cada operacion nueva tiene que acordarse de escribir, y
+  // "acordarse" es exactamente lo que este proyecto no acepta como garantia. Acá
+  // no hay nada que recordar — el que inserta el asiento inserta la copia.
+  //
+  // La otra alternativa, marcar en `asientos` cual ya se copio, no existe: la ley 2
+  // prohibe el UPDATE sobre esa tabla y hay dos triggers que lo hacen cumplir. Una
+  // columna `copiado_en` ahi seria una columna que nadie puede mover.
+  for (const a of asientos) {
+    sql.exec(
+      'INSERT INTO outbox (tipo, cuerpo, correlacion_id, creado_en) VALUES (?, ?, ?, ?)',
+      TIPO_ASIENTO,
+      JSON.stringify(a),
+      a.correlacion_id,
+      a.asentado_en,
+    )
+  }
+
   // Ley 5. Va acá adentro, con todo lo demas, y no en una escritura aparte.
   for (const e of eventos) {
     sql.exec(
@@ -279,6 +301,97 @@ export function reconciliar(sql: Sql): { ok: boolean; diferencias: string[] } {
   }
 
   return { ok: diferencias.length === 0, diferencias }
+}
+
+// ---------------------------------------------------------------------------
+// El outbox
+// ---------------------------------------------------------------------------
+
+/**
+ * Las filas que todavia no salieron, de la mas vieja a la mas nueva.
+ *
+ * El orden es por `id` y no por `creado_en`, y no es lo mismo: `creado_en` es el
+ * `momento` que trajo la operacion —lo pone el llamador— asi que dos operaciones
+ * pueden compartirlo o llegar corridas. El `id` es un AUTOINCREMENT del propio
+ * objeto: es el orden en que la plata se movio de verdad.
+ *
+ * El indice parcial `idx_outbox_pendiente` cubre exactamente esta consulta. Lo ya
+ * publicado es historia y no ensucia el arbol.
+ */
+export function outboxPendiente(sql: Sql, limite: number): FilaDelOutbox[] {
+  return [
+    ...sql.exec<FilaDelOutbox>(
+      'SELECT id, tipo, cuerpo, correlacion_id, creado_en FROM outbox WHERE publicado_en IS NULL ORDER BY id LIMIT ?',
+      limite,
+    ),
+  ]
+}
+
+/**
+ * Marca como publicadas las filas que D1 ya acepto.
+ *
+ * El `AND publicado_en IS NULL` no es decorativo: sin el, una pasada que se cruce
+ * con otra pisaria un `publicado_en` anterior con uno posterior, y la columna
+ * dejaria de decir cuando salio la fila para pasar a decir cuando se la toco por
+ * ultima vez.
+ */
+export function marcarPublicadas(sql: Sql, ids: readonly number[], momento: string): void {
+  for (const id of ids) {
+    sql.exec(
+      'UPDATE outbox SET publicado_en = ? WHERE id = ? AND publicado_en IS NULL',
+      momento,
+      id,
+    )
+  }
+}
+
+/**
+ * Suma uno al contador de intentos de las filas de un lote que fallo.
+ *
+ * Se cuenta para poder esperar mas entre reintento y reintento —ver
+ * `retrasoPorIntentos`— y para que `diagnostico()` pueda decir que hay una
+ * billetera que no logra publicar. Un outbox que se atasca en silencio es plata
+ * movida que los reportes nunca ven.
+ */
+export function contarIntento(sql: Sql, ids: readonly number[]): void {
+  for (const id of ids) {
+    sql.exec('UPDATE outbox SET intentos = intentos + 1 WHERE id = ?', id)
+  }
+}
+
+/**
+ * La fila mas vieja sin publicar, que es la que traba la cola.
+ *
+ * Devuelve tambien sus intentos porque es lo que decide cuando volver a probar. Se
+ * mira la CABEZA y no el maximo de la tabla: publicar es en orden, asi que la que
+ * manda el ritmo es la primera.
+ */
+export function cabezaDelOutbox(sql: Sql): { id: number; intentos: number } | null {
+  const filas = [
+    ...sql.exec<{ id: number; intentos: number }>(
+      'SELECT id, intentos FROM outbox WHERE publicado_en IS NULL ORDER BY id LIMIT 1',
+    ),
+  ]
+  return filas[0] ?? null
+}
+
+/** Lo que un operador necesita saber sin abrir la base. */
+export function resumenDelOutbox(sql: Sql): {
+  pendientes: number
+  intentos_maximos: number
+  mas_viejo: string | null
+} {
+  const f = [
+    ...sql.exec<{ n: number; intentos: number | null; mas_viejo: string | null }>(
+      'SELECT COUNT(*) AS n, MAX(intentos) AS intentos, MIN(creado_en) AS mas_viejo FROM outbox WHERE publicado_en IS NULL',
+    ),
+  ][0]
+
+  return {
+    pendientes: f?.n ?? 0,
+    intentos_maximos: f?.intentos ?? 0,
+    mas_viejo: f?.mas_viejo ?? null,
+  }
 }
 
 /**

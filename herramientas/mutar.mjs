@@ -400,6 +400,177 @@ const MUTACIONES = [
     oraculo: ORACULO_RUNTIME,
   },
 
+  // --- El publicador del outbox --------------------------------------------
+  // La otra mitad de la ley 5. El evento ya se escribia en la misma transaccion
+  // que el cambio; lo que faltaba era sacarlo de ahi. Es el unico camino por el
+  // que la plata llega a los reportes, y es el que menos ruido hace cuando se
+  // rompe: `saldo()` y `reconciliar()` siguen dando bien, porque la plata esta.
+  // Lo unico que esta mal es que nadie afuera se entera.
+  {
+    invariante: 'el asiento va al ledger y no al registro de eventos',
+    archivo: 'src/billetera/publicador.ts',
+    de: "  return tipo === TIPO_ASIENTO ? 'ledger_copia' : 'eventos_billetera'",
+    a: "  return 'eventos_billetera'",
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // El id del outbox es lo que hace que la segunda entrega no duplique: es un
+    // AUTOINCREMENT, o sea estable entre reintentos. Con una constante, la primera
+    // fila se queda con la clave y el `OR IGNORE` descarta todas las demas — plata
+    // acreditada que los reportes nunca ven.
+    invariante: 'el evento se identifica por el id del outbox',
+    archivo: 'src/billetera/publicador.ts',
+    de: '        billetera_id,\n        f.id,',
+    a: '        billetera_id,\n        0,',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'sin fallos previos, la copia a D1 no espera nada',
+    archivo: 'src/billetera/publicador.ts',
+    de: '  if (intentos <= 0) return 0',
+    a: '',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Sin techo, veinte fallos son doce dias de espera. Y con `2 ** 1024` de por
+    // medio, `Infinity`: `setAlarm(Infinity)` no es una espera larga, es un error.
+    invariante: 'la espera entre reintentos tiene techo',
+    archivo: 'src/billetera/publicador.ts',
+    de: '  return Math.min(2 ** (intentos - 1) * 1000, RETRASO_MAXIMO_MS)',
+    a: '  return 2 ** (intentos - 1) * 1000',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // Un lote de cero filas es un publicador que lee cero para siempre, con el
+    // outbox creciendo y todo en verde.
+    invariante: 'el lote del publicador no puede ser cero',
+    archivo: 'src/billetera/publicador.ts',
+    de: 'export const LOTE = 50',
+    a: 'export const LOTE = 0',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    // LEY 6, y el oraculo es la prueba que reproduce la caida entre la escritura en
+    // D1 y la marca en el Durable Object. Sin `OR IGNORE` el lote entero falla por
+    // la clave primaria, el publicador lo atrapa, y las filas quedan pendientes
+    // para siempre: el outbox se traba sin un solo error visible.
+    invariante: 'la segunda entrega del mismo asiento no rompe ni duplica',
+    archivo: 'src/billetera/publicador.ts',
+    de: "  'INSERT OR IGNORE INTO ledger_copia",
+    a: "  'INSERT INTO ledger_copia",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'la segunda entrega del mismo evento no rompe ni duplica',
+    archivo: 'src/billetera/publicador.ts',
+    de: "  'INSERT OR IGNORE INTO eventos_billetera",
+    a: "  'INSERT INTO eventos_billetera",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El asiento sale por el outbox y se escribe donde se inserta el asiento, no
+    // como un evento que el nucleo tenga que acordarse de emitir. Sin esta linea,
+    // `ledger_copia` queda vacia para siempre y el panel muestra una billetera sin
+    // movimientos mientras la plata se mueve adentro del Durable Object.
+    invariante: 'el asiento tambien sale por el outbox',
+    archivo: 'src/billetera/repositorio.ts',
+    de: '  for (const a of asientos) {\n    sql.exec(\n      \'INSERT INTO outbox (tipo, cuerpo, correlacion_id, creado_en) VALUES (?, ?, ?, ?)\',\n      TIPO_ASIENTO,',
+    a: '  for (const a of asientos.slice(0, 0)) {\n    sql.exec(\n      \'INSERT INTO outbox (tipo, cuerpo, correlacion_id, creado_en) VALUES (?, ?, ?, ?)\',\n      TIPO_ASIENTO,',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Si lo publicado no se marca, se republica en cada pasada para siempre. D1 lo
+    // absorbe —las claves primarias estan— asi que no se rompe nada: simplemente el
+    // objeto no para nunca, y la cola nunca se vacia.
+    invariante: 'lo publicado se marca como publicado',
+    archivo: 'src/billetera/repositorio.ts',
+    de: 'export function marcarPublicadas(sql: Sql, ids: readonly number[], momento: string): void {\n  for (const id of ids) {',
+    a: 'export function marcarPublicadas(sql: Sql, ids: readonly number[], momento: string): void {\n  for (const id of ids.slice(0, 0)) {',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Sin contar los intentos, la espera nunca crece: el objeto despierta en bucle
+    // contra una D1 que no contesta, y el diagnostico no tiene nada que mostrar.
+    invariante: 'un intento fallido se cuenta',
+    archivo: 'src/index.ts',
+    de: '        enUnaTransaccion(this.ctx, () => contarIntento(this.sql, ids))',
+    a: '',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // ESTA es la linea que hace que el publicador arranque solo. Sin ella los
+    // eventos esperan a que alguien vuelva a tocar la billetera —podrian ser
+    // meses— y no falla nada: `saldo()` y `reconciliar()` siguen dando bien.
+    invariante: 'el outbox pendiente programa la alarma',
+    archivo: 'src/index.ts',
+    de: '      intentosDeLaCabeza: cabeza === null ? null : cabeza.intentos,',
+    a: '      intentosDeLaCabeza: null,',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Y que el vencimiento no pierda su alarma cuando el outbox tambien pide una:
+    // gana el mas cercano, no el mas lejano.
+    invariante: 'la alarma que decidio alarma.ts es la que se programa',
+    archivo: 'src/index.ts',
+    de: '    else await this.ctx.storage.setAlarm(cuando)',
+    a: '    else await this.ctx.storage.setAlarm(cuando + 60 * 60 * 1000)',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Toda operacion reprograma, no solo las que tocan reservas. La version
+    // anterior lo dejaba a criterio de cada metodo y `acreditar` no lo hacia.
+    invariante: 'toda operacion reprograma la alarma',
+    archivo: 'src/index.ts',
+    de: '    const r = this.aplicar(op, reserva_id, operar)\n    await this.reprogramarAlarma()',
+    a: '    const r = this.aplicar(op, reserva_id, operar)',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: 'la alarma publica lo que quedo pendiente',
+    archivo: 'src/index.ts',
+    de: '    await this.publicar()\n\n    await this.reprogramarAlarma()',
+    a: '    await this.reprogramarAlarma()',
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El oraculo de la carpeta de migraciones. La version anterior de
+    // `check-esquema.mjs` leia SOLO `0001_cimientos.sql` con la ruta escrita a
+    // mano, y 0002 reconstruye `ledger_copia`: el oraculo habria seguido aprobando
+    // la definicion de una tabla que ya no existe.
+    invariante: 'check-esquema mira TODAS las migraciones, no la primera',
+    archivo: 'herramientas/check-esquema.mjs',
+    de: '  for (const { archivo, check } of enSql) {',
+    a: '  for (const { archivo, check } of enSql.slice(0, 1)) {',
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    // Y que una lista vacia no pase por OK. Es la forma que tomaria un cambio en
+    // como se escribe la columna: la expresion regular deja de encontrarla y un
+    // bucle sobre cero elementos no se queja de nada.
+    invariante: 'check-esquema falla si no encuentra ningun CHECK que comparar',
+    archivo: 'herramientas/check-esquema.mjs',
+    de: '  if (enSql.length === 0) {',
+    a: '  if (false) {',
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    // Y la deriva entre lo que el arnes migra y lo que wrangler despliega. Sin
+    // esto, las pruebas del publicador pueden aprobar un esquema de D1 que nadie
+    // va a tener nunca, con todo en verde.
+    invariante: 'el arnes no puede migrar una carpeta distinta de la que se despliega',
+    archivo: 'herramientas/check-runtime.mjs',
+    de: '    if (deWrangler !== declarado.migrationsDir) {',
+    a: '    if (false) {',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+  {
+    invariante: 'el arnes declara un migrationsDir que es texto',
+    archivo: 'herramientas/arnes-del-runtime.mjs',
+    de: "  if (typeof d.migrationsDir !== 'string' || d.migrationsDir === '') {",
+    a: '  if (false) {',
+    oraculo: conNode('herramientas/check-runtime.pruebas.mjs'),
+  },
+
   // --- La frontera con el sistema operativo --------------------------------
   // Un comando lanzado por nombre anda en Linux, anda en el CI, y muere en la
   // maquina del dueño: en Windows `npx` es `npx.cmd`, y desde Node 20.12 un `.cmd`
@@ -647,26 +818,53 @@ const MUTACIONES = [
     // Una reserva que nace vencida —reloj corrido, reintento demorado, campaña de
     // un minuto— dejaba el objeto sin alarma y la plata retenida para siempre.
     // Lo encontro una prueba, no una auditoria.
+    // Las cuatro ramas de la decision viven en `billetera/alarma.ts`, puras, y por
+    // eso su oraculo es el nucleo y no el runtime. Estaban adentro del Durable
+    // Object y ESTA mutacion sobrevivio a cuarenta y ocho pruebas del runtime: el
+    // estado donde la rama manda —algo vencido Y el outbox vacio— solo se observa
+    // desde afuera del objeto ganandole una carrera a la alarma que se dispara
+    // sola. Se movio la decision, no se agrego una prueba mas.
     invariante: 'una reserva ya vencida igual queda con alarma',
-    archivo: 'src/index.ts',
-    de: '    if (vencidas.length > 0) {',
-    a: '    if (false) {',
-    oraculo: ORACULO_RUNTIME,
+    archivo: 'src/billetera/alarma.ts',
+    de: '  if (m.hayVencidas) motivos.push(m.ahora)',
+    a: '  if (false) motivos.push(m.ahora)',
+    oraculo: ORACULO_NUCLEO,
   },
   {
     invariante: 'la alarma queda programada para el vencimiento de la reserva',
-    archivo: 'src/index.ts',
-    de: '    await this.ctx.storage.setAlarm(Date.parse(proximoVencimiento))',
+    archivo: 'src/billetera/alarma.ts',
+    de: '  else if (m.proximoVencimiento !== null) motivos.push(Date.parse(m.proximoVencimiento))',
     a: '',
-    oraculo: ORACULO_RUNTIME,
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'el outbox pendiente es un motivo para despertar',
+    archivo: 'src/billetera/alarma.ts',
+    de: '  if (m.intentosDeLaCabeza !== null) {',
+    a: '  if (false) {',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'sin ningun motivo no queda alarma',
+    archivo: 'src/billetera/alarma.ts',
+    de: '  if (motivos.length === 0) return null',
+    a: '  if (motivos.length === 0) return m.ahora',
+    oraculo: ORACULO_NUCLEO,
+  },
+  {
+    invariante: 'entre los motivos de la alarma gana el mas cercano (decision pura)',
+    archivo: 'src/billetera/alarma.ts',
+    de: '  return Math.min(...motivos)',
+    a: '  return Math.max(...motivos)',
+    oraculo: ORACULO_NUCLEO,
   },
   {
     // Una alarma que sobrevive a la reserva que la justificaba despierta el objeto
     // para nada, para siempre.
     invariante: 'sin reservas abiertas la alarma se borra',
     archivo: 'src/index.ts',
-    de: '      await this.ctx.storage.deleteAlarm()',
-    a: '',
+    de: '    if (cuando === null) await this.ctx.storage.deleteAlarm()',
+    a: '    if (false) await this.ctx.storage.deleteAlarm()',
     oraculo: ORACULO_RUNTIME,
   },
   {

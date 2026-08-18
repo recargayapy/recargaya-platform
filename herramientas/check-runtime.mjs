@@ -45,6 +45,12 @@
  *      un `compatibilityDate` de miniflare — porque ahi la fecha efectiva ya no
  *      es la que este oraculo acaba de aprobar. Un comentario que la mencione no
  *      cuenta: lo que se busca es una forma de codigo, no la palabra.
+ *   5. Y comprueba que el `migrationsDir` del arnes sea el MISMO que declara la
+ *      base D1 de ese entorno en `wrangler.jsonc`. El arnes aplica esas
+ *      migraciones a la D1 local antes de correr las pruebas del publicador: si
+ *      apuntara a otra carpeta, las pruebas aprobarian un esquema de D1 que no es
+ *      el que se despliega. Es la misma categoria que la tabla de juguete que
+ *      motivo sacar el DDL del Durable Object a `src/`.
  *
  * Uso:  node herramientas/check-runtime.mjs
  */
@@ -203,6 +209,21 @@ export function esFechaReal(fecha) {
   return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(fecha)
 }
 
+/**
+ * La carpeta de migraciones que declara la base D1 del entorno, tal cual la lee
+ * wrangler. Devuelve `null` si el entorno no tiene una base D1 con `migrations_dir`.
+ *
+ * Separada y pura para poder probarla sobre objetos, sin disco.
+ */
+export function migracionesDeclaradas(config, entorno) {
+  const bases = config?.env?.[entorno]?.d1_databases
+  if (!Array.isArray(bases)) return null
+  for (const b of bases) {
+    if (typeof b?.migrations_dir === 'string') return b.migrations_dir
+  }
+  return null
+}
+
 function main() {
   let entorno
   let config
@@ -217,11 +238,24 @@ function main() {
       )
     }
 
-    entorno = leerArnesDesde(RAIZ).environment
+    const declarado = leerArnesDesde(RAIZ)
+    entorno = declarado.environment
     config = leerConfig(readFileSync(join(RAIZ, 'wrangler.jsonc'), 'utf8'))
 
     if (config?.env?.[entorno] === undefined) {
       throw new Error(`wrangler.jsonc no declara el entorno "${entorno}" que el arnes dice usar`)
+    }
+
+    const deWrangler = migracionesDeclaradas(config, entorno)
+    if (deWrangler === null) {
+      throw new Error(
+        `la base D1 de env.${entorno} no declara \`migrations_dir\`, y el arnes necesita saber que migraciones aplicar a la base local`,
+      )
+    }
+    if (deWrangler !== declarado.migrationsDir) {
+      throw new Error(
+        `el arnes aplica las migraciones de "${declarado.migrationsDir}" y env.${entorno} despliega las de "${deWrangler}": las pruebas correrian contra un esquema de D1 que no es el que se despliega`,
+      )
     }
 
     resuelta = fechaEfectiva(config, entorno)
@@ -230,12 +264,17 @@ function main() {
     // con un stack de Node le hace perder media hora al que lo lee con el CI en
     // rojo, y este archivo es el que mas se va a leer en ese estado.
     console.error('')
-    console.error('  check-runtime: NO SE PUDO DETERMINAR LA FECHA DE COMPATIBILIDAD')
+    console.error('  check-runtime: EL ARNES DEL RUNTIME NO ESTA BIEN DECLARADO')
     console.error('')
     console.error(`    ${e.message}`)
     console.error('')
-    console.error('  Sin una fecha escrita, miniflare usa la de HOY del reloj del sistema y')
-    console.error('  las pruebas del Durable Object pasan a depender del dia en que corren.')
+    console.error('  Este oraculo comprueba dos cosas sobre el arnes, y las dos terminan igual:')
+    console.error('  una prueba que aprueba algo distinto de lo que se despliega.')
+    console.error('')
+    console.error('    · Sin una compatibility_date escrita, miniflare usa la de HOY del reloj')
+    console.error('      del sistema y el veredicto pasa a depender del dia en que corre.')
+    console.error('    · Con un migrations_dir distinto del que despliega wrangler, las pruebas')
+    console.error('      corren contra un esquema de D1 que nadie va a tener en produccion.')
     console.error('')
     process.exit(1)
   }

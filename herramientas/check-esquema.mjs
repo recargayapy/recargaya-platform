@@ -13,7 +13,7 @@
  * Uso: node herramientas/check-esquema.mjs
  */
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { invocadoDirecto } from './invocado-directo.mjs'
@@ -25,7 +25,7 @@ import { invocadoDirecto } from './invocado-directo.mjs'
 // disfraz. Los otros dos oraculos ya lo resolvian asi; este quedo atras.
 const RAIZ = fileURLToPath(new URL('..', import.meta.url))
 const ARCHIVO_TIPOS = join(RAIZ, 'src', 'dinero', 'bolsas.ts')
-const ARCHIVO_MIGRACION = join(RAIZ, 'migraciones', 'core', '0001_cimientos.sql')
+const DIR_MIGRACIONES = join(RAIZ, 'migraciones', 'core')
 const ARCHIVO_ESQUEMA_DO = join(RAIZ, 'src', 'billetera', 'esquema.ts')
 
 export function extraerTipoBolsa(contenido) {
@@ -34,10 +34,39 @@ export function extraerTipoBolsa(contenido) {
   return [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1])
 }
 
+/**
+ * TODOS los CHECK de la columna `bolsa` que declare un archivo SQL.
+ *
+ * Va en plural desde que las migraciones son mas de una, y no es un detalle de
+ * forma: la version anterior leia SOLO `0001_cimientos.sql` con la ruta escrita a
+ * mano. La migracion 0002 reconstruye `ledger_copia` —para arreglarle la clave
+ * primaria— y con ella la columna `bolsa` y su CHECK. O sea que el oraculo habria
+ * seguido aprobando la definicion de una tabla que ya no existe, mientras la que
+ * gobierna de verdad quedaba sin comparar contra nada.
+ *
+ * Es exactamente la clase de defecto que este archivo existe para agarrar, con el
+ * oraculo del lado equivocado.
+ */
+export function extraerChecksBolsa(contenido) {
+  return [...contenido.matchAll(/bolsa\s+TEXT NOT NULL CHECK \(bolsa IN \(([^)]+)\)\)/g)].map((m) =>
+    [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]),
+  )
+}
+
 export function extraerCheckBolsa(contenido) {
-  const m = contenido.match(/bolsa\s+TEXT NOT NULL CHECK \(bolsa IN \(([^)]+)\)\)/)
-  if (m === null) throw new Error('no se encontro el CHECK de "bolsa" en la migracion')
-  return [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1])
+  const todos = extraerChecksBolsa(contenido)
+  if (todos.length === 0) throw new Error('no se encontro el CHECK de "bolsa" en la migracion')
+  return todos[0]
+}
+
+/** Cada CHECK de `bolsa` que exista en la carpeta de migraciones, con el nombre
+ *  del archivo donde vive para que el error diga donde mirar. */
+export function checksDeLasMigraciones(archivos, leer) {
+  const salida = []
+  for (const archivo of archivos) {
+    for (const check of extraerChecksBolsa(leer(archivo))) salida.push({ archivo, check })
+  }
+  return salida
 }
 
 /**
@@ -83,12 +112,29 @@ export function compararOrden(tipos, delDO) {
 
 function main() {
   const tipos = extraerTipoBolsa(readFileSync(ARCHIVO_TIPOS, 'utf8'))
-  const check = extraerCheckBolsa(readFileSync(ARCHIVO_MIGRACION, 'utf8'))
   const delDO = extraerTiposDelEsquemaDO(readFileSync(ARCHIVO_ESQUEMA_DO, 'utf8'))
 
-  const contraD1 = compararEsquemas(tipos, check)
-  if (!contraD1.ok) {
-    console.error('\n  check-esquema: TipoBolsa y el CHECK de ledger_copia se desincronizaron\n')
+  // Todas las migraciones, no la primera: ver el encabezado de `extraerChecksBolsa`.
+  const migraciones = readdirSync(DIR_MIGRACIONES)
+    .filter((n) => n.endsWith('.sql'))
+    .sort()
+  const enSql = checksDeLasMigraciones(migraciones, (n) =>
+    readFileSync(join(DIR_MIGRACIONES, n), 'utf8'),
+  )
+
+  if (enSql.length === 0) {
+    console.error('\n  check-esquema: NINGUNA migracion declara un CHECK de la columna `bolsa`\n')
+    console.error('  O se borro la columna, o cambio la forma en que se declara y esta')
+    console.error('  herramienta dejo de verla. Las dos terminan igual: un oraculo que dice OK')
+    console.error('  sin haber comparado nada.\n')
+    process.exit(1)
+  }
+
+  for (const { archivo, check } of enSql) {
+    const contraD1 = compararEsquemas(tipos, check)
+    if (contraD1.ok) continue
+
+    console.error(`\n  check-esquema: TipoBolsa y el CHECK de ${archivo} se desincronizaron\n`)
     if (contraD1.faltantes.length > 0) {
       console.error(`  en TipoBolsa pero no en el CHECK: ${contraD1.faltantes.join(', ')}`)
     }
@@ -129,7 +175,7 @@ function main() {
   }
 
   console.log(
-    `  check-esquema: TipoBolsa, el CHECK de ledger_copia y el esquema del DO coinciden (${tipos.join(', ')})`,
+    `  check-esquema: TipoBolsa, el esquema del DO y los ${enSql.length} CHECK de las migraciones coinciden (${tipos.join(', ')})`,
   )
 }
 
