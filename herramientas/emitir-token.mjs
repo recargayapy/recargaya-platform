@@ -47,7 +47,7 @@
 import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { invocadoDirecto } from './invocado-directo.mjs'
 
 const RAIZ = fileURLToPath(new URL('..', import.meta.url))
@@ -104,6 +104,34 @@ export function buscarSecreto({ delArgumento, delEntorno, contenidoDevVars }) {
 }
 
 /**
+ * Como se importa un archivo por su ruta ABSOLUTA, en cualquier sistema.
+ *
+ * EL DEFECTO QUE ESTO CIERRA, y lo encontro el dueño en su maquina, no el arnes:
+ *
+ *     Error [ERR_UNSUPPORTED_ESM_URL_SCHEME]: Only URLs with a scheme in: file,
+ *     data, and node are supported by the default ESM loader. On Windows,
+ *     absolute paths must be valid file:// URLs. Received protocol 'c:'
+ *
+ * En Linux `import('/tmp/x/actor.mjs')` funciona: la ruta ya parece una URL sin
+ * esquema. En Windows `import('C:\Users\...\actor.mjs')` no, porque Node lee
+ * `C:` como el esquema de una URL. O sea: anda acá, anda en el CI, y muere en la
+ * maquina del dueño.
+ *
+ * Es el defecto n.º 6 de la Fase 0 por tercera vez, y en la misma frontera que
+ * `check-portabilidad.mjs` ya vigila —nuestras herramientas contra el sistema
+ * operativo—. Por eso ese oraculo ahora tiene una tercera regla, y no alcanzo con
+ * arreglar esta linea.
+ *
+ * Va en una funcion propia y exportada para que se pueda probar y mutar: la
+ * diferencia entre lo correcto y lo roto NO se puede observar corriendo el codigo
+ * en Linux, asi que lo que se prueba es la FORMA —que empiece con `file://`— y no
+ * el comportamiento.
+ */
+export function urlDelModulo(ruta) {
+  return pathToFileURL(ruta).href
+}
+
+/**
  * Trae `emitirToken` y `secretoDelServicio` DEL CODIGO DE VERDAD.
  *
  * Se bundlea a un archivo temporal y se lo importa. El temporal se borra siempre:
@@ -124,7 +152,7 @@ export async function cargarActor() {
       outfile: salida,
       logLevel: 'silent',
     })
-    return await import(salida)
+    return await import(urlDelModulo(salida))
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

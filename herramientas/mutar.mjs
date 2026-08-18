@@ -1661,6 +1661,34 @@ const MUTACIONES = [
     a: "      bundle: false,",
     oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
   },
+  {
+    // LO ENCONTRO EL DUEÑO EN SU MAQUINA, con la entrega ya mergeada. En Linux
+  // `import('/tmp/x.mjs')` funciona; en Windows, `import('C:\\...\\x.mjs')` muere
+  // porque Node lee `C:` como el esquema de una URL. Ninguna prueba que CORRA el
+  // import puede ver la diferencia acá, asi que lo que se prueba es la FORMA.
+    invariante: "un modulo se importa por su ruta como URL file://, no como ruta pelada",
+    archivo: "herramientas/emitir-token.mjs",
+    de: "  return pathToFileURL(ruta).href",
+    a: "  return ruta",
+    oraculo: conNode('herramientas/emitir-token.pruebas.mjs'),
+  },
+  {
+    // La tercera regla del oraculo de portabilidad. Sin ella, el defecto de arriba
+  // vuelve en la proxima herramienta que importe una ruta calculada — que es
+  // exactamente como volvio dos veces antes en esta misma frontera.
+    invariante: "check-portabilidad marca un import() de una ruta calculada",
+    archivo: "herramientas/check-portabilidad.mjs",
+    de: "    const im = /\\bimport\\s*\\(\\s*([A-Za-z_$][\\w$.]*)\\s*\\)/.exec(linea)",
+    a: "    const im = null",
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
+  {
+    invariante: "check-portabilidad no marca un import() de un paquete",
+    archivo: "herramientas/check-portabilidad.mjs",
+    de: "    if (im !== null && !/pathToFileURL/.test(linea)) {",
+    a: "    if (im !== null) {",
+    oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
+  },
 ]
 
 const ORACULO_POR_DEFECTO = ORACULO_NUCLEO
