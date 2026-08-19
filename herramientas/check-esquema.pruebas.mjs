@@ -17,6 +17,7 @@ import {
   sinComentarios,
   checkDeColumna,
   checksDeLaFrontera,
+  declaracionesDeLaTabla,
   compararEsquemas,
   compararOrden,
   extraerTipo,
@@ -293,7 +294,17 @@ assert.deepEqual(compararOrden(['a', 'b'], ['b', 'a']), {
 
 // Las fronteras declaradas no pueden quedar en cero por un descuido de edicion:
 // con la lista vacia, `main()` no compara nada y sale 0.
-assert.ok(FRONTERAS.length >= 3, 'se esperaban al menos tres fronteras declaradas')
+assert.ok(FRONTERAS.length >= 4, 'se esperaban al menos cuatro fronteras declaradas')
+
+// Y que cada frontera apunte a un archivo que existe y a un tipo que se puede leer.
+// Sin esto, una frontera con la ruta mal escrita hace fallar `main()` con un ENOENT
+// pelado — que se lee como «se rompio la herramienta» y no como «alguien declaro mal
+// una frontera».
+for (const f of FRONTERAS) {
+  assert.ok(Array.isArray(f.archivo) && f.archivo.length > 0, `frontera ${f.tipo} sin archivo`)
+  assert.ok(typeof f.tabla === 'string' && f.tabla.length > 0, `frontera ${f.tipo} sin tabla`)
+  assert.ok(typeof f.columna === 'string' && f.columna.length > 0, `frontera ${f.tipo} sin columna`)
+}
 
 // --- de punta a punta ------------------------------------------------------
 // Las de arriba prueban las funciones puras. Sin esto, `main()` no lo ejercita
@@ -617,4 +628,49 @@ const CHECK_ESTADO = "CHECK (estado IN ('activa', 'suspendida', 'cerrada'))"
   assert.match(r.salida, /0004_recorte\.sql/)
 }
 
-console.log('  check-esquema.pruebas: OK (3 fronteras, renombres, comentarios, orden, STRICT y punta a punta)')
+// --- la ultima declaracion legible tiene que ser la ultima declaracion -------
+// LO ENCONTRO LA SEGUNDA VUELTA DE AUDITORIA DE LA 1.3, y es la tercera vez que esta
+// herramienta tiene el mismo defecto con otro disfraz: aprobar la definicion de una
+// tabla que ya no gobierna. Acá el disfraz es un CHECK escrito a nivel de TABLA, que
+// `checkDeColumna` no sabe leer — asi que la declaracion nueva no entraba a la lista y
+// se comparaba contra la vieja, en verde.
+
+{
+  const CON_CHECK_DE_TABLA = `
+CREATE TABLE pedidos_v2 (
+  id     TEXT PRIMARY KEY,
+  estado TEXT NOT NULL,
+  CHECK (estado IN ('creado', 'pagado'))
+) STRICT;
+DROP TABLE pedidos;
+ALTER TABLE pedidos_v2 RENAME TO pedidos;
+`
+  // La declaracion existe y se ve...
+  const decls = declaracionesDeLaTabla(['0005.sql'], () => CON_CHECK_DE_TABLA, 'pedidos')
+  assert.equal(decls.length, 1, 'la declaracion con CHECK de tabla tiene que verse')
+  assert.equal(decls[0].declarada, 'pedidos_v2')
+
+  // ...y su CHECK NO se puede leer. Las dos cosas juntas son el agujero.
+  const checks = checksDeLaFrontera(['0005.sql'], () => CON_CHECK_DE_TABLA, 'pedidos', 'estado')
+  assert.equal(checks.length, 0, 'el CHECK a nivel de tabla no lo lee `checkDeColumna`')
+}
+
+{
+  const r = correrSobreCopia((dir) => {
+    writeFileSync(
+      join(dir, 'migraciones', 'core', '0005_prueba.sql'),
+      `CREATE TABLE pedidos_v2 (
+  id     TEXT PRIMARY KEY,
+  estado TEXT NOT NULL,
+  CHECK (estado IN ('creado', 'pagado'))
+) STRICT;
+DROP TABLE pedidos;
+ALTER TABLE pedidos_v2 RENAME TO pedidos;
+`,
+    )
+  })
+  assert.equal(r.codigo, 1, 'una tabla redeclarada con un CHECK ilegible tiene que fallar')
+  assert.match(r.salida, /la ultima declaracion de pedidos esta en 0005_prueba\.sql/)
+}
+
+console.log(`  check-esquema.pruebas: OK (${FRONTERAS.length} fronteras, renombres, comentarios, orden, STRICT, la ultima declaracion y punta a punta)`)

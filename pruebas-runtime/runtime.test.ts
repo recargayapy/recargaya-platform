@@ -1248,34 +1248,49 @@ describe('las reservas, por el metodo publico del DO', () => {
   it('la reserva abandonada se libera sola cuando vence', async ({ task }) => {
     // La segunda mitad: que el handler libere lo vencido y devuelva la plata.
     //
-    // Se invoca `alarm()` directo en vez de esperar a que Cloudflare lo llame, y
-    // no es una comodidad: una reserva ya vencida hace que `reprogramarAlarma`
-    // ponga la alarma para AHORA, y entonces se dispara sola antes de que la
-    // prueba alcance a preguntar por ella. `runDurableObjectAlarm` devolvia
-    // `false` —no porque el mecanismo fallara, sino porque ya habia corrido—.
+    // TODO OCURRE EN UN SOLO TURNO DEL OBJETO, y eso es el arreglo de una prueba
+    // INTERMITENTE que estuvo declarada como deuda desde la entrega 1.2 —un auditor
+    // la vio fallar 2 de ~8 corridas— y que ademas dejaba inutilizable al arnes de
+    // mutacion: sobre un arbol que ya falla, toda mutacion se reporta muerta y el
+    // veredicto no vale nada.
     //
-    // Que Cloudflare invoque `alarm()` a su hora es trabajo de Cloudflare, y las
-    // dos sondas de la plataforma ya lo miden. Lo nuestro es lo que el handler
-    // hace cuando corre.
+    // LA CAUSA, medida: la reserva nace VENCIDA, asi que `reprogramarAlarma` programa
+    // la alarma para AHORA. Entre el `reservar()` y la lectura de `antes` —dos
+    // llamadas RPC, o sea dos turnos del objeto— la alarma alcanza a dispararse,
+    // libera la plata, y `antes` ve cero retenido.
+    //
+    // Adentro de `runInDurableObject` la compuerta de entrada esta tomada: ningun
+    // evento nuevo —incluida la alarma— entra hasta que el bloque termina. Con la
+    // reserva, las dos lecturas y la invocacion de `alarm()` en el MISMO bloque, la
+    // ventana no existe. No es un reintento ni una espera: es la carrera eliminada.
+    //
+    // Se invoca `alarm()` directo en vez de esperar a que Cloudflare lo llame. Que
+    // Cloudflare lo invoque a su hora es trabajo de Cloudflare, y las dos sondas de la
+    // plataforma ya lo miden. Lo nuestro es lo que el handler hace cuando corre.
     const oreja = billetera(task)
     await conSaldo(oreja)
 
-    await oreja.reservar(op('r1'), {
-      reserva_id: 'promo-1',
-      monto: guaranies(50_000),
-      vence_en: new Date(Date.now() - 1000).toISOString(),
+    const { antes, despues } = await runInDurableObject(oreja, async (instancia) => {
+      // El generico no sale del stub: `instancia` llega como `DurableObject` a secas.
+      // Se declara lo que se espera de el, igual que en la prueba de las dos
+      // publicaciones a la vez.
+      const dentro = instancia as unknown as BilleteraDO
+
+      await dentro.reservar(op('r1'), {
+        reserva_id: 'promo-1',
+        monto: guaranies(50_000),
+        vence_en: new Date(Date.now() - 1000).toISOString(),
+      })
+
+      const antes = await dentro.saldo()
+      await dentro.alarm()
+      return { antes, despues: await dentro.saldo() }
     })
 
-    const antes = await oreja.saldo()
     expect(antes.bolsas.filter((b) => b.tipo === 'retenido').reduce((a, b) => a + b.monto, 0)).toBe(
       50_000,
     )
 
-    await runInDurableObject(oreja, async (instancia) => {
-      await instancia.alarm?.()
-    })
-
-    const despues = await oreja.saldo()
     // El retenido volvio a sus bolsas de origen. Nada se perdio.
     expect(despues.bolsas.filter((b) => b.tipo === 'retenido')).toEqual([])
     expect(despues.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(100_000)

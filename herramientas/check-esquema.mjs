@@ -32,9 +32,13 @@
  *
  * La version anterior buscaba `bolsa ... CHECK (bolsa IN (...))` en cualquier
  * lado, y con una sola frontera alcanzaba. Con tres no: la columna `estado`
- * existe en `personas` (activa/suspendida/cerrada) Y en `pedidos`
- * (creado/pagado/repartido/cancelado). Comparar por nombre de columna haria que
- * cada una fallara contra el tipo de la otra.
+ * existe en `personas` Y en `pedidos`, con listas de valores distintas. Comparar por
+ * nombre de columna haria que cada una fallara contra el tipo de la otra.
+ *
+ * (Las listas NO se enumeran acá a proposito. La version anterior las escribia, y con
+ * la 1.3 quedo desactualizada el mismo dia: `pedidos.estado` gano `reservado`. Una
+ * cuarta copia de la lista, adentro de la herramienta que existe para que no haya
+ * copias sin comparar, la encontro la segunda vuelta de auditoria.)
  *
  * Y mirar la tabla tiene su propia trampa, que es la razon por la que hay
  * resolucion de renombres: 0002 crea `ledger_copia_nueva` y despues la renombra a
@@ -65,11 +69,15 @@ const ARCHIVO_ESQUEMA_DO = join(RAIZ, 'src', 'billetera', 'esquema.ts')
  * Las fronteras, declaradas. Cada linea es "este tipo de TypeScript y el CHECK de
  * esta columna de esta tabla dicen lo mismo".
  *
- * `pedidos.estado` NO esta, y es una ausencia deliberada: todavia no existe un
- * tipo de TypeScript que la nombre, porque el flujo de pedidos es de otra
- * entrega. Declarar la frontera hoy la haria fallar contra un tipo inexistente.
- * Cuando `EstadoPedido` se escriba, se agrega la linea acá — y esta frase es el
- * recordatorio de que hay que hacerlo.
+ * `pedidos.estado` ENTRO EN LA ENTREGA 1.3, y vale contar por que estuvo afuera.
+ * La version anterior de este comentario decia que era «una ausencia deliberada:
+ * todavia no existe un tipo de TypeScript que la nombre», y cerraba con «cuando
+ * `EstadoPedido` se escriba, se agrega la linea acá — y esta frase es el
+ * recordatorio de que hay que hacerlo». Se escribio, se agrego.
+ *
+ * Queda contado para que la proxima ausencia se anote igual: una frontera que
+ * falta y esta escrita es deuda; una que falta y no esta escrita es
+ * indistinguible de una que nadie vio.
  */
 export const FRONTERAS = [
   {
@@ -88,6 +96,12 @@ export const FRONTERAS = [
     tipo: 'EstadoPersona',
     archivo: ['src', 'identidad', 'capacidades.ts'],
     tabla: 'personas',
+    columna: 'estado',
+  },
+  {
+    tipo: 'EstadoPedido',
+    archivo: ['src', 'pedidos', 'pedido.ts'],
+    tabla: 'pedidos',
     columna: 'estado',
   },
 ]
@@ -274,6 +288,42 @@ export function checksDeLaFrontera(archivos, leer, tabla, columna) {
 }
 
 /**
+ * TODAS las declaraciones de una tabla, tengan o no un CHECK que se pueda leer.
+ *
+ * ---------------------------------------------------------------------------
+ * EL AGUJERO QUE ESTO CIERRA, medido por la segunda vuelta de auditoria de la 1.3
+ *
+ * `checksDeLaFrontera` devuelve solo las declaraciones cuyo CHECK la expresion regular
+ * SUPO LEER. `laQueGobierna` toma la ultima de ESA lista y la compara. O sea que el
+ * oraculo compara la ultima declaracion LEGIBLE, no la ultima declaracion.
+ *
+ * Con una migracion `0005` que reconstruya `pedidos` escribiendo el CHECK a nivel de
+ * TABLA —SQL perfectamente legitimo, y la forma natural en cuanto el CHECK se vuelve
+ * compuesto—, o con un `DEFAULT` entre la columna y su CHECK, la regex no lo encuentra,
+ * la declaracion nueva no entra a la lista, y el oraculo compara contra la de 0004.
+ * Medido: la base admitia dos estados, `EstadoPedido` declaraba cinco, y el veredicto
+ * salia en VERDE nombrando `0004_pedidos.sql`.
+ *
+ * Es exactamente el defecto que el encabezado de esta herramienta dice haber cerrado
+ * dos veces —«el oraculo aprobando la definicion de una tabla que ya no existe»— con
+ * un tercer disfraz. Por eso el guarda no compara CHECKs: compara ARCHIVOS. Si la
+ * ultima vez que alguien declaro la tabla no es la ultima vez que pudimos leerle el
+ * CHECK, este oraculo se quedo ciego y tiene que decirlo.
+ */
+export function declaracionesDeLaTabla(archivos, leer, tabla) {
+  const salida = []
+  for (const archivo of archivos) {
+    const sql = leer(archivo)
+    const renombres = renombresDeclarados(sql)
+    for (const t of tablasDeclaradas(sql)) {
+      if (nombreFinal(t.tabla, renombres, t.posicion) !== tabla) continue
+      salida.push({ archivo, declarada: t.tabla })
+    }
+  }
+  return salida
+}
+
+/**
  * Los tipos de bolsa que declara el esquema del SQLite del Durable Object.
  *
  * Es la copia mas peligrosa de todas: es la que gobierna la tabla donde NACE el
@@ -350,6 +400,25 @@ function main() {
     // proyecto sostiene sobre migraciones. La declaracion que manda es la ultima,
     // igual que en la base.
     const ultima = laQueGobierna(enSql)
+
+    // Y EL GUARDA QUE FALTABA: que la ultima declaracion LEGIBLE sea la ultima
+    // declaracion. Ver `declaracionesDeLaTabla` para el caso medido.
+    const declaraciones = declaracionesDeLaTabla(migraciones, leer, frontera.tabla)
+    const ultimaDeclaracion = laQueGobierna(declaraciones)
+    if (ultimaDeclaracion !== undefined && ultimaDeclaracion.archivo !== ultima.archivo) {
+      console.error(
+        `\n  check-esquema: la ultima declaracion de ${frontera.tabla} esta en ${ultimaDeclaracion.archivo}`,
+      )
+      console.error(`  y el ultimo CHECK de ${frontera.columna} que se pudo leer esta en ${ultima.archivo}\n`)
+      console.error('  O sea que la definicion que GOBIERNA la tabla tiene su CHECK escrito de una')
+      console.error('  forma que esta herramienta no sabe leer —a nivel de tabla, con un DEFAULT en')
+      console.error('  el medio, en varias lineas— y el oraculo estaria comparando contra una')
+      console.error('  definicion vieja. Un OK asi es peor que un error: dice que se comparo.\n')
+      console.error('  Arreglalo escribiendo el CHECK al lado de la columna, o enseñale la forma')
+      console.error('  nueva a `checkDeColumna` y agregale su prueba.\n')
+      process.exit(1)
+    }
+
     for (const { archivo, declarada, check } of [ultima]) {
       const r = compararEsquemas(tipos, check)
       if (r.ok) continue

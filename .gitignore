@@ -31,3 +31,9 @@ capturas/diff/
 # por si el proceso muere de un Ctrl-C. El patron cubre tambien el nombre sin pid
 # que usaba la version anterior.
 .check-entorno.*temporal.d.ts
+
+# Nota de una corrida de mutacion que murio con un archivo mutado. La escribe
+# `herramientas/mutar.mjs` antes de tocar cada archivo y la borra al restaurarlo;
+# si sobrevive, la proxima corrida restaura desde ahi. Es estado de una corrida, no
+# del proyecto — misma razon que el temporal de check-entorno.
+herramientas/.mutacion-en-vuelo.json

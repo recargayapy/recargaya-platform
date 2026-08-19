@@ -12,65 +12,29 @@
  * decia que «una prueba puede fijar el instante». Una auditoria lo midio.
  */
 
-import { env, SELF, applyD1Migrations, type D1Migration } from 'cloudflare:test'
+import { env, SELF } from 'cloudflare:test'
 import { describe, it, expect, beforeAll } from 'vitest'
-import { emitirToken } from '../src/identidad/actor.js'
 import { derivarBilleteraId } from '../src/identidad/personas.js'
 import { guaranies } from '../src/dinero/monto.js'
 import { atender } from '../src/api/rutas.js'
+import { emitirToken } from '../src/identidad/actor.js'
+/**
+ * El arnes es compartido — ver el encabezado de `arnes.ts`. Estaba copiado palabra
+ * por palabra en este archivo y en el de al lado; la entrega 1.3 traia la tercera
+ * copia, y tres copias de un arnes son la garantia de que un dia dos de ellas
+ * dejan de probar lo mismo.
+ */
+import {
+  SECRETO,
+  aplicarMigraciones,
+  ahora,
+  llamar,
+  personaCon,
+  tokenDePersona,
+  tokenDePlataforma,
+} from './arnes.js'
 
-const SECRETO = (env as unknown as { SECRETO_SERVICIO: string }).SECRETO_SERVICIO
-const MIGRACIONES = (env as unknown as { MIGRACIONES: D1Migration[] }).MIGRACIONES
-
-beforeAll(async () => {
-  expect(Array.isArray(MIGRACIONES)).toBe(true)
-  expect(MIGRACIONES.length).toBeGreaterThan(0)
-  await applyD1Migrations(env.CORE, MIGRACIONES)
-})
-
-const ahora = () => new Date().toISOString()
-
-const tokenDePlataforma = () =>
-  emitirToken(
-    { actor: { tipo: 'plataforma' }, emitido_en: ahora() as never, entorno: env.ENTORNO },
-    SECRETO,
-  )
-
-const tokenDePersona = (persona_id: string) =>
-  emitirToken(
-    { actor: { tipo: 'persona', persona_id }, emitido_en: ahora() as never, entorno: env.ENTORNO },
-    SECRETO,
-  )
-
-interface Opciones {
-  token?: string
-  cuerpo?: unknown
-  correlacion?: string
-}
-
-async function llamar(metodo: string, ruta: string, o: Opciones = {}): Promise<Response> {
-  const encabezados: Record<string, string> = {}
-  if (o.token !== undefined) encabezados['authorization'] = `Bearer ${o.token}`
-  if (o.correlacion !== undefined) encabezados['x-correlacion-id'] = o.correlacion
-  if (o.cuerpo !== undefined) encabezados['content-type'] = 'application/json'
-
-  return SELF.fetch(`https://prueba.test${ruta}`, {
-    method: metodo,
-    headers: encabezados,
-    ...(o.cuerpo === undefined ? {} : { body: JSON.stringify(o.cuerpo) }),
-  })
-}
-
-async function personaCon(id: string, capacidades: readonly string[]): Promise<string> {
-  const token = await tokenDePlataforma()
-  const r = await llamar('POST', '/personas', { token, cuerpo: { persona_id: id } })
-  expect(r.status).toBe(201)
-  for (const capacidad of capacidades) {
-    const c = await llamar('POST', `/personas/${id}/capacidades`, { token, cuerpo: { capacidad } })
-    expect(c.status).toBe(201)
-  }
-  return id
-}
+beforeAll(aplicarMigraciones)
 
 /** Cuantas intenciones de acreditacion quedaron escritas para una persona. */
 async function intenciones(persona_id: string): Promise<number> {

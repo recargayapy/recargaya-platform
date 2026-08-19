@@ -26,6 +26,9 @@ import {
   consumirReserva,
   liberarReserva,
   verificarInvariantes,
+  ReservaNaceVencida,
+  ReservaYaNoEstaAbierta,
+  claveAplicada,
 } from '../src/billetera/nucleo.js'
 
 const AHORA = '2026-08-14T12:00:00.000Z'
@@ -424,5 +427,123 @@ describe('consumirReserva() — el consumo que cruza mas de una bolsa retenida',
     expect(segunda.repetida).toBe(true)
     expect(segunda.valor).toEqual(primera.valor)
     expect(retenidoDe(segunda.estado)).toBe(retenidoDe(primera.estado))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Las dos vueltas de auditoria de la entrega 1.3
+// ---------------------------------------------------------------------------
+
+describe('reservar() no crea una reserva que naceria vencida', () => {
+  it('un vence_en anterior al momento se rechaza', () => {
+    // `acreditar` tiene este guarda desde la 1.2, agregado por una auditoria con este
+    // argumento: plata que entra al ledger, cuenta en los totales, pasa los
+    // invariantes, y es inconsumible para siempre. `reservar` es la OTRA puerta por la
+    // que entra un vencimiento de afuera y no lo tenia — dos de dos, una arreglada,
+    // que es la forma mas facil de creer que se arreglo la categoria.
+    //
+    // Medido en la 1.3: con un `vence_en` en el pasado, `reservar()` contestaba bien y
+    // la alarma devolvia la plata en milisegundos. El llamador se llevaba un 200 con
+    // `estado: reservado` sobre una reserva que ya no existia.
+    expect(() =>
+      reservar(billeteraConDosBolsas(), op('rv-1'), {
+        reserva_id: 'rv-1',
+        monto: guaranies(10_000),
+        vence_en: '2026-08-14T11:59:59.999Z',
+      }),
+    ).toThrow(ReservaNaceVencida)
+  })
+
+  it('un vence_en EXACTAMENTE igual al momento tambien', () => {
+    // El borde, y del lado que corresponde: una reserva que vence en el instante en
+    // que nace no retiene nada durante ningun instante. Es el mismo criterio de borde
+    // que usan las bolsas (`vence_en <= momento` ⇒ vencida) y las capacidades.
+    expect(() =>
+      reservar(billeteraConDosBolsas(), op('rv-2'), {
+        reserva_id: 'rv-2',
+        monto: guaranies(10_000),
+        vence_en: AHORA,
+      }),
+    ).toThrow(ReservaNaceVencida)
+  })
+
+  it('un milisegundo despues, si', () => {
+    // El control. Sin esto, un guarda que rechazara TODO pasaria las dos de arriba.
+    expect(() =>
+      reservar(billeteraConDosBolsas(), op('rv-3'), {
+        reserva_id: 'rv-3',
+        monto: guaranies(10_000),
+        vence_en: '2026-08-14T12:00:00.001Z',
+      }),
+    ).not.toThrow()
+  })
+})
+
+describe('la puerta de idempotencia no dice que la reserva siga viva', () => {
+  it('reintentar una reserva que ya no esta abierta NO contesta que si', () => {
+    // El hallazgo: `puertaDeEntrada` contesta «esto ya se aplico», que no es «esto
+    // sigue vigente». El camino medido: el Worker muere despues de que la billetera
+    // confirmo la reserva y antes de que D1 anote `reservado`; pasan treinta minutos y
+    // la alarma libera la reserva vencida; recien ahi llega el reintento del llamador
+    // con la misma clave. La version anterior contestaba `repetida: true`, el
+    // orquestador anotaba `reservado`, y quedaba un pedido diciendo retener 30.000 Gs.
+    // sobre una billetera que no retiene nada.
+    const conReserva = conReservaAbierta()
+    const liberada = liberarReserva(conReserva, op('lib-1'), { reserva_id: 'r1' }).estado
+
+    expect(() =>
+      reservar(liberada, op('res-1'), {
+        reserva_id: 'r1',
+        monto: guaranies(50_000),
+        vence_en: VENCE_RESERVA,
+      }),
+    ).toThrow(ReservaYaNoEstaAbierta)
+  })
+
+  it('pero el reintento de una reserva que SIGUE abierta contesta repetida', () => {
+    // El control, y es la mitad que importa: el reintento honesto —el que existe para
+    // que un POST cortado se pueda repetir— tiene que seguir funcionando. Un guarda
+    // que tirara siempre pasaria la prueba de arriba y rompería la idempotencia.
+    const r = reservar(conReservaAbierta(), op('res-1'), {
+      reserva_id: 'r1',
+      monto: guaranies(50_000),
+      vence_en: VENCE_RESERVA,
+    })
+    expect(r.repetida).toBe(true)
+    expect(r.valor.reserva_id).toBe('r1')
+    expect(r.asientos).toEqual([])
+  })
+})
+
+describe('cada operacion se acuerda de lo suyo y de nada mas', () => {
+  it('una acreditacion con la clave de una reserva NO se hace pasar por ella', () => {
+    // El hallazgo mas caro de la 1.3, en su forma pura. Hasta entonces la clave era el
+    // `clave_idem` PELADO, o sea que las cinco operaciones compartian un espacio de
+    // nombres, y el `clave_idem` lo elige el llamador.
+    const envenenada = acreditar(billeteraConDosBolsas(), op('pedido:RY-2026-000001:reserva'), {
+      monto: guaranies(1),
+      bolsa: 'disponible',
+      concepto: 'veneno',
+      origen: 'afuera',
+    }).estado
+
+    const r = reservar(envenenada, op('pedido:RY-2026-000001:reserva'), {
+      reserva_id: 'RY-2026-000001',
+      monto: guaranies(50_000),
+      vence_en: VENCE_RESERVA,
+    })
+
+    // La reserva se hizo DE VERDAD: no salio por la puerta con el valor de la
+    // acreditacion.
+    expect(r.repetida).toBe(false)
+    expect(r.asientos.length).toBeGreaterThan(0)
+    expect(r.estado.reservas.get('RY-2026-000001')?.estado).toBe('abierta')
+    verificarInvariantes(r.estado)
+  })
+
+  it('la clave lleva el nombre de la operacion adentro', () => {
+    expect(claveAplicada('acreditar', 'x')).not.toBe(claveAplicada('reservar', 'x'))
+    expect(claveAplicada('reservar', 'x')).not.toBe(claveAplicada('liberar', 'x'))
+    expect(claveAplicada('debitar', 'x')).not.toBe(claveAplicada('consumir', 'x'))
   })
 })

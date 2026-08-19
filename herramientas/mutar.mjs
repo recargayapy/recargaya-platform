@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
+import { anotarEnVuelo, borrarLaNota, restaurarLoQueQuedoDeAntes } from './mutacion-en-vuelo.mjs'
 import {
   ORACULO_NUCLEO,
   ORACULO_RUNTIME,
@@ -526,7 +527,7 @@ const MUTACIONES = [
     // anterior lo dejaba a criterio de cada metodo y `acreditar` no lo hacia.
     invariante: 'toda operacion reprograma la alarma',
     archivo: 'src/index.ts',
-    de: '    const r = this.aplicar(op, reserva_id, operar)\n    await this.reprogramarAlarma()',
+    de: '    const r = this.aplicar(operacion, op, reserva_id, operar)\n    await this.reprogramarAlarma()',
     a: '    const r = this.aplicar(op, reserva_id, operar)',
     oraculo: ORACULO_RUNTIME,
   },
@@ -553,8 +554,8 @@ const MUTACIONES = [
     // pendiente y sin nadie que lo despierte.
     invariante: 'una liberacion que falla no arrastra al publicador',
     archivo: 'src/index.ts',
-    de: '      try {\n        this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n        this.liberacionesFallidas.delete(reserva_id)\n      } catch (e) {',
-    a: '      this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n      this.liberacionesFallidas.delete(reserva_id)\n      try {\n      } catch (e) {',
+    de: "      try {\n        this.aplicar('liberar', op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n        this.liberacionesFallidas.delete(reserva_id)\n      } catch (e) {",
+    a: "      this.aplicar('liberar', op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))\n      this.liberacionesFallidas.delete(reserva_id)\n      try {\n      } catch (e) {",
     oraculo: ORACULO_RUNTIME,
   },
   {
@@ -836,8 +837,8 @@ const MUTACIONES = [
     // orden de dos lineas, y una auditoria midio que nada lo sostenia.
     invariante: 'el momento se revisa aunque la operacion sea repetida',
     archivo: 'src/billetera/nucleo.ts',
-    de: '  instante(op.momento)\n\n  const previo = estado.aplicadas.get(op.clave_idem)\n  if (previo === undefined) return null',
-    a: '  const previo = estado.aplicadas.get(op.clave_idem)\n  if (previo === undefined) {\n    instante(op.momento)\n    return null\n  }',
+    de: '  instante(op.momento)\n\n  const previo = estado.aplicadas.get(claveAplicada(operacion, op.clave_idem))\n  if (previo === undefined) return null',
+    a: '  const previo = estado.aplicadas.get(claveAplicada(operacion, op.clave_idem))\n  if (previo === undefined) {\n    instante(op.momento)\n    return null\n  }',
     oraculo: ORACULO_NUCLEO,
   },
   {
@@ -944,7 +945,7 @@ const MUTACIONES = [
     // tiene que mirar. Las dos lineas de las que cuelga, una por mutacion.
     invariante: 'el DO le pasa al nucleo la reserva que la operacion nombra',
     archivo: 'src/index.ts',
-    de: '    return this.operar(op, entrada.reserva_id, (e) => reservar(e, op, entrada))',
+    de: "    return this.operar('reservar', op, entrada.reserva_id, (e) => reservar(e, op, entrada))",
     a: '    return this.operar(op, undefined, (e) => reservar(e, op, entrada))',
     oraculo: ORACULO_RUNTIME,
   },
@@ -1689,8 +1690,431 @@ const MUTACIONES = [
     a: "    if (im !== null) {",
     oraculo: conNode('herramientas/check-portabilidad.pruebas.mjs'),
   },
+  // -------------------------------------------------------------------------
+  // ENTREGA 1.3 · el pedido
+  // -------------------------------------------------------------------------
+  {
+    // La derivacion del efecto sobre la plata sale de ESTE conjunto. Vaciarlo hace
+    // que ninguna transicion mueva un guarani, y el pedido reservado no reserve.
+    invariante: "el estado `reservado` retiene plata",
+    archivo: "src/pedidos/pedido.ts",
+    de: "export const RETIENEN_PLATA: ReadonlySet<EstadoPedido> = new Set<EstadoPedido>(['reservado'])",
+    a: "export const RETIENEN_PLATA: ReadonlySet<EstadoPedido> = new Set<EstadoPedido>([])",
+  },
+  {
+    // Es la linea que separa «se cobro» de «se devolvio». Con `consumir` siempre, la
+    // cancelacion se lleva la plata del comprador en vez de devolversela.
+    invariante: "salir de una reserva hacia cancelado DEVUELVE, no cobra",
+    archivo: "src/pedidos/pedido.ts",
+    de: "    return hacia === 'cancelado' ? 'liberar' : 'consumir'",
+    a: "    return 'consumir'",
+  },
+  {
+    invariante: "un estado terminal se deriva de no tener salidas",
+    archivo: "src/pedidos/pedido.ts",
+    de: "  return (TRANSICIONES.get(estado) ?? []).length === 0",
+    a: "  return (TRANSICIONES.get(estado) ?? []).length === 99",
+  },
+  {
+    // Precedencia declarada: reintentar una transicion ya aplicada tiene que
+    // distinguirse de un camino inexistente, incluso desde un terminal.
+    invariante: "`mismo_estado` gana sobre `estado_terminal`",
+    archivo: "src/pedidos/pedido.ts",
+    de: "  if (desde === hacia) return no('mismo_estado')\n  if (esTerminal(desde)) return no('estado_terminal')",
+    a: "  if (esTerminal(desde)) return no('estado_terminal')\n  if (desde === hacia) return no('mismo_estado')",
+  },
+  {
+    invariante: "transicionar() tira cuando el camino no existe",
+    archivo: "src/pedidos/pedido.ts",
+    de: "  if (!v.puede) throw new TransicionInvalida(desde, hacia, v.motivo)",
+    a: "  if (false) throw new TransicionInvalida(desde, hacia, v.motivo)",
+  },
+  {
+    // Cancelar un pedido ya cobrado es un asiento de compensacion, no un cambio de
+    // estado. Declarar el camino deja que alguien cancele un pedido cobrado y que el
+    // sistema conteste 200 sin devolver un guarani.
+    invariante: "un pedido pagado NO se cancela",
+    archivo: "src/pedidos/pedido.ts",
+    de: "  ['pagado', ['repartido']],",
+    a: "  ['pagado', ['repartido', 'cancelado']],",
+  },
+  {
+    invariante: "el año del numero de pedido sale de la zona, no de UTC",
+    archivo: "src/dinero/momento.ts",
+    de: "    timeZone: zona,",
+    a: "    timeZone: 'UTC',",
+  },
+  {
+    // El CHECK de la columna y el tipo de TypeScript dicen lo mismo, y el oraculo
+    // del esquema es quien lo compara.
+    invariante: "`reservado` esta en el CHECK de pedidos.estado",
+    archivo: "migraciones/core/0004_pedidos.sql",
+    de: "  estado         TEXT NOT NULL CHECK (estado IN ('creado', 'reservado', 'pagado', 'repartido', 'cancelado')),",
+    a: "  estado         TEXT NOT NULL CHECK (estado IN ('creado', 'pagado', 'repartido', 'cancelado')),",
+    oraculo: conNode('herramientas/check-esquema.mjs'),
+  },
+  {
+    // Es lo unico que impide que un reintento cree un segundo pedido y reserve la
+    // plata dos veces. La comprobacion previa en TypeScript da el mensaje; esto lo
+    // hace imposible.
+    invariante: "la clave_idem del pedido es UNICA del lado de la base",
+    archivo: "migraciones/core/0004_pedidos.sql",
+    de: "CREATE UNIQUE INDEX IF NOT EXISTS idx_pedidos_clave_idem ON pedidos (clave_idem);",
+    a: "CREATE INDEX IF NOT EXISTS idx_pedidos_clave_idem ON pedidos (clave_idem);",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "un pedido repartido o cancelado no vuelve a otro estado",
+    archivo: "migraciones/core/0004_pedidos.sql",
+    de: "WHEN OLD.estado IN ('repartido', 'cancelado') AND NEW.estado <> OLD.estado",
+    a: "WHEN OLD.estado IN ('creado') AND NEW.estado <> OLD.estado",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Sin esto, un `UPDATE` que solo toca `actualizado_en` de un pedido terminal
+    // abortaria. El trigger tiene que mirar el CAMBIO, no la fila.
+    invariante: "el trigger de los terminales mira el cambio de estado, no cualquier UPDATE",
+    archivo: "migraciones/core/0004_pedidos.sql",
+    de: "BEFORE UPDATE OF estado ON pedidos\nWHEN OLD.estado IN ('repartido', 'cancelado') AND NEW.estado <> OLD.estado",
+    a: "BEFORE UPDATE ON pedidos\nWHEN OLD.estado IN ('repartido', 'cancelado')",
+    oraculo: ORACULO_RUNTIME,
+  },
+  // LA MUTACION «reservar y liberar no comparten clave de idempotencia» SE SACO, y
+  // hay que decir por que en vez de borrarla en silencio.
+  //
+  // Existia porque con un solo espacio de nombres, darle a la liberacion la clave de
+  // la reserva hacia que saliera por la puerta de idempotencia como «repetida» y no
+  // soltara un guarani. Desde que la clave lleva el nombre de la operacion adentro
+  // (`claveAplicada`), `reservar\u0001pedido:X:reserva` y `liberar\u0001pedido:X:reserva`
+  // son claves distintas: la colision que esa mutacion vigilaba es ESTRUCTURALMENTE
+  // imposible, y por eso la mutacion sobrevivia — no porque faltara una prueba.
+  //
+  // Los dos nombres siguen siendo distintos por higiene, y eso ya no es un invariante
+  // que se pueda defender con una prueba. La que lo reemplaza es «cada operacion tiene
+  // su propio espacio de claves de idempotencia», mas abajo, que ataca la causa.
+  {
+    invariante: "cancelar un pedido reservado libera la plata",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "    if (!(e instanceof Error) || !e.message.includes(RESERVA_DESCONOCIDA)) throw e",
+    a: "    if (true) throw e",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Dejarla escrita hace que el barrido de reservas vencidas encuentre este pedido
+    // para siempre, y que el read model muestre una retencion que ya no existe.
+    invariante: "al cancelar, reserva_vence_en vuelve a NULL",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "      'UPDATE pedidos SET estado = ?, reserva_vence_en = NULL, actualizado_en = ? WHERE id = ? AND estado = ?',",
+    a: "      'UPDATE pedidos SET estado = ?, reserva_vence_en = reserva_vence_en, actualizado_en = ? WHERE id = ? AND estado = ?',",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // La misma clave con otro contenido no puede devolver el pedido del otro.
+    invariante: "una clave_idem repetida con otro contenido es un 409, no el pedido ajeno",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "    if (ya.comprador_id !== comprador.persona_id || ya.monto !== entrada.monto) {",
+    a: "    if (false) {",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Sin esto, un pedido sin saldo sale como 500 y queda colgado en `creado`, con
+    // un numero ocupado y sin plata.
+    invariante: "el saldo insuficiente se reconoce del otro lado del Durable Object",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "    if (mensaje.includes(SALDO_INSUFICIENTE)) {",
+    a: "    if (false) {",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El reintento tiene que reservar hasta el MISMO instante que el intento
+    // original. Derivado del reloj de cada intento, un llamador que reintenta cada
+    // minuto mantiene la plata retenida para siempre.
+    invariante: "la ventana de reserva se deriva del creado_en del pedido",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "  return instante(new Date(Date.parse(pedido.creado_en) + VENTANA_DE_RESERVA_MS).toISOString())",
+    a: "  return instante(new Date(Date.parse(pedido.creado_en) + 1).toISOString())",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // «El pedido y su renglon de bitacora entran juntos o no entra ninguno.» Con dos
+    // `.run()` sueltos, un INSERT que choca deja el renglon escrito igual.
+    invariante: "el pedido y su bitacora entran en la MISMA transaccion",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "function enUnLote(d1: D1Database, sentencias: D1PreparedStatement[]): Promise<D1Result[]> {\n  return d1.batch(sentencias)\n}",
+    a: "async function enUnLote(d1: D1Database, sentencias: D1PreparedStatement[]): Promise<D1Result[]> {\n  const r: D1Result[] = []\n  for (const s of sentencias) r.push(await s.run())\n  return r\n}",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "un pedido_id sin la forma no llega a la base",
+    archivo: "src/pedidos/numero.ts",
+    de: "export const PEDIDO_VALIDO = /^RY-\\d{4}-\\d{6,12}$/",
+    a: "export const PEDIDO_VALIDO = /^.*$/",
+  },
+  {
+    invariante: "el patron del pedido_id esta anclado",
+    archivo: "src/pedidos/numero.ts",
+    de: "export const PEDIDO_VALIDO = /^RY-\\d{4}-\\d{6,12}$/",
+    a: "export const PEDIDO_VALIDO = /RY-\\d{4}-\\d{6,12}/",
+  },
+  {
+    // El año termina EN EL TEXTO del numero. Sin guarda salen `RY-2026.5-000001` y
+    // `RY--1-000001`, y los dos pasan por la columna porque `pedidos.id` es TEXT.
+    invariante: "la secuencia rechaza un año que no es un año",
+    archivo: "src/pedidos/numero.ts",
+    de: "  if (!Number.isInteger(anio) || anio < ANIO_MINIMO || anio > ANIO_MAXIMO) {",
+    a: "  if (false) {",
+  },
+  {
+    invariante: "el correlativo se rellena a seis digitos",
+    archivo: "src/pedidos/numero.ts",
+    de: "  return `RY-${anio}-${String(correlativo).padStart(ANCHO_DEL_CORRELATIVO, '0')}`",
+    a: "  return `RY-${anio}-${String(correlativo)}`",
+  },
+  {
+    invariante: "el numero de pedido avanza de a uno",
+    archivo: "src/index.ts",
+    de: "    const proximo = actual + 1",
+    a: "    const proximo = actual",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "nadie pide un pedido a nombre de otro",
+    archivo: "src/api/rutas.ts",
+    de: "  exigirPlataformaOElMismo(actor, comprador_id)\n\n  const clave_idem = exigirClaveIdem(cuerpo)",
+    a: "  const clave_idem = exigirClaveIdem(cuerpo)",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "nadie lee ni cancela el pedido ajeno",
+    archivo: "src/api/rutas.ts",
+    de: "    exigirPlataformaOElMismo(actor, pedido.comprador_id)\n    return json({ ...pedidoAJson(pedido), correlacion_id }, 200, correlacion_id)",
+    a: "    return json({ ...pedidoAJson(pedido), correlacion_id }, 200, correlacion_id)",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Ley 4 en el camino de verdad: sin la capacidad de cliente no se pide.
+    invariante: "pedir exige la capacidad de cliente VIGENTE",
+    archivo: "src/api/rutas.ts",
+    de: "  const veredicto = puede(comprador, 'cliente', momento)\n  if (!veredicto.puede) throw new Problema(403, 'no_puede', { motivo: veredicto.motivo })",
+    a: "  const veredicto = puede(comprador, 'cliente', momento)\n  if (false) throw new Problema(403, 'no_puede', { motivo: veredicto.motivo })",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Mutar tambien el arnes. Uno que no puede fallar hace que todo pase: sin el
+    // encabezado, TODAS las llamadas salen 401 y ninguna prueba prueba nada.
+    invariante: "el arnes del runtime manda el token de verdad",
+    archivo: "pruebas-runtime/arnes.ts",
+    de: "  if (o.token !== undefined) encabezados['authorization'] = `Bearer ${o.token}`",
+    a: "  if (false) encabezados['authorization'] = `Bearer ${String(o.token)}`",
+    oraculo: ORACULO_RUNTIME,
+  },
+  // -------------------------------------------------------------------------
+  // ENTREGA 1.3 · lo que arreglaron las dos vueltas de auditoria
+  // -------------------------------------------------------------------------
+  {
+    // El hallazgo mas caro: con el `clave_idem` pelado, las cinco operaciones
+    // compartian un espacio de nombres y una acreditacion podia hacerse pasar por la
+    // reserva de un pedido. Medido de punta a punta, en las dos direcciones.
+    invariante: "cada operacion tiene su propio espacio de claves de idempotencia",
+    archivo: "src/billetera/nucleo.ts",
+    de: "  return `${operacion}\\u0001${clave_idem}`",
+    a: "  return clave_idem",
+  },
+  {
+    // La puerta dice «esto ya se aplico», que NO es «la reserva sigue viva». Sin este
+    // guarda, un reintento posterior al vencimiento anotaba `reservado` sobre una
+    // reserva muerta.
+    invariante: "un reintento no confirma una reserva que ya no esta abierta",
+    archivo: "src/billetera/nucleo.ts",
+    de: "    if (viva === undefined || viva.estado !== 'abierta') {",
+    a: "    if (false) {",
+  },
+  {
+    // `acreditar` tenia este guarda desde la 1.2 y `reservar` no: dos de dos, una
+    // arreglada. La reserva nacia y la alarma la deshacia en milisegundos.
+    invariante: "reservar() no crea una reserva que naceria vencida",
+    archivo: "src/billetera/nucleo.ts",
+    de: "  if (entrada.vence_en <= op.momento) {",
+    a: "  if (false) {",
+  },
+  {
+    // El CHECK `actualizado_en >= creado_en` explotaba DESPUES de que la plata ya se
+    // habia movido: 500 permanente, pedido huerfano y `clave_idem` quemada.
+    invariante: "un cambio se sella con un instante que no es anterior al nacimiento de la fila",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "  return ctx.momento < pedido.actualizado_en ? pedido.actualizado_en : ctx.momento",
+    a: "  return ctx.momento",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Un pedido cuya ventana ya paso no se puede completar. Sin esto contestaba 200
+    // con `estado: reservado` sobre una reserva que la alarma deshacia enseguida.
+    invariante: "una ventana de reserva vencida no se anota como reservada",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "  if (vence_en <= ctx.momento) {",
+    a: "  if (false) {",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El pedido esta muerto: `reserva_id = pedido_id` no se reusa. Sin este bloque
+    // quedaba colgado en `creado` esperando un reintento que no existe.
+    invariante: "un pedido cuya reserva murio se cierra en vez de quedar colgado",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "    if (mensaje.includes(RESERVA_YA_NO_ESTA_ABIERTA) || mensaje.includes(RESERVA_NACE_VENCIDA)) {",
+    a: "    if (false) {",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // `cancelado` es TERMINAL: lo que quede retenido al entrar queda retenido para
+    // siempre. Medido: 45.000 Gs. en un pedido cancelado, sin ningun camino de codigo
+    // que los soltara.
+    invariante: "ir a cancelado SIEMPRE libera, mire lo que mire el estado",
+    archivo: "src/pedidos/pedido.ts",
+    de: "  if (puedeHaberRetencion && !retieneDespues) {",
+    a: "  if (RETIENEN_PLATA.has(desde) && !retieneDespues) {",
+  },
+  {
+    invariante: "el estado `creado` tiene retencion INCIERTA, no cero",
+    archivo: "src/pedidos/pedido.ts",
+    de: "export const RETENCION_INCIERTA: ReadonlySet<EstadoPedido> = new Set<EstadoPedido>(['creado'])",
+    a: "export const RETENCION_INCIERTA: ReadonlySet<EstadoPedido> = new Set<EstadoPedido>([])",
+  },
+  {
+    // «El UPDATE toco una fila» no es lo mismo que «la fila esta asi». Con dos
+    // cancelaciones en el mismo milisegundo, las dos contestaban `cancelado: true`.
+    invariante: "`cancelado` sale de si ESTE UPDATE toco una fila",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "  return { pedido: releido, cancelado: (cambio?.meta?.changes ?? 0) > 0 }",
+    a: "  return { pedido: releido, cancelado: releido.estado === 'cancelado' }",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // La columna `reserva_vence_en` se escribia y no la comparaba contra el reloj
+    // NADIE, con tres comentarios prometiendo el barrido.
+    invariante: "el conciliador busca las ventanas ya vencidas, no las vigentes",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "AND reserva_vence_en IS NOT NULL AND reserva_vence_en <= ?\"",
+    a: "AND reserva_vence_en IS NOT NULL AND reserva_vence_en > ?\"",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "el conciliador solo toca los pedidos que dicen retener plata",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "    \"FROM pedidos WHERE estado = 'reservado' AND reserva_vence_en",
+    a: "    \"FROM pedidos WHERE estado <> 'nada' AND reserva_vence_en",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "el monto de un pedido no se reescribe",
+    archivo: "migraciones/core/0004_pedidos.sql",
+    de: "WHEN NEW.monto <> OLD.monto",
+    a: "WHEN NEW.monto <> OLD.monto AND 0",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "el comprador de un pedido no se reescribe",
+    archivo: "migraciones/core/0004_pedidos.sql",
+    de: "WHEN NEW.comprador_id <> OLD.comprador_id",
+    a: "WHEN NEW.comprador_id <> OLD.comprador_id AND 0",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // Mutar tambien el arnes, segunda parte: si el ayudante que lee las bolsas
+    // devolviera cualquier cosa, todas las mediciones de plata de la 1.3 serian humo.
+    invariante: "el arnes lee las bolsas de la billetera de verdad",
+    archivo: "pruebas-runtime/arnes.ts",
+    de: "  return ((await r.json()) as { bolsas: Bolsa[] }).bolsas",
+    a: "  return []",
+    oraculo: ORACULO_RUNTIME,
+  },
+  // -------------------------------------------------------------------------
+  // ENTREGA 1.3 · lo que arreglo la SEGUNDA vuelta (defectos nacidos de los arreglos)
+  // -------------------------------------------------------------------------
+  {
+    // EL DEFECTO NACIDO DEL ARREGLO: el guarda de «la ventana ya vencio» cancelaba por
+    // un atajo que no le preguntaba nada a la billetera, y `cancelado` es TERMINAL.
+    // Medido: 45.000 Gs. retenidos, sin ninguna ruta que los soltara.
+    invariante: "el pedido con la ventana vencida se cierra SOLTANDO la plata",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "    await cancelarPedido(p, ctx, comprador, pedido, 'ventana_vencida')",
+    a: "    await enUnLote(p.CORE, [p.CORE.prepare('UPDATE pedidos SET estado = ?, actualizado_en = ? WHERE id = ? AND estado = ?').bind('cancelado', selloDe(ctx, pedido), pedido.id, 'creado')])",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El sello comparaba contra `creado_en` y no contra `actualizado_en`, asi que la
+    // columna podia retroceder respecto de su propio valor anterior.
+    invariante: "el sello no deja retroceder a `actualizado_en`",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "  return ctx.momento < pedido.actualizado_en ? pedido.actualizado_en : ctx.momento",
+    a: "  return ctx.momento < pedido.creado_en ? pedido.creado_en : ctx.momento",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // `quedan` era un booleano disfrazado de contador, con el encabezado prometiendo un
+    // conteo. Medido: 57 vencidos, tope 50, la respuesta decia 1.
+    invariante: "`quedan` es un conteo, no un booleano",
+    archivo: "src/pedidos/pedidos.ts",
+    de: "  const quedan = Math.max(0, total - aRevisar.length)",
+    a: "  const quedan = total > aRevisar.length ? 1 : 0",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El texto que cruza la frontera del Durable Object salia de un literal escrito a
+    // mano justo en la unica funcion a la que alguien compara.
+    invariante: "el texto de `reserva desconocida` sale de la constante compartida",
+    archivo: "src/billetera/nucleo.ts",
+    de: "  if (r === undefined) throw new Error(`${RESERVA_DESCONOCIDA}: ${entrada.reserva_id}`)\n  if (r.estado !== 'abierta') {\n    const valor = { devuelto: CERO }",
+    a: "  if (r === undefined) throw new Error(`no conozco esa reserva: ${entrada.reserva_id}`)\n  if (r.estado !== 'abierta') {\n    const valor = { devuelto: CERO }",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "una fila no se puede modificar antes de existir",
+    archivo: "migraciones/core/0004_pedidos.sql",
+    de: "  CHECK (actualizado_en >= creado_en)",
+    a: "  CHECK (actualizado_en >= '0000')",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "el `creado_en` de un pedido lleva la forma de ancho fijo",
+    archivo: "migraciones/core/0004_pedidos.sql",
+    de: "  CHECK (creado_en LIKE '____-__-__T__:__:__.___Z' AND NOT creado_en GLOB '*[^0-9.:TZ-]*'),",
+    a: "  CHECK (creado_en LIKE '%'),",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    invariante: "el numero de pedido no se reescribe",
+    archivo: "migraciones/core/0004_pedidos.sql",
+    de: "WHEN NEW.id <> OLD.id",
+    a: "WHEN NEW.id <> OLD.id AND 0",
+    oraculo: ORACULO_RUNTIME,
+  },
+  {
+    // El oraculo del esquema comparaba la ultima declaracion LEGIBLE, no la ultima
+    // declaracion: con un CHECK escrito a nivel de tabla firmaba en verde contra una
+    // definicion vieja. Tercera vez que esta herramienta tiene el mismo defecto.
+    invariante: "check-esquema exige que la ultima declaracion sea la que comparo",
+    archivo: "herramientas/check-esquema.mjs",
+    de: "    if (ultimaDeclaracion !== undefined && ultimaDeclaracion.archivo !== ultima.archivo) {",
+    a: "    if (false) {",
+    oraculo: conNode('herramientas/check-esquema.pruebas.mjs'),
+  },
+  {
+    // El seguro en disco de la mutacion restauraba SIEMPRE, asi que con una nota vieja
+    // sobreviviente borraba trabajo real en silencio.
+    invariante: "el seguro de la mutacion no pisa un archivo que cambio por otra razon",
+    archivo: "herramientas/mutacion-en-vuelo.mjs",
+    de: "  if (enDisco !== nota.mutado) {",
+    a: "  if (false) {",
+    oraculo: conNode('herramientas/mutacion-en-vuelo.pruebas.mjs'),
+  },
+  {
+    invariante: "el seguro de la mutacion limpia la nota de una corrida ya restaurada",
+    archivo: "herramientas/mutacion-en-vuelo.mjs",
+    de: "  if (enDisco === nota.original) {\n    borrarLaNota()\n    return false\n  }",
+    a: "  if (enDisco === nota.original) {\n    return false\n  }",
+    oraculo: conNode('herramientas/mutacion-en-vuelo.pruebas.mjs'),
+  },
 ]
-
 const ORACULO_POR_DEFECTO = ORACULO_NUCLEO
 
 /**
@@ -1749,6 +2173,15 @@ let muertas = 0
 /** El archivo mutado en este instante, para poder restaurarlo si nos matan. */
 let enVuelo = null
 
+/**
+ * EL MISMO SEGURO, PERO EN DISCO — para lo que una señal no puede atrapar.
+ *
+ * El manejador de `SIGINT`/`SIGTERM` de mas abajo cubre el Ctrl-C. No cubre `SIGKILL`,
+ * ni que se caiga el contenedor, ni que se corte la luz. La nota en disco si, y vive
+ * en `mutacion-en-vuelo.mjs` porque la usa tambien `restaurar-mutacion.mjs`, que es lo
+ * primero que corre `npm run verificar`. El porque de las dos cosas esta entero alla.
+ */
+
 // Un Ctrl-C dejaba el arbol con un invariante roto A PROPOSITO en el codigo del
 // dinero, porque el `finally` no corre con una señal. Y peor: el SIGINT mataba al
 // hijo, `execFileSync` tiraba, la mutacion se contaba como muerta y la corrida
@@ -1758,12 +2191,22 @@ for (const señal of ['SIGINT', 'SIGTERM']) {
   process.on(señal, () => {
     if (enVuelo !== null) {
       writeFileSync(rutaDe(enVuelo.archivo), enVuelo.original)
+      borrarLaNota()
       console.log(`\n\n  ${señal} — restaurado ${enVuelo.archivo}`)
     }
     console.log('  INTERRUMPIDA. El veredicto no vale: no se corrieron todas.\n')
     process.exit(130)
   })
 }
+
+// ANTES de la linea de base, y no despues: si quedo una mutacion de una corrida que
+// murio, el arbol esta en rojo por eso y el mensaje diria «este oraculo ya falla sin
+// mutaciones», que manda a buscar el defecto al lugar equivocado.
+//
+// Y `npm run verificar` la corre ademas en su PRIMER paso —`restaurar-mutacion.mjs`—
+// porque `mutar` es el octavo de ocho: con una mutacion viva, `verificar` muere en el
+// tercero y esta linea no llega a correr nunca. Lo midio la segunda vuelta.
+restaurarLoQueQuedoDeAntes()
 
 comprobarLineaBase()
 const selloInicial = sellar()
@@ -1793,8 +2236,10 @@ for (const m of MUTACIONES) {
     continue
   }
 
+  const mutado = original.replace(m.de, m.a)
   enVuelo = { archivo: m.archivo, original }
-  writeFileSync(rutaDe(m.archivo), original.replace(m.de, m.a))
+  anotarEnVuelo(m.archivo, original, mutado)
+  writeFileSync(rutaDe(m.archivo), mutado)
 
   // El oraculo por defecto es vitest. Algunas mutaciones atacan un lugar que
   // vitest no ve — el CHECK de una migracion SQL, o una herramienta de node
@@ -1816,6 +2261,7 @@ for (const m of MUTACIONES) {
     murio = true // el oraculo fallo: la mutacion murio, que es lo que queremos
   } finally {
     writeFileSync(rutaDe(m.archivo), original)
+    borrarLaNota()
     enVuelo = null
   }
 
