@@ -21,14 +21,20 @@
  *     (el mismo Node que ya corre) o algo que salga de `binarios.mjs`. Un nombre de
  *     comando pelado —`'npx'`, `'npm'`, `'node'`, `'wrangler'`— depende del PATH y
  *     de la extension que use cada sistema.
+ *   · Que todo `import()` de una ruta calculada pase por `pathToFileURL`. En
+ *     Windows una ruta absoluta no es una URL valida —Node lee `C:` como esquema—
+ *     y el import muere con ERR_UNSUPPORTED_ESM_URL_SCHEME. En Linux funciona.
  *   · Que todo `symlinkSync` lleve `'junction'`. Un symlink de directorio necesita
  *     permiso de administrador en Windows y devuelve EPERM sin el; una junction
  *     hace lo mismo sin pedir nada, y en Linux el argumento se ignora.
  *
- * La segunda se agrego DESPUES de la primera, y por el mismo motivo: la version
- * original de este oraculo miraba como se lanzan procesos y no como se crean
- * enlaces. Cubria una parte de la frontera y no la otra — y el defecto que quedaba
- * estaba en el archivo de al lado.
+ * Cada regla se agrego DESPUES de la anterior, y siempre por el mismo motivo: la
+ * version anterior cubria una parte de la frontera y no la otra, y el defecto que
+ * quedaba estaba en el archivo de al lado. La primera miraba como se lanzan
+ * procesos; la segunda, como se crean enlaces; la tercera, como se importa un
+ * modulo por su ruta — y esa la encontro el DUEÑO en su maquina, con la entrega ya
+ * mergeada. Tres veces la misma leccion: cubrir la forma exacta y no la categoria
+ * deja el agujero abierto al lado.
  *
  * QUE NO REVISA, y se dice: los scripts de `package.json`. Ahi `npm` pone
  * `node_modules/.bin` en el PATH y crea los `.cmd` de Windows, asi que
@@ -102,6 +108,23 @@ export function buscarComandosLiterales(texto) {
     // cubria las llamadas y no las declaraciones — media frontera otra vez.
     const o = /\boraculo\s*:\s*\[\s*'([^']+)'/.exec(linea)
     if (o !== null) hallazgos.push({ linea: i + 1, comando: `oraculo: '${o[1]}'` })
+
+    // Y los `import()` de una ruta CALCULADA. Tercera regla, y se agrego por el
+    // mismo motivo que la segunda: la frontera estaba cubierta a medias.
+    //
+    // En Linux `import('/tmp/x/actor.mjs')` funciona. En Windows,
+    // `import('C:\\Users\\...\\actor.mjs')` muere con
+    // ERR_UNSUPPORTED_ESM_URL_SCHEME, porque Node lee `C:` como el esquema de una
+    // URL. Lo encontro el dueño corriendo `npm run token`, no el CI — que es
+    // exactamente lo que este oraculo existe para evitar.
+    //
+    // Un `import` de un literal entrecomillado NO se marca: `import('esbuild')` y
+    // `import('node:fs')` son especificadores de paquete y son portables. Lo que se
+    // marca es importar una VARIABLE, que es siempre una ruta armada.
+    const im = /\bimport\s*\(\s*([A-Za-z_$][\w$.]*)\s*\)/.exec(linea)
+    if (im !== null && !/pathToFileURL/.test(linea)) {
+      hallazgos.push({ linea: i + 1, comando: `import(${im[1]}) sin pathToFileURL` })
+    }
   })
 
   return hallazgos
@@ -125,19 +148,26 @@ function main() {
 
   if (malos.length > 0) {
     console.error('')
-    console.error('  check-portabilidad: UNA HERRAMIENTA LANZA UN COMANDO POR NOMBRE')
+    console.error('  check-portabilidad: UNA HERRAMIENTA NO ES PORTABLE')
     console.error('')
     for (const m of malos) {
       console.error(`    ${CARPETA}/${m.archivo}:${m.linea}  →  '${m.comando}'`)
     }
     console.error('')
-    console.error('  Un nombre pelado depende del PATH y de la extension de cada sistema. En')
-    console.error('  Windows `npx` es `npx.cmd`, y desde Node 20.12 un `.cmd` no se puede')
-    console.error('  lanzar sin `shell: true`: la herramienta anda en Linux, anda en el CI, y')
-    console.error('  muere en la maquina del dueño.')
+    console.error('  Las tres formas terminan igual: anda en Linux, anda en el CI, y muere en')
+    console.error('  la maquina del dueño.')
     console.error('')
-    console.error('  Se arregla con `comando()` de `herramientas/binarios.mjs`, que devuelve')
-    console.error('  siempre [node, archivo, ...args]. Sin shell, sin .cmd, sin PATH.')
+    console.error('  · un COMANDO por nombre depende del PATH y de la extension de cada')
+    console.error('    sistema. En Windows `npx` es `npx.cmd`, y desde Node 20.12 un `.cmd` no')
+    console.error('    se lanza sin `shell: true`. Se arregla con `comando()` de')
+    console.error('    `herramientas/binarios.mjs`, que devuelve siempre [node, archivo, ...].')
+    console.error('')
+    console.error('  · un `symlinkSync` sin `junction` devuelve EPERM en Windows sin permiso')
+    console.error('    de administrador. La junction hace lo mismo y en Linux se ignora.')
+    console.error('')
+    console.error('  · un `import()` de una ruta CALCULADA muere con')
+    console.error('    ERR_UNSUPPORTED_ESM_URL_SCHEME: Windows lee `C:` como el esquema de una')
+    console.error('    URL. Se arregla pasando la ruta por `pathToFileURL(...)`.')
     console.error('')
     process.exit(1)
   }

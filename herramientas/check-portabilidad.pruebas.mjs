@@ -180,4 +180,56 @@ assert.deepEqual(entornoParaOraculo({ PATH: '/x' }), { PATH: '/x' })
   assert.equal(original.GITHUB_ACTIONS, 'true')
 }
 
-console.log('  check-portabilidad.pruebas: OK')
+// --- La TERCERA regla: import() de una ruta calculada ----------------------
+//
+// La encontro el dueño en su maquina, con la entrega ya mergeada:
+// `import('C:\\...\\actor.mjs')` muere con ERR_UNSUPPORTED_ESM_URL_SCHEME porque
+// Node lee `C:` como el esquema de una URL. En Linux la misma linea funciona, asi
+// que ni las pruebas ni el CI la podian ver. Lo unico que puede verla es una regla
+// sobre la FORMA, y eso es esto.
+
+// Se arma en dos pedazos, igual que `ejemplo` y `enlace`: escrito entero, este
+// archivo se acusaria a si mismo — y lo hizo, la primera vez que se escribio.
+const importa = (arg) => `  return await impor${'t'}(${arg})`
+
+assert.deepEqual(buscarComandosLiterales(importa('salida')), [
+  { linea: 1, comando: 'import(salida) sin pathToFileURL' },
+])
+
+// Una propiedad tambien es una ruta calculada.
+assert.deepEqual(buscarComandosLiterales(importa('rutas.salida')), [
+  { linea: 1, comando: 'import(rutas.salida) sin pathToFileURL' },
+])
+
+// Con `pathToFileURL` en la misma linea, no se marca.
+assert.deepEqual(buscarComandosLiterales(importa('urlDelModulo(salida)')), [])
+assert.deepEqual(buscarComandosLiterales(importa('pathToFileURL(x).href')), [])
+
+// Un especificador de paquete NO es una ruta: `esbuild` y `node:fs` son portables
+// y no se tocan. Sin esta distincion, la regla marcaria los `import` de modulos de
+// Node que ya existen en las herramientas y nadie podria dejar el arbol en verde.
+assert.deepEqual(buscarComandosLiterales(importa("'esbuild'")), [])
+assert.deepEqual(buscarComandosLiterales(importa("'node:path'")), [])
+
+// LA URL ARMADA EN LA MISMA LINEA. Es el unico caso donde la guarda de
+// `pathToFileURL` decide algo: acá el argumento del import SI es un identificador
+// pelado —`u`— asi que la expresion regular lo encuentra, y lo que lo salva es que
+// la conversion este a la vista en la misma linea.
+//
+// Sin esta prueba, sacar la guarda SOBREVIVIA a la mutacion: todos los demas casos
+// que no hay que marcar ya los excluye la expresion regular, porque llevan comillas
+// o un parentesis. Lo mostro el arnes, no una idea.
+assert.deepEqual(
+  buscarComandosLiterales(`  const u = pathToFileURL(p).href; ${importa('u').trim()}`),
+  [],
+)
+
+// Y sin la conversion, la misma forma SI se marca.
+assert.deepEqual(buscarComandosLiterales(importa('u')), [
+  { linea: 1, comando: 'import(u) sin pathToFileURL' },
+])
+
+// Y un comentario que la menciona tampoco cuenta.
+assert.deepEqual(buscarComandosLiterales(`// antes decia ${importa('salida')}`), [])
+
+console.log('  check-portabilidad.pruebas: OK (tres reglas)')

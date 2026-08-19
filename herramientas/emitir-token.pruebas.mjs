@@ -16,7 +16,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { buscarSecreto, cargarActor, interpretarArgumentos } from './emitir-token.mjs'
+import { buscarSecreto, cargarActor, interpretarArgumentos, urlDelModulo } from './emitir-token.mjs'
 
 // --- los argumentos --------------------------------------------------------
 
@@ -92,6 +92,23 @@ assert.equal(
   buscarSecreto({ delArgumento: '', delEntorno: '', contenidoDevVars: 'SECRETO_SERVICIO=el-bueno' }),
   'el-bueno',
 )
+
+// --- como se importa un archivo por su ruta absoluta -----------------------
+//
+// SE PRUEBA LA FORMA, NO EL COMPORTAMIENTO, y eso es deliberado: en Linux
+// `import('/tmp/x.mjs')` funciona igual que `import('file:///tmp/x.mjs')`, asi que
+// ninguna prueba que CORRA el import puede distinguir lo correcto de lo roto. En
+// Windows la primera muere con ERR_UNSUPPORTED_ESM_URL_SCHEME — lo encontro el
+// dueño, con la entrega ya mergeada.
+//
+// Lo unico observable desde acá es que la ruta se convierta en una URL `file://`.
+
+assert.ok(urlDelModulo('/tmp/x/actor.mjs').startsWith('file://'))
+assert.ok(urlDelModulo('/tmp/x/actor.mjs').endsWith('/actor.mjs'))
+
+// Un espacio en la ruta se codifica, que es la otra mitad de por que esto no puede
+// ser una concatenacion a mano: `C:\\Users\\Juan Perez\\...` tiene espacios.
+assert.ok(!urlDelModulo('/tmp/con espacio/actor.mjs').includes(' '))
 
 // --- lo que de verdad importa: el token entra por la puerta ---------------
 
