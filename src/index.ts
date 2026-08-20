@@ -14,9 +14,11 @@
 import { DurableObject } from 'cloudflare:workers'
 import {
   type EstadoBilletera,
+  type NombreDeOperacion,
   type Operacion,
   type Resultado,
   acreditar,
+  claveAplicada,
   debitar,
   reservar,
   liberarReserva,
@@ -42,6 +44,7 @@ import { LOTE, PASADAS_MAXIMAS, sentencias } from './billetera/publicador.js'
 import { cuandoDespertar } from './billetera/alarma.js'
 import { guaranies } from './dinero/monto.js'
 import { atender } from './api/rutas.js'
+import { exigirAnio, numeroDePedido } from './pedidos/numero.js'
 
 export interface Entorno {
   readonly ENTORNO: string
@@ -173,18 +176,31 @@ export class BilleteraDO extends DurableObject<Entorno> {
    * el evento que la anuncia, o al reves.
    */
   private aplicar<T>(
+    operacion: NombreDeOperacion,
     op: { clave_idem: string; correlacion_id: string; momento: string },
     reserva_id: string | undefined,
     operar: (estado: EstadoBilletera) => Resultado<T>,
   ): { valor: T; repetida: boolean } {
+    // LA CLAVE CON LA QUE LA BILLETERA SE ACUERDA LLEVA EL NOMBRE DE LA OPERACION.
+    // El porque esta entero en `claveAplicada` (`billetera/nucleo.ts`) y es un
+    // arreglo de la 1.3: con el `clave_idem` pelado, las cinco operaciones
+    // compartian un solo espacio de nombres y una acreditacion podia hacerse pasar
+    // por la reserva de un pedido. Medido de punta a punta.
+    //
+    // Acá se calcula UNA vez y se usa para leer y para escribir. Que este lado y el
+    // del nucleo digan lo mismo no es una promesa: si divergieran, ninguna operacion
+    // volveria a encontrarse a si misma y la prueba «la misma clave de idempotencia
+    // no paga dos veces» muere.
+    const clave = claveAplicada(operacion, op.clave_idem)
+
     return enUnaTransaccion(this.ctx, () => {
-      const estado = cargarEstado(this.sql, this.billeteraId, op.clave_idem, reserva_id)
+      const estado = cargarEstado(this.sql, this.billeteraId, clave, reserva_id)
       const r = operar(estado)
       if (r.repetida) return { valor: r.valor, repetida: true }
 
       verificarDelta(r.asientos)
       verificarInvariantes(r.estado)
-      guardarDelta(this.sql, r.estado, r.asientos, r.eventos, op.clave_idem, r.valor, op.momento)
+      guardarDelta(this.sql, r.estado, r.asientos, r.eventos, clave, r.valor, op.momento)
 
       return { valor: r.valor, repetida: false }
     })
@@ -204,33 +220,34 @@ export class BilleteraDO extends DurableObject<Entorno> {
    * Se arregla la categoria: ya no hay dos caminos que puedan divergir, hay uno.
    */
   private async operar<T>(
+    operacion: NombreDeOperacion,
     op: { clave_idem: string; correlacion_id: string; momento: string },
     reserva_id: string | undefined,
     operar: (estado: EstadoBilletera) => Resultado<T>,
   ): Promise<{ valor: T; repetida: boolean }> {
-    const r = this.aplicar(op, reserva_id, operar)
+    const r = this.aplicar(operacion, op, reserva_id, operar)
     await this.reprogramarAlarma()
     return r
   }
 
   async acreditar(op: Operacion, entrada: Parameters<typeof acreditar>[2]) {
-    return this.operar(op, undefined, (e) => acreditar(e, op, entrada))
+    return this.operar('acreditar', op, undefined, (e) => acreditar(e, op, entrada))
   }
 
   async debitar(op: Operacion, entrada: Parameters<typeof debitar>[2]) {
-    return this.operar(op, undefined, (e) => debitar(e, op, entrada))
+    return this.operar('debitar', op, undefined, (e) => debitar(e, op, entrada))
   }
 
   async reservar(op: Operacion, entrada: Parameters<typeof reservar>[2]) {
-    return this.operar(op, entrada.reserva_id, (e) => reservar(e, op, entrada))
+    return this.operar('reservar', op, entrada.reserva_id, (e) => reservar(e, op, entrada))
   }
 
   async liberarReserva(op: Operacion, entrada: Parameters<typeof liberarReserva>[2]) {
-    return this.operar(op, entrada.reserva_id, (e) => liberarReserva(e, op, entrada))
+    return this.operar('liberar', op, entrada.reserva_id, (e) => liberarReserva(e, op, entrada))
   }
 
   async consumirReserva(op: Operacion, entrada: Parameters<typeof consumirReserva>[2]) {
-    return this.operar(op, entrada.reserva_id, (e) => consumirReserva(e, op, entrada))
+    return this.operar('consumir', op, entrada.reserva_id, (e) => consumirReserva(e, op, entrada))
   }
 
   /**
@@ -453,7 +470,7 @@ export class BilleteraDO extends DurableObject<Entorno> {
       // La transaccion de `aplicar` ya garantiza que la que falla no deja nada a
       // medias. Lo unico que agrega esto es seguir de largo.
       try {
-        this.aplicar(op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))
+        this.aplicar('liberar', op, reserva_id, (e) => liberarReserva(e, op, { reserva_id }))
         this.liberacionesFallidas.delete(reserva_id)
       } catch (e) {
         // Contar el fracaso NO es contabilidad: es lo que hace que la proxima
@@ -497,16 +514,82 @@ export class BilleteraDO extends DurableObject<Entorno> {
 }
 
 /**
- * Un contador monotono necesita un solo escritor. Uno por ano.
- * Formato: RY-2026-000001.
+ * El numero de pedido. Un contador monotono necesita UN SOLO ESCRITOR, y eso es
+ * exactamente lo que un Durable Object es.
+ *
+ * Estuvo declarado desde la Fase 0 sin nadie que lo llamara. La entrega 1.3 lo
+ * cablea de verdad, asi que lo que era un esqueleto de tres lineas se escribe
+ * entero — incluido lo que cuesta.
+ *
+ * ---------------------------------------------------------------------------
+ * EL CUELLO DE BOTELLA, DECLARADO
+ *
+ * Todos los pedidos de un año pasan por UN objeto, uno detras de otro. Eso no es
+ * un efecto secundario: es el mecanismo. Un numero correlativo sin huecos ni
+ * repetidos no se puede sacar de una base distribuida sin un punto de
+ * serializacion, y el punto de serializacion es esto.
+ *
+ * El techo practico de un Durable Object para una operacion de un solo `put` esta
+ * en el orden de cientos por segundo. Cuando la plataforma se acerque a eso, la
+ * salida NO es paralelizar este objeto —dejaria de ser correlativo— sino cambiar
+ * la forma del numero: por sucursal, por dia, o un identificador opaco con un
+ * correlativo aparte para lo que de verdad lo necesita. Queda escrito acá para que
+ * el dia que aparezca la lentitud, la discusion arranque de la decision y no del
+ * sintoma.
+ *
+ * ---------------------------------------------------------------------------
+ * UN OBJETO POR AÑO, y por que la clave igual lleva el año adentro
+ *
+ * Se enruta con `nombreDeLaSecuencia(anio)`, o sea `idFromName('secuencia:2026')`:
+ * un objeto distinto por año, para que el primero de enero los pedidos nuevos no
+ * hagan cola detras de nada y para que el objeto de un año cerrado deje de
+ * despertarse.
+ *
+ * Y la clave de adentro sigue siendo `n:<anio>`, que con un objeto por año parece
+ * redundante. No lo es: es lo que hace que un ruteo equivocado —alguien pidiendo el
+ * numero de 2027 al objeto de 2026— devuelva el correlativo de 2027 igual, en vez
+ * de devolver el de 2026 con la etiqueta de 2027. La redundancia cuesta cero bytes
+ * y convierte un defecto silencioso en ninguno.
+ *
+ * ---------------------------------------------------------------------------
+ * LOS HUECOS EXISTEN Y ESTAN ACEPTADOS
+ *
+ * El numero se entrega ANTES de que el pedido termine de nacer. Si la creacion
+ * falla despues, ese numero no se reusa: queda un hueco en la numeracion.
+ *
+ * Es una decision tomada con el dueño el 18/08/2026. La alternativa —devolver el
+ * numero al contador— pide una transaccion que abarque este objeto y D1, que no
+ * existe; y la otra alternativa —numerar despues de crear— deja al pedido sin
+ * identidad justo mientras se lo esta escribiendo. Un hueco en la numeracion no
+ * pierde plata ni confunde a nadie. Dos pedidos con el mismo numero, si.
  */
 export class SecuenciaDO extends DurableObject<Entorno> {
   async siguiente(anio: number): Promise<string> {
+    // El año entra de afuera y termina EN EL TEXTO del numero. La regla es PURA y
+    // vive en `pedidos/numero.ts`: acá se la llama. Que no viva adentro de este
+    // metodo tiene un motivo medido — ver el encabezado de ese archivo.
+    //
+    // ESTA LLAMADA ES REDUNDANTE Y ASI TIENE QUE SER: `numeroDePedido` valida lo
+    // mismo tres lineas mas abajo. La diferencia es el ORDEN — acá se valida ANTES
+    // de escribir en el almacenamiento, asi que un año invalido no deja consumido un
+    // numero de un contador inventado (`n:2026.5`) que despues nadie va a mirar. Por
+    // eso no hay una mutacion que la saque: sacarla no cambia el resultado de ninguna
+    // llamada, solo la basura que queda. Queda dicho para que nadie la borre «porque
+    // esta repetida».
+    exigirAnio(anio)
+
     const clave = `n:${anio}`
     const actual = (await this.ctx.storage.get<number>(clave)) ?? 0
     const proximo = actual + 1
+
+    // El `put` va ANTES del `return`, y con `await`. Es lo unico que impide que dos
+    // llamadas seguidas reciban el mismo numero: hasta que el almacenamiento no
+    // confirmo, el numero no salio.
     await this.ctx.storage.put(clave, proximo)
-    return `RY-${anio}-${String(proximo).padStart(6, '0')}`
+
+    // La forma la arma un solo lugar. Ver `pedidos/numero.ts` para el ancho y para
+    // que pasa despues del pedido un millon de un año.
+    return numeroDePedido(anio, proximo)
   }
 }
 

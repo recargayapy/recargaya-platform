@@ -129,3 +129,63 @@ export function instanteOpcional(valor: unknown): Instante | null {
   if (valor === null || valor === undefined) return null
   return instante(valor)
 }
+
+/**
+ * EL AÑO CALENDARIO EN UNA ZONA HORARIA. La unica salida de este archivo que no
+ * es UTC, y esta acá justamente para que sea la unica.
+ *
+ * ---------------------------------------------------------------------------
+ * POR QUE EXISTE
+ *
+ * El numero de pedido es `RY-<año>-<seis digitos>` y lo lee una persona. Un pedido
+ * hecho el 31 de diciembre a las 23:30 en Asuncion tiene que decir 2026, y en UTC
+ * ese instante ya es `2027-01-01T02:30:00.000Z`.
+ *
+ * O sea: si el año saliera de `momento.slice(0, 4)` —que es lo primero que uno
+ * escribe, y funciona perfecto los 364 dias que no importan— durante tres horas
+ * cada 31 de diciembre los pedidos saldrian numerados con el año siguiente. No
+ * falla nada: quedan numerados mal, en una columna que despues alguien usa para
+ * facturar.
+ *
+ * El proyecto ya declaro las dos mitades de esta decision —«Almacenamiento: UTC.
+ * Presentacion: America/Asuncion»— y el numero de pedido es PRESENTACION que se
+ * guarda. Es el unico caso asi que hay hoy, y por eso la conversion vive en una
+ * funcion con nombre en vez de repartida.
+ *
+ * ---------------------------------------------------------------------------
+ * POR QUE `Intl` Y NO RESTARLE TRES HORAS
+ *
+ * Paraguay no tiene horario de verano desde 2024 y esta fijo en UTC−03:00. Restar
+ * tres horas daria hoy el mismo resultado y seria una bomba de tiempo: el dia que
+ * el huso cambie —ya cambio una vez— el offset queda escrito en nuestro codigo y
+ * nadie lo va a ir a buscar ahi. `Intl` usa la base de datos de husos del runtime,
+ * que es la que se actualiza sola.
+ *
+ * La zona entra por PARAMETRO y sale de `entorno.ZONA_HORARIA`, que ya existe en
+ * `wrangler.jsonc` desde la Fase 0. Una zona invalida hace que `Intl` tire
+ * `RangeError`, y eso es lo correcto: un despliegue mal configurado tiene que
+ * romper ruidosamente y no numerar pedidos con el año equivocado en silencio.
+ *
+ * Se devuelve un NUMERO y no el texto de cuatro digitos a proposito: quien lo use
+ * para formatear tiene que decidir el ancho, y quien lo use para comparar no tiene
+ * que parsear nada.
+ */
+export function anioEnZona(momento: Instante, zona: string): number {
+  // `formatToParts` y no `format`: el formato corto de un año depende del
+  // calendario y del locale, y `'en-CA'`/`'en-US'` no prometen lo mismo. La parte
+  // `year` si esta definida. `numberingSystem: 'latn'` fuerza digitos arabigos —
+  // sin eso, un runtime con otro default puede devolver `'٢٠٢٦'`, que `Number()`
+  // convierte igual pero que nadie quiere descubrir en produccion.
+  const partes = new Intl.DateTimeFormat('en-US', {
+    timeZone: zona,
+    year: 'numeric',
+    numberingSystem: 'latn',
+  }).formatToParts(new Date(momento))
+
+  const anio = partes.find((p) => p.type === 'year')?.value
+  if (anio === undefined) throw new Error(`no se pudo obtener el año de ${momento} en ${zona}`)
+
+  const n = Number(anio)
+  if (!Number.isInteger(n)) throw new Error(`año no entero para ${momento} en ${zona}: ${anio}`)
+  return n
+}

@@ -150,20 +150,97 @@ export interface Resultado<T> {
  * Revisa incluso cuando la operacion resulta repetida: un `momento` mal escrito
  * es un error del llamador aunque esta vez no se escriba nada.
  */
-function puertaDeEntrada<T>(estado: EstadoBilletera, op: Operacion): Resultado<T> | null {
+/**
+ * Las cinco operaciones que mueven plata, nombradas.
+ *
+ * El nombre no es decorativo: forma parte de la CLAVE de idempotencia. Ver
+ * `claveAplicada`.
+ */
+export type NombreDeOperacion = 'acreditar' | 'debitar' | 'reservar' | 'consumir' | 'liberar'
+
+/**
+ * LA CLAVE CON LA QUE LA BILLETERA SE ACUERDA DE UNA OPERACION.
+ *
+ * ---------------------------------------------------------------------------
+ * EL DEFECTO QUE ESTO CIERRA, medido por las dos vueltas de auditoria de la 1.3
+ *
+ * Hasta la 1.3 la clave era el `clave_idem` PELADO, o sea que las cinco
+ * operaciones compartian un solo espacio de nombres. Y el `clave_idem` lo elige
+ * el llamador, con un alfabeto que acepta `:` y `-`.
+ *
+ * La 1.3 agrego claves DERIVADAS —`pedido:<id>:reserva` y `pedido:<id>:liberacion`,
+ * ver `pedidos/pedidos.ts`— y el numero de pedido es correlativo, o sea predecible.
+ * Con un solo espacio de nombres, eso se envenena de las dos direcciones, y las dos
+ * se midieron de punta a punta sobre workerd:
+ *
+ *   · Alguien acredita 1 Gs. con `clave_idem = "pedido:RY-2026-000002:reserva"`.
+ *     El pedido siguiente «reserva» por la puerta de idempotencia: contesta 201,
+ *     `estado: reservado`, y NO retiene un guarani. El comprador se gasta la plata
+ *     que el pedido dice tener. Medido: 50.000 Gs.
+ *   · Al reves: despues de que un pedido reservo, una acreditacion de 500.000 Gs.
+ *     con esa misma clave sale 200 con `repetida: true` y NO entra al ledger.
+ *     Medido: la respuesta ni siquiera trae `saldo_retirable`, porque el valor
+ *     guardado era el de `reservar` (`{reserva_id}`).
+ *
+ * No hace falta un atacante: el propio comentario de `CLAVE_IDEM_VALIDA` sugiere
+ * claves de la forma `carga:<pedido>:<paso>`, y las pruebas de esta entrega mandan
+ * `pedido:ped-1:1`. Alcanza con un integrador ordenado.
+ *
+ * ---------------------------------------------------------------------------
+ * POR QUE EL NOMBRE DE LA OPERACION Y NO UN PREFIJO EN LA PUERTA
+ *
+ * Se podia prefijar en `api/rutas.ts` lo que trae el llamador (`ext:<clave>`) y
+ * listo. Eso cierra el caso y deja la categoria abierta: `acreditar` y `debitar`
+ * seguirian compartiendo espacio, y la sexta operacion tambien.
+ *
+ * La idempotencia identifica LA INTENCION —lo dice el encabezado de
+ * `puertaDeEntrada` desde la Fase 0— y «acreditar 500.000» y «reservar para el
+ * pedido X» son dos intenciones distintas. El nombre de la operacion es parte de
+ * la intencion, asi que es parte de la clave. Entra por parametro obligatorio para
+ * que la sexta operacion no se lo pueda olvidar.
+ *
+ * El separador es `\u0001`, que `CLAVE_IDEM_VALIDA` no acepta: asi ninguna clave
+ * de afuera puede fabricar el prefijo de otra operacion.
+ *
+ * ---------------------------------------------------------------------------
+ * QUE PASA CON LO YA ESCRITO, dicho
+ *
+ * Las filas de `aplicadas` que existan en billeteras ya desplegadas quedan con la
+ * clave vieja y dejan de encontrarse. O sea: una operacion cortada JUSTO durante el
+ * despliegue, reintentada despues, se aplica de nuevo. `core-produccion` esta vacia
+ * y `core-staging` no tiene plata real, asi que hoy la ventana es teorica — pero es
+ * la clase de cosa que hay que decir antes y no despues.
+ *
+ * `asiento_id` NO cambia: lo sigue armando `asentar()` con `op.clave_idem` pelado,
+ * asi que las claves primarias de `ledger_copia` quedan donde estaban.
+ */
+export function claveAplicada(operacion: NombreDeOperacion, clave_idem: string): string {
+  return `${operacion}\u0001${clave_idem}`
+}
+
+function puertaDeEntrada<T>(
+  estado: EstadoBilletera,
+  op: Operacion,
+  operacion: NombreDeOperacion,
+): Resultado<T> | null {
   // El instante ordena plata: `decidirConsumo` compara `vence_en <= momento` como
   // TEXTO. Con un huso distinto de `Z`, ese `<=` deja de coincidir con el reloj y
   // una bolsa vencida se consume, o una vigente se descarta. Ver `dinero/momento.ts`.
   instante(op.momento)
 
-  const previo = estado.aplicadas.get(op.clave_idem)
+  const previo = estado.aplicadas.get(claveAplicada(operacion, op.clave_idem))
   if (previo === undefined) return null
   return { estado, asientos: [], eventos: [], valor: JSON.parse(previo) as T, repetida: true }
 }
 
-function marcarAplicada<T>(estado: EstadoBilletera, op: Operacion, valor: T): ReadonlyMap<string, string> {
+function marcarAplicada<T>(
+  estado: EstadoBilletera,
+  op: Operacion,
+  valor: T,
+  operacion: NombreDeOperacion,
+): ReadonlyMap<string, string> {
   const m = new Map(estado.aplicadas)
-  m.set(op.clave_idem, JSON.stringify(valor))
+  m.set(claveAplicada(operacion, op.clave_idem), JSON.stringify(valor))
   return m
 }
 
@@ -211,7 +288,7 @@ export function acreditar(
     readonly restringida_a?: string | null
   },
 ): Resultado<{ saldo_retirable: Guaranies }> {
-  const previo = puertaDeEntrada<{ saldo_retirable: Guaranies }>(estado, op)
+  const previo = puertaDeEntrada<{ saldo_retirable: Guaranies }>(estado, op, 'acreditar')
   if (previo !== null) return previo
 
   if (entrada.monto <= 0) throw new Error('acreditar exige un monto positivo')
@@ -250,7 +327,7 @@ export function acreditar(
       ...estado,
       bolsas,
       totales: acumular(estado.totales, asientos),
-      aplicadas: marcarAplicada(estado, op, valor),
+      aplicadas: marcarAplicada(estado, op, valor, 'acreditar'),
     },
     asientos,
     eventos: [
@@ -271,9 +348,58 @@ export function acreditar(
 // Debitar
 // ---------------------------------------------------------------------------
 
+/**
+ * El texto con el que empieza el mensaje, exportado. NO es cosmetica.
+ *
+ * Un llamador que esta del otro lado de una frontera de Durable Object no recibe la
+ * clase: el RPC de workerd serializa el error, asi que `instanceof SaldoInsuficiente`
+ * es siempre falso ahi. Lo unico que cruza es el texto, y `pedidos/pedidos.ts` lo
+ * necesita para distinguir «no hay plata» —que es un 409 con explicacion, y ademas
+ * cancela el pedido— de «se rompio algo» —que es un 500.
+ *
+ * Con la constante exportada, el que compara y el que escribe salen del mismo lugar.
+ * Sin ella serian dos literales en dos archivos, y el dia que alguien reescriba este
+ * mensaje «para que se entienda mejor», un pedido sin saldo pasa a salir como fallo
+ * interno y a quedar colgado en `creado`.
+ */
+export const SALDO_INSUFICIENTE = 'saldo insuficiente'
+
+/**
+ * Los textos que cruzan la frontera del Durable Object, exportados.
+ *
+ * Mismo motivo que `SALDO_INSUFICIENTE`: el RPC de workerd serializa el error, asi
+ * que del otro lado `instanceof` es siempre falso y lo unico que llega es el
+ * mensaje. Quien tenga que distinguir estos casos —`pedidos/pedidos.ts`— compara
+ * contra estas constantes, no contra un literal propio.
+ */
+export const RESERVA_DESCONOCIDA = 'reserva desconocida'
+export const RESERVA_YA_NO_ESTA_ABIERTA = 'la reserva ya no esta abierta'
+export const RESERVA_NACE_VENCIDA = 'la reserva naceria vencida'
+
+export class ReservaYaNoEstaAbierta extends Error {
+  constructor(
+    readonly reserva_id: string,
+    readonly estadoDeLaReserva: string,
+  ) {
+    super(`${RESERVA_YA_NO_ESTA_ABIERTA}: ${reserva_id} quedo ${estadoDeLaReserva}`)
+    this.name = 'ReservaYaNoEstaAbierta'
+  }
+}
+
+export class ReservaNaceVencida extends Error {
+  constructor(
+    readonly reserva_id: string,
+    readonly vence_en: string,
+    readonly momento: string,
+  ) {
+    super(`${RESERVA_NACE_VENCIDA}: ${reserva_id} vence ${vence_en} y ya son las ${momento}`)
+    this.name = 'ReservaNaceVencida'
+  }
+}
+
 export class SaldoInsuficiente extends Error {
   constructor(readonly faltante: Guaranies) {
-    super(`saldo insuficiente: faltan ${faltante}`)
+    super(`${SALDO_INSUFICIENTE}: faltan ${faltante}`)
     this.name = 'SaldoInsuficiente'
   }
 }
@@ -302,7 +428,7 @@ export function debitar(
     readonly omitirDisponible?: boolean
   },
 ): Resultado<{ tomas: readonly Toma[]; faltante: Guaranies }> {
-  const previo = puertaDeEntrada<{ tomas: readonly Toma[]; faltante: Guaranies }>(estado, op)
+  const previo = puertaDeEntrada<{ tomas: readonly Toma[]; faltante: Guaranies }>(estado, op, 'debitar')
   if (previo !== null) return previo
 
   if (entrada.monto <= 0) throw new Error('debitar exige un monto positivo')
@@ -326,7 +452,7 @@ export function debitar(
       ...estado,
       bolsas,
       totales: acumular(estado.totales, asientos),
-      aplicadas: marcarAplicada(estado, op, valor),
+      aplicadas: marcarAplicada(estado, op, valor, 'debitar'),
     },
     asientos,
     eventos: [
@@ -351,8 +477,28 @@ export function reservar(
   op: Operacion,
   entrada: { readonly reserva_id: string; readonly monto: Guaranies; readonly vence_en: string },
 ): Resultado<{ reserva_id: string }> {
-  const previo = puertaDeEntrada<{ reserva_id: string }>(estado, op)
-  if (previo !== null) return previo
+  const previo = puertaDeEntrada<{ reserva_id: string }>(estado, op, 'reservar')
+  if (previo !== null) {
+    // LA PUERTA DICE «ESTO YA SE APLICO». NO DICE «LA RESERVA SIGUE VIVA», y la
+    // diferencia es plata. Lo midio la primera vuelta de auditoria de la 1.3:
+    //
+    // el Worker muere despues de que la billetera confirmo la reserva y antes de que
+    // D1 anote `reservado`. Pasan treinta minutos, la alarma libera la reserva
+    // vencida y devuelve la plata. Recien ahi llega el reintento del llamador con la
+    // misma clave: la puerta contesta `repetida: true`, el orquestador anota
+    // `reservado` en D1, y queda un pedido que dice retener 30.000 Gs. sobre una
+    // billetera que no retiene nada. El dia que ese pedido se cobre,
+    // `consumirReserva` va a contestar «la reserva no esta abierta» con la
+    // mercaderia ya entregada.
+    //
+    // `cargarReservas` trae SIEMPRE la reserva nombrada, aunque este cerrada,
+    // justamente para que esta linea pueda verla.
+    const viva = estado.reservas.get(entrada.reserva_id)
+    if (viva === undefined || viva.estado !== 'abierta') {
+      throw new ReservaYaNoEstaAbierta(entrada.reserva_id, viva?.estado ?? 'inexistente')
+    }
+    return previo
+  }
 
   // UN reserva_id se usa UNA vez. No «una vez a la vez»: una vez y nunca mas.
   //
@@ -379,8 +525,22 @@ export function reservar(
   // siempre la reserva nombrada aunque este cerrada justamente para que esta
   // linea pueda verla. Un llamador que necesite reservar de nuevo usa un id
   // nuevo — que es lo que tiene que hacer, porque es otra reserva.
-  // El otro lugar por el que entra un vencimiento de afuera.
+  // El otro lugar por el que entra un vencimiento de afuera — y desde la 1.3 con el
+  // MISMO guarda que la otra puerta, no solo con la comprobacion de forma.
+  //
+  // `acreditar` tiene desde la 1.2 el rechazo `vence_en_ya_vencido`, agregado por una
+  // auditoria con este argumento: plata que entra al ledger, cuenta en los totales,
+  // pasa los invariantes, y es inconsumible para siempre. `reservar` era la otra
+  // puerta por la que entra un vencimiento y no lo tenia — dos de dos, una arreglada,
+  // que es la forma mas facil de creer que se arreglo la categoria.
+  //
+  // Medido en la 1.3: con un `vence_en` en el pasado, `reservar()` contestaba bien y
+  // la alarma devolvia la plata en milisegundos. El llamador recibia 200 con
+  // `estado: reservado` sobre una reserva que ya no existia.
   instante(entrada.vence_en)
+  if (entrada.vence_en <= op.momento) {
+    throw new ReservaNaceVencida(entrada.reserva_id, entrada.vence_en, op.momento)
+  }
 
   if (estado.reservas.has(entrada.reserva_id)) {
     const previa = estado.reservas.get(entrada.reserva_id)
@@ -429,7 +589,7 @@ export function reservar(
       bolsas,
       totales: acumular(estado.totales, asientos),
       reservas,
-      aplicadas: marcarAplicada(estado, op, valor),
+      aplicadas: marcarAplicada(estado, op, valor, 'reservar'),
     },
     asientos,
     eventos: [
@@ -468,13 +628,15 @@ export function consumirReserva(
   op: Operacion,
   entrada: { readonly reserva_id: string; readonly monto: Guaranies },
 ): Resultado<{ consumido: Guaranies; disponible: Guaranies }> {
-  const previo = puertaDeEntrada<{ consumido: Guaranies; disponible: Guaranies }>(estado, op)
+  const previo = puertaDeEntrada<{ consumido: Guaranies; disponible: Guaranies }>(estado, op, 'consumir')
   if (previo !== null) return previo
 
   if (entrada.monto <= 0) throw new Error('consumirReserva exige un monto positivo')
 
   const r = estado.reservas.get(entrada.reserva_id)
-  if (r === undefined) throw new Error(`reserva desconocida: ${entrada.reserva_id}`)
+  // El texto sale de una constante exportada porque lo compara `pedidos/pedidos.ts`
+  // del otro lado de la frontera del Durable Object, donde `instanceof` no vale.
+  if (r === undefined) throw new Error(`${RESERVA_DESCONOCIDA}: ${entrada.reserva_id}`)
   if (r.estado !== 'abierta') {
     throw new Error(`la reserva ${entrada.reserva_id} no esta abierta: ${r.estado}`)
   }
@@ -531,7 +693,7 @@ export function consumirReserva(
       bolsas,
       totales: acumular(estado.totales, asientos),
       reservas,
-      aplicadas: marcarAplicada(estado, op, valor),
+      aplicadas: marcarAplicada(estado, op, valor, 'consumir'),
     },
     asientos,
     eventos: [
@@ -557,11 +719,20 @@ export function liberarReserva(
   op: Operacion,
   entrada: { readonly reserva_id: string },
 ): Resultado<{ devuelto: Guaranies }> {
-  const previo = puertaDeEntrada<{ devuelto: Guaranies }>(estado, op)
+  const previo = puertaDeEntrada<{ devuelto: Guaranies }>(estado, op, 'liberar')
   if (previo !== null) return previo
 
   const r = estado.reservas.get(entrada.reserva_id)
-  if (r === undefined) throw new Error(`reserva desconocida: ${entrada.reserva_id}`)
+  // La constante, y no el literal. Es el UNICO texto de error que alguien compara del
+  // otro lado de la frontera del Durable Object (`cancelarPedido` lo tolera para poder
+  // pedir «solta lo que haya» a ciegas), y la primera version lo tenia escrito a mano
+  // acá mientras `consumirReserva` —a la que nadie compara— usaba la constante. Dos de
+  // dos, la que no importaba arreglada: lo midio la segunda vuelta.
+  //
+  // Si este texto y el de `pedidos.ts` divergen, cancelar cualquier pedido que nunca
+  // reservo pasa a ser un 500, y como `cancelarPedido` es el unico camino del
+  // conciliador, el barrido de vencidos se cae entero.
+  if (r === undefined) throw new Error(`${RESERVA_DESCONOCIDA}: ${entrada.reserva_id}`)
   if (r.estado !== 'abierta') {
     const valor = { devuelto: CERO }
     return { estado, asientos: [], eventos: [], valor, repetida: true }
@@ -604,7 +775,7 @@ export function liberarReserva(
       bolsas,
       totales: acumular(estado.totales, asientos),
       reservas,
-      aplicadas: marcarAplicada(estado, op, valor),
+      aplicadas: marcarAplicada(estado, op, valor, 'liberar'),
     },
     asientos,
     eventos: [

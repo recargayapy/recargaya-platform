@@ -235,8 +235,15 @@ export const ESQUEMA: readonly string[] = [
   // -------------------------------------------------------------------------
   // Idempotencia
   // -------------------------------------------------------------------------
-  // La clave identifica la INTENCION, no el momento: `{pedido_id}:{paso}`. Esta
-  // tabla solo se acuerda de haberla visto y de que devolvio.
+  // La clave identifica la INTENCION, no el momento. Desde la entrega 1.3 lleva el
+  // NOMBRE DE LA OPERACION adelante, separado por un `\u0001`: la fila dice
+  // `reservar\u0001pedido:RY-2026-000001:reserva` y no `pedido:RY-2026-000001:reserva`.
+  // Quien abra esta tabla con `wrangler d1 execute` va a ver un caracter de control y
+  // tiene que saber que es eso y no una base corrupta. El porque esta entero en
+  // `claveAplicada`, en `billetera/nucleo.ts`. La columna se sigue llamando
+  // `clave_idem` porque renombrarla pediria reconstruir la tabla adentro de cada
+  // Durable Object desplegado, y SQLite no tiene `ADD COLUMN IF NOT EXISTS`.
+  // La tabla solo se acuerda de haber visto la clave y de que devolvio.
   `CREATE TABLE IF NOT EXISTS aplicadas (
     clave_idem  TEXT PRIMARY KEY,
     valor       TEXT NOT NULL,

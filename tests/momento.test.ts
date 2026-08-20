@@ -12,7 +12,7 @@
  * que las dos formas ordenaban igual. No ordenan igual. Hoy hay UNA forma.
  */
 import { describe, it, expect } from 'vitest'
-import { InstanteInvalido, instante, instanteOpcional } from '../src/dinero/momento.js'
+import { InstanteInvalido, anioEnZona, instante, instanteOpcional } from '../src/dinero/momento.js'
 import {
   billeteraVacia,
   acreditar,
@@ -175,5 +175,56 @@ describe('la puerta: ninguna operacion entra con un instante mal escrito', () =>
     expect(conSaldo.bolsas.reduce((a, b) => a + b.monto, 0)).toBe(10_000)
     expect(conSaldo.reservas.size).toBe(0)
     expect(() => verificarInvariantes(conSaldo)).not.toThrow()
+  })
+})
+
+/**
+ * El año en una zona horaria. La unica salida de `momento.ts` que no es UTC, y la
+ * que decide el año del numero de pedido.
+ *
+ * Estas pruebas MIDEN el borde, que es lo unico que importa acá: los 364 dias del
+ * año en que las dos respuestas coinciden no prueban nada.
+ */
+describe('anioEnZona()', () => {
+  const ASUNCION = 'America/Asuncion'
+
+  it('un dia cualquiera coincide con UTC', () => {
+    expect(anioEnZona(instante('2026-08-18T15:00:00.000Z'), ASUNCION)).toBe(2026)
+  })
+
+  it('EL BORDE: las tres ultimas horas del año en Asuncion todavia son el año viejo', () => {
+    // Esto es el defecto entero, medido. `momento.slice(0, 4)` contesta 2027 para
+    // los tres instantes de abajo, y los tres son el 31 de diciembre en Asuncion.
+    //
+    // Paraguay esta en UTC-03:00, asi que la medianoche local del 1 de enero de 2027
+    // ocurre a las 03:00Z. Un milisegundo antes todavia es 2026.
+    expect(anioEnZona(instante('2027-01-01T00:00:00.000Z'), ASUNCION)).toBe(2026)
+    expect(anioEnZona(instante('2027-01-01T02:59:59.999Z'), ASUNCION)).toBe(2026)
+    // Y en ese instante exacto, ya es 2027.
+    expect(anioEnZona(instante('2027-01-01T03:00:00.000Z'), ASUNCION)).toBe(2027)
+  })
+
+  it('el borde de arriba: el 31 de diciembre a las 21:00 en Asuncion sigue siendo el año viejo', () => {
+    expect(anioEnZona(instante('2026-12-31T23:59:59.999Z'), ASUNCION)).toBe(2026)
+  })
+
+  it('en UTC el borde es la medianoche, que es lo que confirma que la zona hace algo', () => {
+    // Si `anioEnZona` ignorara la zona, esta prueba y la del borde de Asuncion
+    // darian el mismo resultado y ninguna de las dos probaria nada.
+    expect(anioEnZona(instante('2027-01-01T00:00:00.000Z'), 'UTC')).toBe(2027)
+    expect(anioEnZona(instante('2026-12-31T23:59:59.999Z'), 'UTC')).toBe(2026)
+  })
+
+  it('una zona que no existe rompe RUIDOSAMENTE', () => {
+    // Un despliegue mal configurado tiene que romper, no numerar pedidos con el año
+    // equivocado en silencio. `Intl` tira `RangeError`.
+    expect(() => anioEnZona(instante('2026-08-18T15:00:00.000Z'), 'America/Asuncionn')).toThrow()
+    expect(() => anioEnZona(instante('2026-08-18T15:00:00.000Z'), '')).toThrow()
+  })
+
+  it('devuelve un numero entero, no el texto', () => {
+    const a = anioEnZona(instante('2026-08-18T15:00:00.000Z'), ASUNCION)
+    expect(typeof a).toBe('number')
+    expect(Number.isInteger(a)).toBe(true)
   })
 })

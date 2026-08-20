@@ -61,9 +61,16 @@ function aBolsa(f: FilaBolsa): Bolsa {
 /**
  * Arma el `aplicadas` del estado con UNA sola clave: la de esta operacion.
  *
- * El nucleo solo hace `estado.aplicadas.get(op.clave_idem)` y nada mas — no
- * recorre el mapa ni busca otras claves. Cargar la tabla entera seria traer un
+ * El nucleo solo hace `estado.aplicadas.get(<la clave de esta operacion>)` y nada mas
+ * — no recorre el mapa ni busca otras claves. Cargar la tabla entera seria traer un
  * historial que crece para siempre para leer un solo renglon.
+ *
+ * QUE ES «LA CLAVE», exactamente: NO es el `clave_idem` que mando el llamador. Desde
+ * la entrega 1.3 es `claveAplicada(operacion, clave_idem)`, o sea el nombre de la
+ * operacion, un `\u0001`, y el `clave_idem`. El porque esta entero en `nucleo.ts`; lo
+ * que importa acá es que el parametro se llama `clave_aplicada` y no `clave_idem`,
+ * porque son cosas distintas y la version anterior de este comentario decia la que ya
+ * no es. Lo encontro la segunda vuelta de auditoria de la 1.3.
  *
  * Esa afirmacion sobre el nucleo no es una suposicion de este comentario: hay una
  * prueba que le pasa un mapa con una clave señuelo y verifica que el resultado no
@@ -71,15 +78,15 @@ function aBolsa(f: FilaBolsa): Bolsa {
  */
 export function soloLaClaveDeLaOperacion(
   sql: Sql,
-  clave_idem: string,
+  clave_aplicada: string,
 ): ReadonlyMap<string, string> {
   const filas = [...sql.exec<{ valor: string }>(
     'SELECT valor FROM aplicadas WHERE clave_idem = ?',
-    clave_idem,
+    clave_aplicada,
   )]
   const m = new Map<string, string>()
   const fila = filas[0]
-  if (fila !== undefined) m.set(clave_idem, fila.valor)
+  if (fila !== undefined) m.set(clave_aplicada, fila.valor)
   return m
 }
 

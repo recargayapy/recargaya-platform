@@ -58,7 +58,19 @@ import {
 import { registrarIntencion } from '../bitacora/bitacora.js'
 import { type Instante, instante, instanteOpcional } from '../dinero/momento.js'
 import { type Guaranies, guaranies } from '../dinero/monto.js'
-import type { BilleteraDO } from '../index.js'
+import type { BilleteraDO, SecuenciaDO } from '../index.js'
+import {
+  ClaveIdemRepetida,
+  type Pedido,
+  PedidoNoCancelable,
+  SaldoInsuficienteParaElPedido,
+  VentanaDeReservaVencida,
+  cancelarPedido,
+  cargarPedido,
+  conciliarReservasVencidas,
+  crearPedido,
+  pedidoIdValido,
+} from '../pedidos/pedidos.js'
 
 /**
  * Lo que se acepta como `correlacion_id` de afuera.
@@ -72,7 +84,7 @@ const CORRELACION_VALIDA = /^[A-Za-z0-9:_-]{1,64}$/
 
 /** La clave de idempotencia. Mismo criterio, mas largo: la arman los llamadores
  *  concatenando identificadores (`carga:<pedido>:<paso>`) y 128 les sobra. */
-const CLAVE_IDEM_VALIDA = /^[A-Za-z0-9:._-]{1,128}$/
+export const CLAVE_IDEM_VALIDA = /^[A-Za-z0-9:._-]{1,128}$/
 
 export function correlacionValida(valor: unknown): valor is string {
   return typeof valor === 'string' && CORRELACION_VALIDA.test(valor)
@@ -135,6 +147,71 @@ export function personaIdValido(valor: unknown): valor is string {
     PERSONA_VALIDA.test(valor) &&
     !IDS_RESERVADOS.includes(valor.toLowerCase())
   )
+}
+
+/**
+ * La clave de idempotencia del cuerpo, validada. UNA sola vez para las dos rutas
+ * que mueven plata.
+ *
+ * ---------------------------------------------------------------------------
+ * POR QUE ES UNA FUNCION Y NO DOS BLOQUES IGUALES
+ *
+ * Lo pidio el arnes de mutacion, con nombre y apellido. La entrega 1.3 copio este
+ * bloque de `acreditar` a la ruta del pedido, y la mutacion que rompe el tope
+ * —declarada desde la 1.2— paso a reportar «EL FRAGMENTO APARECE 2 VECES: la
+ * mutacion es ambigua». O sea: la copia dejo ciega a la comprobacion que existia,
+ * y con `String.replace` mutando solo la primera, la ruta del pedido quedaba sin
+ * nadie que la atacara.
+ *
+ * Es exactamente lo mismo que paso con el arnes de las pruebas del runtime en esta
+ * misma entrega. Dos copias se discuten; tres son un defecto esperando.
+ *
+ * ---------------------------------------------------------------------------
+ * QUE VALIDA Y POR QUE IMPORTA
+ *
+ * La clave la pone el LLAMADOR y es obligatoria. Generarla acá seria generar una
+ * distinta en cada reintento, o sea mover plata dos veces cuando la primera
+ * respuesta se pierde. Es la unica proteccion real contra que un token repetido
+ * dentro de su ventana de cinco minutos se ejecute dos veces.
+ *
+ * El MISMO alfabeto y el mismo tope que la correlacion, y por una razon mas fuerte:
+ * `clave_idem` no es decorativa. `nucleo.ts` arma el `asiento_id` como
+ * `${clave_idem}:${sufijo}`, y ese texto es la mitad de la clave primaria de
+ * `ledger_copia`; en el pedido, ademas, es una columna UNICA de `pedidos`. Y viaja
+ * al `detalle` de la bitacora, que desde 0003 no se puede editar ni borrar.
+ *
+ * La primera version de la 1.2 acoto `concepto`, `origen` y `restringida_a` —los
+ * tres decorativos— y dejo justo este afuera. Medido por una auditoria: una
+ * `clave_idem` de cien mil caracteres entraba, y quedaba una fila de auditoria de
+ * 200 KB que nadie puede borrar. Tres de cuatro no es la categoria.
+ */
+function exigirClaveIdem(cuerpo: Record<string, unknown>): string {
+  const clave_idem = cuerpo['clave_idem']
+  if (typeof clave_idem !== 'string' || clave_idem.length === 0) {
+    throw new Problema(400, 'falta_clave_idem')
+  }
+  if (!CLAVE_IDEM_VALIDA.test(clave_idem)) throw new Problema(400, 'clave_idem_invalida')
+  return clave_idem
+}
+
+/**
+ * El monto del cuerpo, en guaranies. Tambien en un solo lugar, y por lo mismo.
+ *
+ * `guaranies()` es la puerta del dinero y exige un NUMERO: un `"100000"` de texto
+ * ni siquiera llega a la validacion de decimales. Se comprueba el tipo antes para
+ * que un cuerpo mal armado salga como 400 y no como 500.
+ */
+function exigirMonto(cuerpo: Record<string, unknown>): Guaranies {
+  const crudo = cuerpo['monto']
+  if (typeof crudo !== 'number') throw new Problema(400, 'monto_invalido')
+  let monto: Guaranies
+  try {
+    monto = guaranies(crudo)
+  } catch {
+    throw new Problema(400, 'monto_invalido')
+  }
+  if (monto <= 0) throw new Problema(400, 'monto_invalido')
+  return monto
 }
 
 /** Un fallo con su codigo HTTP ya decidido, para que las rutas no lo repitan. */
@@ -255,13 +332,32 @@ function personaAJson(persona: Persona, momento: Instante) {
   }
 }
 
+/** Como sale un pedido por la API. Mismo criterio que `personaAJson`: un solo
+ *  lugar decide que se muestra. */
+function pedidoAJson(pedido: Pedido) {
+  return {
+    pedido_id: pedido.id,
+    comprador_id: pedido.comprador_id,
+    monto: pedido.monto,
+    estado: pedido.estado,
+    clave_idem: pedido.clave_idem,
+    reserva_vence_en: pedido.reserva_vence_en,
+    creado_en: pedido.creado_en,
+    actualizado_en: pedido.actualizado_en,
+  }
+}
+
 /**
  * Lo que estas rutas necesitan del entorno, y nada mas.
  *
- * No es `Entorno`: `SECUENCIA` y `ZONA_HORARIA` existen y acá no se usan, y una
- * dependencia declarada que no se usa es una dependencia que un dia alguien usa
- * sin darse cuenta de que la agrego. Es la misma razon por la que `EstadoBilletera`
- * es angosto.
+ * No es `Entorno`, y el criterio es «lo que se usa»: una dependencia declarada que
+ * no se usa es una dependencia que un dia alguien usa sin darse cuenta de que la
+ * agrego. Es la misma razon por la que `EstadoBilletera` es angosto.
+ *
+ * `SECUENCIA` y `ZONA_HORARIA` estuvieron afuera hasta la entrega 1.2 justamente
+ * por eso. Entran en la 1.3 porque el pedido las usa: la secuencia le da el numero
+ * y la zona decide de que AÑO es ese numero (ver `anioEnZona`). Entran juntas y no
+ * sueltas porque `Puertas`, del lado de `pedidos/pedidos.ts`, las pide a las dos.
  *
  * `BilleteraDO` entra como TIPO —`import type`— y no como valor. Es a proposito:
  * `index.ts` importa `atender` de este archivo, asi que un import de valor cerraria
@@ -273,9 +369,12 @@ function personaAJson(persona: Persona, momento: Instante) {
 export interface Dependencias {
   readonly CORE: D1Database
   readonly BILLETERA: DurableObjectNamespace<BilleteraDO>
+  readonly SECUENCIA: DurableObjectNamespace<SecuenciaDO>
   readonly SECRETO_SERVICIO?: string
   /** Para que un token de staging no valga en produccion. Ver `actor.ts`. */
   readonly ENTORNO: string
+  /** De donde sale el año del numero de pedido. Ver `dinero/momento.ts`. */
+  readonly ZONA_HORARIA: string
 }
 
 /**
@@ -308,39 +407,8 @@ async function acreditar(
     throw new Problema(400, 'falta_persona_id')
   }
 
-  // La clave de idempotencia la pone el LLAMADOR y es obligatoria. Generarla acá
-  // seria generar una distinta en cada reintento, o sea acreditar dos veces
-  // cuando la primera respuesta se pierde. Es la unica proteccion real contra que
-  // un token repetido dentro de su ventana mueva plata dos veces.
-  // El MISMO alfabeto y el mismo tope que la correlacion, y esta vez por la razon
-  // mas fuerte de las tres: `clave_idem` no es decorativa. `nucleo.ts` arma el
-  // `asiento_id` como `${clave_idem}:${sufijo}`, y ese texto es la mitad de la
-  // clave primaria de `ledger_copia`. Ademas viaja al `detalle` de la bitacora,
-  // que desde 0003 no se puede editar ni borrar.
-  //
-  // La primera version acoto `concepto`, `origen` y `restringida_a` —los tres
-  // decorativos— y dejo justo este afuera. Medido por una auditoria: una
-  // `clave_idem` de cien mil caracteres entraba, y quedaba una fila de auditoria de
-  // 200 KB que nadie puede borrar, con un `asiento_id` de cien mil caracteres en la
-  // clave primaria del read model. Tres de cuatro no es la categoria.
-  const clave_idem = cuerpo['clave_idem']
-  if (typeof clave_idem !== 'string' || clave_idem.length === 0) {
-    throw new Problema(400, 'falta_clave_idem')
-  }
-  if (!CLAVE_IDEM_VALIDA.test(clave_idem)) throw new Problema(400, 'clave_idem_invalida')
-
-  // `guaranies()` es la puerta del dinero y exige un numero: un `"100000"` de
-  // texto ni siquiera llega a la validacion de decimales. Se comprueba el tipo
-  // antes para que un cuerpo mal armado salga como 400 y no como 500.
-  const crudo = cuerpo['monto']
-  if (typeof crudo !== 'number') throw new Problema(400, 'monto_invalido')
-  let monto: Guaranies
-  try {
-    monto = guaranies(crudo)
-  } catch {
-    throw new Problema(400, 'monto_invalido')
-  }
-  if (monto <= 0) throw new Problema(400, 'monto_invalido')
+  const clave_idem = exigirClaveIdem(cuerpo)
+  const monto = exigirMonto(cuerpo)
 
   const bolsa = cuerpo['bolsa']
   if (bolsa !== 'disponible' && bolsa !== 'ganancia_creador' && bolsa !== 'credito_promocion') {
@@ -417,8 +485,83 @@ async function acreditar(
 }
 
 /**
+ * POST /pedidos — el pedido nace y reserva la plata.
+ *
+ * ORDEN, que es lo unico que importa acá y es el mismo de `acreditar`:
+ *
+ *   1. se identifica al actor y se comprueba que puede hacerlo por ese comprador
+ *   2. se valida TODO lo que viene del cuerpo, antes de tocar nada
+ *   3. se carga el comprador y se le pregunta `puede(..., 'cliente', momento)`
+ *   4. recien entonces se crea, y `crearPedido` se ocupa del orden de adentro
+ *
+ * El 2 antes del 3 y del 4 es la leccion de la 1.2: un cuerpo mal armado tiene que
+ * salir como 400 ANTES de que quede escrita una intencion en la bitacora y antes de
+ * sacar un numero de la secuencia, que es irreversible.
+ */
+async function crearPedidoRuta(
+  dep: Dependencias,
+  actor: Actor,
+  correlacion_id: string,
+  momento: Instante,
+  cuerpo: Record<string, unknown>,
+): Promise<Response> {
+  const comprador_id = cuerpo['comprador_id']
+  if (!personaIdValido(comprador_id)) throw new Problema(400, 'comprador_id_invalido')
+
+  // La plataforma, o la propia persona pidiendo para si misma. Va ANTES de leer el
+  // resto del cuerpo por la misma razon que `exigirPlataforma` en `acreditar`: no
+  // hay motivo para validar ocho campos de alguien que no tiene permiso.
+  exigirPlataformaOElMismo(actor, comprador_id)
+
+  const clave_idem = exigirClaveIdem(cuerpo)
+  const monto = exigirMonto(cuerpo)
+
+  const comprador = await cargarPersona(dep.CORE, comprador_id)
+  if (comprador === null) throw new Problema(404, 'no_existe_la_persona')
+
+  // Ley 4 en el camino de verdad: la pregunta lleva momento.
+  const veredicto = puede(comprador, 'cliente', momento)
+  if (!veredicto.puede) throw new Problema(403, 'no_puede', { motivo: veredicto.motivo })
+
+  try {
+    const { pedido, repetido } = await crearPedido(
+      dep,
+      { actor, correlacion_id, momento },
+      comprador,
+      { monto, clave_idem },
+    )
+    // 201 cuando nacio ahora, 200 cuando es el reintento de uno que ya existia. La
+    // diferencia importa para el llamador: con 201 siempre, un reintento parece
+    // haber creado un segundo pedido.
+    return json({ ...pedidoAJson(pedido), repetido, correlacion_id }, repetido ? 200 : 201, correlacion_id)
+  } catch (e) {
+    if (e instanceof ClaveIdemRepetida) {
+      throw new Problema(409, 'clave_idem_ya_usada_para_otro_pedido')
+    }
+    if (e instanceof VentanaDeReservaVencida) {
+      // El pedido quedo cancelado. No hay reintento con la misma clave: la reserva se
+      // llama como el pedido y un `reserva_id` no se reusa nunca.
+      throw new Problema(409, 'ventana_de_reserva_vencida', {
+        pedido_id: e.pedido_id,
+        que_hacer: 'volvé a pedir con otra clave_idem',
+      })
+    }
+    if (e instanceof SaldoInsuficienteParaElPedido) {
+      // El pedido ya quedo cancelado —ver `asegurarReserva`— y por eso la respuesta
+      // dice que hay que mandar una clave nueva: la vieja va a devolver siempre ese
+      // pedido cancelado, que es lo que una clave de idempotencia significa.
+      throw new Problema(409, 'saldo_insuficiente', {
+        pedido_id: e.pedido_id,
+        que_hacer: 'cargá saldo y volvé a pedir con otra clave_idem',
+      })
+    }
+    throw e
+  }
+}
+
+/**
  * El enrutador. Explicito, sin expresiones regulares sobre el path y sin tabla de
- * rutas generada: son seis, se leen de arriba abajo, y cada una dice que metodo y
+ * rutas generada: son nueve, se leen de arriba abajo, y cada una dice que metodo y
  * que forma acepta.
  */
 export async function enrutar(
@@ -555,7 +698,92 @@ export async function enrutar(
     return json({ billetera_id: persona.billetera_id, ...saldo, correlacion_id }, 200, correlacion_id)
   }
 
+  // POST /pedidos/conciliar
+  //
+  // VA ANTES DE `GET /pedidos/:id` y de la ruta de cancelar, aunque las tres tengan
+  // formas distintas: leerlas de arriba abajo es la promesa del enrutador, y una ruta
+  // de dos segmentos que empieza por `pedidos` tiene que decidirse antes de que
+  // `conciliar` pueda ser confundido con un numero de pedido. Hoy no puede
+  // —`pedidoIdValido` lo rechazaria— pero el orden es lo que lo hace imposible en vez
+  // de improbable.
+  //
+  // Solo la plataforma: barre pedidos de cualquiera.
+  if (
+    partes.length === 2 &&
+    partes[0] === 'pedidos' &&
+    partes[1] === 'conciliar' &&
+    peticion.method === 'POST'
+  ) {
+    exigirPlataforma(actor)
+    const r = await conciliarReservasVencidas(dep, { actor, correlacion_id, momento })
+    return json({ ...r, correlacion_id }, 200, correlacion_id)
+  }
+
+  // POST /pedidos
+  if (partes.length === 1 && partes[0] === 'pedidos' && peticion.method === 'POST') {
+    return crearPedidoRuta(dep, actor, correlacion_id, momento, await cuerpoJson(peticion))
+  }
+
+  // GET /pedidos/:id
+  if (partes.length === 2 && partes[0] === 'pedidos' && peticion.method === 'GET') {
+    const pedido = await pedidoDeLaRuta(dep, partes[1])
+    // Quien puede verlo: la plataforma, o el comprador. Se decide con el
+    // `comprador_id` de la fila y NO con nada que venga de la peticion — si saliera
+    // de la URL o del cuerpo, cualquiera pediria el pedido ajeno diciendo que es
+    // suyo.
+    exigirPlataformaOElMismo(actor, pedido.comprador_id)
+    return json({ ...pedidoAJson(pedido), correlacion_id }, 200, correlacion_id)
+  }
+
+  // POST /pedidos/:id/cancelar
+  //
+  // POST y no DELETE: cancelar no borra nada. El pedido queda, con su numero y su
+  // historia, en estado `cancelado` — que es lo que despues contesta «por que este
+  // pedido no se cobro».
+  if (
+    partes.length === 3 &&
+    partes[0] === 'pedidos' &&
+    partes[2] === 'cancelar' &&
+    peticion.method === 'POST'
+  ) {
+    const pedido = await pedidoDeLaRuta(dep, partes[1])
+    exigirPlataformaOElMismo(actor, pedido.comprador_id)
+
+    // El comprador se carga para tener su `billetera_id`, que es de donde hay que
+    // soltar la plata. No se deriva del `comprador_id`: la columna es la fuente, por
+    // lo mismo que dice el encabezado de la migracion 0003.
+    const comprador = await cargarPersona(dep.CORE, pedido.comprador_id)
+    if (comprador === null) throw new Problema(404, 'no_existe_la_persona')
+
+    try {
+      const r = await cancelarPedido(dep, { actor, correlacion_id, momento }, comprador, pedido)
+      // 200 con `cancelado: false` y no un 409: reintentar una cancelacion ya
+      // aplicada tiene que ser inofensivo. Mismo criterio que la revocacion de
+      // capacidades.
+      return json({ ...pedidoAJson(r.pedido), cancelado: r.cancelado, correlacion_id }, 200, correlacion_id)
+    } catch (e) {
+      if (e instanceof PedidoNoCancelable) {
+        throw new Problema(409, 'pedido_no_cancelable', { estado: e.estado, motivo: e.motivo })
+      }
+      throw e
+    }
+  }
+
   throw new Problema(404, 'no_encontrado')
+}
+
+/**
+ * El pedido que nombra la URL, validado y cargado.
+ *
+ * La forma del id se comprueba ANTES de ir a la base, y no es cosmetica: sin eso,
+ * `GET /pedidos/..` o `GET /pedidos/<treinta kilobytes>` llegan como consulta a D1.
+ * Es el mismo guarda que `personaIdValido` puso en la 1.2, en la ruta de al lado.
+ */
+async function pedidoDeLaRuta(dep: Dependencias, crudo: string | undefined): Promise<Pedido> {
+  if (!pedidoIdValido(crudo)) throw new Problema(400, 'pedido_id_invalido')
+  const pedido = await cargarPedido(dep.CORE, crudo)
+  if (pedido === null) throw new Problema(404, 'no_existe_el_pedido')
+  return pedido
 }
 
 /**

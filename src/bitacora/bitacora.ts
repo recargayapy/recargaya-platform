@@ -57,6 +57,15 @@ export type Accion =
   | 'capacidad.otorgada'
   | 'capacidad.revocada'
   | 'billetera.acreditacion.pedida'
+  // Entrega 1.3. `pedido.reserva.pedida` y `pedido.liberacion.pedida` son
+  // INTENCIONES —se escriben antes de tocar la billetera, como
+  // `billetera.acreditacion.pedida`— y las otras tres son HECHOS, que van en el
+  // mismo `batch()` que el cambio en D1. La diferencia esta contada arriba.
+  | 'pedido.creado'
+  | 'pedido.reserva.pedida'
+  | 'pedido.reservado'
+  | 'pedido.liberacion.pedida'
+  | 'pedido.cancelado'
 
 export interface EntradaDeBitacora {
   /** Quien. `null` solo para lo que ocurre sin actor; hoy nada. */
